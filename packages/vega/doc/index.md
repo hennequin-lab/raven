@@ -4,9 +4,9 @@ Vega provides composable gradient-based optimizers for OCaml. Each optimizer is 
 
 ## Features
 
-- **Optimizer aliases** — `adam`, `adamw`, `sgd`, `rmsprop`, `adagrad`, `lamb`, `lion`, `radam`, `lars`, `adan`, `adafactor`
-- **Composable primitives** — `scale_by_adam`, `trace`, `add_decayed_weights`, `clip_by_norm`, and more, combined via `chain`
-- **Structural steps** — `sgd_step`, `adam_step`, `adamw_step` over any `Nx.Ptree.S` parameter structure; the state is a parameter tree too (`Sgd_state`, `Adam_state`)
+- **Optimizer aliases** — `adam`, `adamw`, `muon`, `sgd`, `rmsprop`, `adagrad`, `lamb`, `lion`, `radam`, `lars`, `adan`, `adafactor`
+- **Composable primitives** — `scale_by_adam`, `scale_by_muon`, `trace`, `add_decayed_weights`, `clip_by_norm`, and more, combined via `chain`
+- **Structural steps** — `sgd_step`, `adam_step`, `adamw_step`, `muon_step` over any `Nx.Ptree.S` parameter structure; the state is a parameter tree too (`Sgd_state`, `Adam_state`, `Muon_state`)
 - **Jit-compilable steps** — every time-varying scalar is a tensor leaf, so a whole training step compiles as one `Rune.jit2` program
 - **Learning rate schedules** — `constant`, `cosine_decay`, `warmup_cosine_decay`, `one_cycle`, `piecewise_constant`, `join` — tensor arithmetic over a step counter, so one family serves eager and compiled loops alike
 - **Gradient processing** — clipping, centralization, noise injection

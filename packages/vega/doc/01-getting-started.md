@@ -105,6 +105,7 @@ Vega provides ready-to-use aliases that compose primitives internally:
 | `sgd` | Stochastic gradient descent | `~momentum`, `~nesterov` |
 | `adam` | Adam with bias correction | `~b1`, `~b2`, `~eps` |
 | `adamw` | Adam with decoupled weight decay | `~b1`, `~b2`, `~eps`, `~weight_decay` |
+| `muon` | Muon: orthogonalized momentum for matrix parameters | `~momentum`, `~nesterov`, `~ns_steps`, `~scaling` |
 | `rmsprop` | RMSprop | `~decay`, `~eps`, `~momentum` |
 | `adagrad` | Adagrad | `~eps` |
 | `lamb` | LAMB for large-batch training | `~b1`, `~b2`, `~eps`, `~weight_decay` |

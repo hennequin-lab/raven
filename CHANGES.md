@@ -13,6 +13,19 @@ All notable changes to this project will be documented in this file.
 
 ### Vega
 
+- Add Muon. `scale_by_muon` and the `muon` alias optimize a matrix parameter
+  by orthogonalizing its momentum with a Newton-Schulz iteration — no
+  factorization, matmuls only — and rescaling the result by shape:
+  `muon_scaling` selects the update-RMS matching of the original definition and
+  of the scaling recipe (`Update_rms 0.2`, the default) or the reference
+  implementation's width transfer (`Width`).
+- Add `muon_step`, `muon_init` and `Muon_state`: the structural Muon step, which
+  optimizes the matrix leaves with Muon and every other float leaf with an
+  auxiliary AdamW — the reference implementation's arrangement, whose two
+  learning rates stay separate because they live in different units. Routing is
+  by shape (`use_muon`), and each buffer is allocated only on the leaves that
+  use it, so a state costs one tensor per parameter. Embeddings and heads that
+  should stay on AdamW are excluded through the same predicate.
 - Optimizer state now compiles. The structural states are parameter trees —
   `Vega.Sgd_state (P)` and `Vega.Adam_state (P)` are the `Nx.Ptree.S` for the
   state over a parameter tree `P` — so the state is one field of a

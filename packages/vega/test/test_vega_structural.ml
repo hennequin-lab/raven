@@ -40,6 +40,31 @@ let pair a b =
     b = Nx.create Nx.float32 [| Array.length b |] b;
   }
 
+(* A matrix leaf and a vector leaf: Muon takes the matrix, the auxiliary AdamW
+   the vector. *)
+module Mixed = struct
+  type t = { w : Nx.float32_t; b : Nx.float32_t }
+
+  let map (f : 'a 'b. ('a, 'b) Nx.t -> ('a, 'b) Nx.t) { w; b } =
+    { w = f w; b = f b }
+
+  let map2 (f : 'a 'b. ('a, 'b) Nx.t -> ('a, 'b) Nx.t -> ('a, 'b) Nx.t) p q =
+    { w = f p.w q.w; b = f p.b q.b }
+
+  let iter (f : 'a 'b. ('a, 'b) Nx.t -> unit) { w; b } =
+    f w;
+    f b
+end
+
+let mixed w b =
+  {
+    Mixed.w = Nx.create Nx.float32 [| 2; 3 |] w;
+    b = Nx.create Nx.float32 [| Array.length b |] b;
+  }
+
+(* A leaf's elements as a flat host array, whatever its shape. *)
+let flat t = Nx.to_array (Nx.reshape [| -1 |] (Nx.contiguous t))
+
 let check_vec ?(eps = 1e-9) ?msg expected actual =
   let t = if eps = 0. then float_exact else float eps in
   equal ?msg (array t) expected (Nx.to_array actual)
@@ -392,6 +417,171 @@ let test_adamw_converges () =
   in
   is_true ~msg:"reaches the bottom of the bowl" (bowl_distance params < 0.05)
 
+(* Muon *)
+
+let test_muon_matches_the_chain () =
+  (* On a matrix-only parameter tree the structural step is the per-tensor Muon
+     transform and its update: the same orthogonalized momentum, the same shape
+     factor, the same decoupled decay. *)
+  let lr = 0.0625 and wd = 0.01 in
+  let tensor xs = Nx.create Nx.float64 [| 3; 3 |] xs in
+  let param0 = tensor [| 0.5; -1.0; 2.0; 0.25; 1.5; -0.5; -2.0; 0.75; 1.0 |] in
+  let grads =
+    List.map tensor
+      [
+        [| 1.0; 0.5; -0.25; 0.75; -1.0; 2.0; 0.5; -0.5; 1.25 |];
+        [| -0.5; 1.0; 0.25; 1.5; 0.75; -1.25; 0.25; 0.5; -0.75 |];
+      ]
+  in
+  let tx =
+    Vega.chain
+      [
+        Vega.scale_by_muon ~momentum:0.9 ~nesterov:true
+          ~scaling:(`Update_rms 0.2) ();
+        Vega.add_decayed_weights ~rate:(S.constant wd) ();
+        Vega.scale_by_learning_rate (S.constant lr);
+      ]
+  in
+  let chain_params, _ =
+    List.fold_left
+      (fun (param, st) grad ->
+        let updates, st = Vega.update st ~grad ~param in
+        (Vega.apply_updates ~param ~updates, st))
+      (param0, Vega.init tx param0)
+      grads
+  in
+  let step_params, _ =
+    List.fold_left
+      (fun (param, st) grad ->
+        Vega.muon_step
+          (module Vec)
+          ~lr:(lr64 lr) ~aux_lr:(lr64 0.001) ~momentum:0.9 ~nesterov:true
+          ~scaling:(`Update_rms 0.2) st ~params:param ~grads:grad)
+      (param0, Vega.muon_init (module Vec) param0)
+      grads
+  in
+  equal ~msg:"the matrix path matches the chain"
+    (array (float 1e-6))
+    (flat chain_params) (flat step_params)
+
+let test_muon_aux_is_adamw () =
+  (* Every leaf the routing rule does not send to Muon must be optimized by
+     exactly [adamw_step], weight decay and all: routing the whole structure to
+     the auxiliary optimizer reproduces AdamW. *)
+  let params0 = mixed [| 1.0; -2.0; 3.0; 0.5; -1.5; 2.0 |] [| 0.25; -0.75 |] in
+  let grads =
+    [
+      mixed [| 0.5; 0.25; -1.0; 0.75; 0.5; -0.25 |] [| 0.1; -0.2 |];
+      mixed [| -0.25; 0.5; 0.75; -0.5; 1.0; 0.25 |] [| -0.3; 0.4 |];
+    ]
+  in
+  let aux_only (_ : int array) = false in
+  let muon_params, _ =
+    List.fold_left
+      (fun (params, st) grads ->
+        Vega.muon_step
+          (module Mixed)
+          ~lr:(Vega.lr 0.1) ~aux_lr:(Vega.lr 0.1) ~use_muon:aux_only st ~params
+          ~grads)
+      (params0, Vega.muon_init (module Mixed) ~use_muon:aux_only params0)
+      grads
+  in
+  let adamw_params, _ =
+    List.fold_left
+      (fun (params, st) grads ->
+        Vega.adamw_step (module Mixed) ~lr:(Vega.lr 0.1) st ~params ~grads)
+      (params0, Vega.adamw_init (module Mixed) params0)
+      grads
+  in
+  equal ~msg:"the matrix leaf is AdamW's" (array float_exact)
+    (flat adamw_params.Mixed.w)
+    (flat muon_params.Mixed.w);
+  equal ~msg:"the vector leaf is AdamW's" (array float_exact)
+    (flat adamw_params.Mixed.b)
+    (flat muon_params.Mixed.b)
+
+let test_muon_routes_and_allocates () =
+  (* The default rule routes by shape, and a buffer is allocated only on the
+     leaves that use it: the matrix on Muon carries a momentum buffer and
+     zero-dimensional placeholders for the AdamW moments, the vector leaf the
+     other way round. *)
+  let params = mixed [| 1.0; 2.0; 3.0; 4.0; 5.0; 6.0 |] [| 0.0 |] in
+  let grads = mixed [| 0.1; 0.2; 0.3; 0.4; 0.5; 0.6 |] [| 0.7 |] in
+  let st = Vega.muon_init (module Mixed) params in
+  equal ~msg:"velocity on the matrix" (array int) [| 2; 3 |]
+    (Nx.shape st.velocity.w);
+  equal ~msg:"no velocity on the vector" (array int) [||]
+    (Nx.shape st.velocity.b);
+  equal ~msg:"no moments on the matrix" (array int) [||] (Nx.shape st.aux_mu.w);
+  equal ~msg:"moments on the vector" (array int) [| 1 |] (Nx.shape st.aux_mu.b);
+  equal ~msg:"second moment too" (array int) [| 1 |] (Nx.shape st.aux_nu.b);
+  let _, st =
+    Vega.muon_step
+      (module Mixed)
+      ~lr:(Vega.lr 0.1) ~aux_lr:(Vega.lr 0.1) st ~params ~grads
+  in
+  (* The matrix leaf's momentum is the EMA of its gradient (momentum 0.95); the
+     vector leaf's first moment is AdamW's, [0.1 * g]. *)
+  equal ~msg:"matrix momentum"
+    (array (float 1e-6))
+    (Array.map (fun g -> 0.05 *. g) [| 0.1; 0.2; 0.3; 0.4; 0.5; 0.6 |])
+    (flat st.velocity.w);
+  equal ~msg:"vector moment" (array (float 1e-6)) [| 0.07 |] (flat st.aux_mu.b)
+
+let test_muon_zero_grads () =
+  let params = mixed [| 1.0; -2.0; 3.0; 0.5; -1.5; 2.0 |] [| 0.25 |] in
+  let grads = mixed (Array.make 6 0.0) [| 0.0 |] in
+  let st = Vega.muon_init (module Mixed) params in
+  let params', st' =
+    Vega.muon_step
+      (module Mixed)
+      ~lr:(Vega.lr 0.1) ~aux_lr:(Vega.lr 0.1) ~weight_decay:0.0 st ~params
+      ~grads
+  in
+  equal ~msg:"the matrix leaf is unchanged" (array float_exact) (flat params.w)
+    (flat params'.w);
+  equal ~msg:"the vector leaf is unchanged" (array float_exact) (flat params.b)
+    (flat params'.b);
+  (* Orthogonalizing a zero matrix is zero, not a division by zero. *)
+  is_true ~msg:"the momentum stays finite"
+    (Nx.item [] (Nx.all (Nx.isfinite st'.velocity.w)));
+  equal ~msg:"the counter advances" int 1 (Int32.to_int (Nx.item [] st'.step))
+
+let test_muon_rejects_non_matrix_routing () =
+  (* Muon is a matrix method, so a routing rule that selects a vector leaf is an
+     error when the state is built, not a silently wrong update. *)
+  raises_match Exn.invalid_arg (fun () ->
+      ignore
+        (Vega.muon_init
+           (module Pair)
+           ~use_muon:(fun _ -> true)
+           (pair [| 1.0 |] [| 2.0 |])));
+  raises_match Exn.invalid_arg (fun () ->
+      let params = pair [| 1.0 |] [| 2.0 |] in
+      ignore
+        (Vega.muon_step
+           (module Pair)
+           ~lr:(Vega.lr 0.1) ~aux_lr:(Vega.lr 0.1) ~momentum:1.0
+           (Vega.muon_init (module Pair) params)
+           ~params ~grads:params))
+
+let test_muon_state_traversals () =
+  (* The Muon state is a parameter tree like the others: one traversal visits
+     the matrix leaf's three buffers, the vector leaf's three, then the
+     counter. *)
+  let module M = Vega.Muon_state (Mixed) in
+  let params = mixed (Array.make 6 1.0) [| 1.0 |] in
+  let st = Vega.muon_init (module Mixed) params in
+  let n = ref 0 in
+  M.iter (fun _ -> incr n) st;
+  equal ~msg:"muon leaf count" int 7 !n;
+  equal ~msg:"the counter starts at zero" int 0
+    (Int32.to_int (Nx.item [] st.step));
+  let merged = M.map2 (fun _ right -> right) st st in
+  equal ~msg:"map2 merges leafwise" int32 0l (Nx.item [] merged.step);
+  equal ~msg:"placeholders merge too" (array int) [||]
+    (Nx.shape merged.velocity.b)
+
 (* A parameter structure may carry leaves that are not parameters. The canonical
    one is an RNG key, which has to sit in the structure to reach a compiled step
    as an input but is not something to optimize. Rune leaves its gradient slot
@@ -467,7 +657,15 @@ let test_optimizers_carry_a_non_parameter_leaf () =
       (Vega.adamw_init (module Stepper) params)
       ~params ~grads
   in
-  check "adamw" adamw
+  check "adamw" adamw;
+  let muon, _ =
+    Vega.muon_step
+      (module Stepper)
+      ~lr:(Vega.lr 0.1) ~aux_lr:(Vega.lr 0.01)
+      (Vega.muon_init (module Stepper) params)
+      ~params ~grads
+  in
+  check "muon" muon
 
 (* Optimizer state as a parameter tree *)
 
@@ -583,6 +781,18 @@ let tests =
         test "zero gradients decay weights geometrically"
           test_adamw_decays_weights;
         test "converges on a quadratic bowl" test_adamw_converges;
+      ];
+    group "muon"
+      [
+        test "the matrix path matches the per-tensor chain"
+          test_muon_matches_the_chain;
+        test "the auxiliary optimizer is AdamW" test_muon_aux_is_adamw;
+        test "routes by shape and allocates buffers"
+          test_muon_routes_and_allocates;
+        test "zero gradients leave parameters unchanged" test_muon_zero_grads;
+        test "rejects a non-matrix routing rule"
+          test_muon_rejects_non_matrix_routing;
+        test "state traversals walk every leaf" test_muon_state_traversals;
       ];
     group "optimizer state as a parameter tree"
       [

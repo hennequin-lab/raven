@@ -12,12 +12,19 @@ optimizers are composable gradient transformations.
 | `optax.sgd(0.1, momentum=0.9)` | `Vega.sgd ~momentum:0.9 (Schedule.constant 0.1)` |
 | `optax.adam(1e-3)` | `Vega.adam (Schedule.constant 1e-3)` |
 | `optax.adamw(1e-3, weight_decay=0.01)` | `Vega.adamw ~weight_decay:0.01 (Schedule.constant 1e-3)` |
+| `optax.contrib.muon(0.02)` | `Vega.muon (Schedule.constant 0.02)` |
 | `optax.rmsprop(1e-3)` | `Vega.rmsprop (Schedule.constant 1e-3)` |
 | `optax.adagrad(0.01)` | `Vega.adagrad (Schedule.constant 0.01)` |
 | `optax.lamb(1e-3)` | `Vega.lamb (Schedule.constant 1e-3)` |
 | `optax.lion(1e-4)` | `Vega.lion (Schedule.constant 1e-4)` |
 | `optax.radam(1e-3)` | `Vega.radam (Schedule.constant 1e-3)` |
 | `optax.adafactor()` | `Vega.adafactor ()` |
+
+Both libraries optimize a matrix's momentum with Muon and leave the rest of a
+model to AdamW, but they reach it differently. Optax's `muon` folds the
+auxiliary AdamW into one transform with a learning rate of its own; Vega's
+structural `muon_step` does the same, while in the chain tier — one chain per
+parameter — matrices take `muon` and everything else `adamw`.
 
 ## Init and Update
 

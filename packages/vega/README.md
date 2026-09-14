@@ -34,8 +34,8 @@ let () =
 
 ## Features
 
-- **Optimizer aliases**: `adam`, `adamw`, `sgd`, `rmsprop`, `adagrad`, `lamb`, `lion`, `radam`, `lars`, `adan`, `adafactor`
-- **Composable primitives**: `scale_by_adam`, `scale_by_rms`, `trace`, `add_decayed_weights`, `scale_by_trust_ratio`, and more -- combine via `chain`
+- **Optimizer aliases**: `adam`, `adamw`, `muon`, `sgd`, `rmsprop`, `adagrad`, `lamb`, `lion`, `radam`, `lars`, `adan`, `adafactor`
+- **Composable primitives**: `scale_by_adam`, `scale_by_rms`, `scale_by_muon`, `trace`, `add_decayed_weights`, `scale_by_trust_ratio`, and more -- combine via `chain`
 - **Learning rate schedules**: `constant`, `cosine_decay`, `warmup_cosine_decay`, `one_cycle`, `cosine_decay_restarts`, `piecewise_constant`, `join`
 - **Gradient clipping**: `clip_by_value`, `clip_by_norm`
 - **Gradient processing**: `centralize`, `add_noise`

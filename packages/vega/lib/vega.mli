@@ -10,19 +10,20 @@
     implementing {!Nx.Ptree.S}. Optimizer state has the shape of the parameters
     themselves: each algorithm keeps its per-parameter accumulators as values of
     the user's own structure type, in a small record the training loop threads
-    explicitly ({!type:sgd_state}, {!type:adam_state}). Steps are pure
-    traversals — a step consumes a state and returns the next one — so a
-    training step is an ordinary function of [(params, state)], and
+    explicitly ({!type:sgd_state}, {!type:adam_state}, {!type:muon_state}).
+    Steps are pure traversals — a step consumes a state and returns the next
+    one — so a training step is an ordinary function of [(params, state)], and
     checkpointing an optimizer means saving a record of parameter-shaped values.
 
     There is no optimizer object; composition is function application. Transform
     gradients before the step (for example {!clip_by_global_norm}) and derive
     the step's learning rate from the state's step counter with a schedule
     ({!Schedule}). Because optimizer state is itself a parameter tree
-    ({!Adam_state}, {!Sgd_state}), a whole training step — forward, backward and
-    update — is an ordinary function of [(params, state)] that threads both
-    through one {!Rune.val-jit} call, so the step compiles into a single program
-    on any device and the state rides it as ordinary input and output leaves:
+    ({!Adam_state}, {!Sgd_state}, {!Muon_state}), a whole training step —
+    forward, backward and update — is an ordinary function of [(params, state)]
+    that threads both through one {!Rune.val-jit} call, so the step compiles
+    into a single program on any device and the state rides it as ordinary input
+    and output leaves:
 
     {[
     module Opt = Vega.Adam_state (Model)
@@ -372,6 +373,158 @@ val adamw_step :
     history. [weight_decay] defaults to [0.01]; with [weight_decay = 0.] the
     step is exactly {!adam_step}. *)
 
+(** {1:muon Muon}
+
+    Muon (MomentUm Orthogonalized by Newton-Schulz, Jordan et al., 2024)
+    optimizes the {e matrices} of a network's hidden layers. Where Adam scales
+    each coordinate by its own second moment, Muon replaces the momentum
+    buffer's update with the nearest semi-orthogonal matrix to it — the polar
+    factor [U V^T] of its SVD, which is steepest descent under the spectral norm
+    — and computes that factor with a Newton-Schulz iteration, so no
+    factorization is needed and the update stays a handful of matrix products.
+
+    Muon is defined for matrices only, and its update is not in the units of a
+    coordinate-wise optimizer, so {!muon_step} takes two learning rates and
+    routes by shape: a float leaf of two or more dimensions takes Muon at [lr],
+    every other float leaf takes an auxiliary AdamW at [aux_lr]. That is the
+    arrangement the reference implementation recommends — embeddings, classifier
+    heads, norms and biases are optimized by a standard method — and it is what
+    lets one step cover a whole model:
+
+    {[
+    let opt = Vega.muon_init (module Model) params in
+    let params, opt =
+      Vega.muon_step
+        (module Model)
+        ~lr:(Vega.lr 0.02) ~aux_lr:(Vega.lr 3e-4) opt ~params ~grads
+    in
+    ignore params
+    ]}
+
+    Everything below the surface is tensor arithmetic over [(params, st)], as in
+    every other structural step: the momentum buffer, the auxiliary moments and
+    the step counter are the state's leaves, and the orthogonalization is matrix
+    products — so a whole training step compiles into one {!Rune.val-jit}
+    program. *)
+
+type muon_scaling = [ `Update_rms of float | `Width ]
+(** How Muon's orthogonalized update is rescaled by shape. The update's RMS is
+    [1 /. sqrt (max rows cols)] — a wider matrix's update is diluted over more
+    coordinates — and the two conventions differ in the units their learning
+    rates are quoted in:
+
+    - [`Update_rms r] multiplies the update by [r *. sqrt (max rows cols)], for
+      an update RMS of [r] whatever the shape, up to the few percent by which
+      five Newton-Schulz steps miss the ideal polar factor. [0.2] matches
+      AdamW's empirical update RMS, so a rate tuned for AdamW transfers; it is
+      the convention of the original definition and of the recipe for scaling
+      Muon up (Liu et al., 2025).
+    - [`Width] multiplies it by [sqrt (max 1. (rows /. cols))], for an update
+      RMS of [1 /. sqrt fan_in] that does not depend on the output width; it is
+      the convention of the current reference implementation, whose learning
+      rates ([0.02]–[0.05]) are quoted in those units.
+
+    [rows] is the size of a leaf's first dimension, [cols] the product of the
+    rest. *)
+
+type 'p muon_state = {
+  velocity : 'p;
+      (** The momentum buffer, on the leaves Muon takes; a zero-dimensional
+          placeholder elsewhere. *)
+  aux_mu : 'p;
+      (** The auxiliary AdamW's first moment, on the leaves Muon does not take;
+          a zero-dimensional placeholder elsewhere. *)
+  aux_nu : 'p;
+      (** The auxiliary AdamW's second moment, allocated like [aux_mu]. *)
+  step : Nx.int32_t;
+      (** Completed steps, a scalar tensor — the counter every structural state
+          carries. Both the auxiliary optimizer's bias corrections and a
+          schedule read it. *)
+}
+
+(** [Muon_state (P)] is the state over the parameter tree [P] as a parameter
+    tree itself — see {!Sgd_state}. The leaf order — every leaf of [velocity] in
+    [P]'s order, then every leaf of [aux_mu], then [aux_nu], then [step] — is
+    part of a compiled step's leaf signature and is fixed for good. *)
+module Muon_state (P : Nx.Ptree.S) : Nx.Ptree.S with type t = P.t muon_state
+
+val muon_init :
+  (module Nx.Ptree.S with type t = 'p) ->
+  ?use_muon:(int array -> bool) ->
+  'p ->
+  'p muon_state
+(** [muon_init (module P) params] is the initial state for optimizing [params]:
+    an all-zero momentum buffer on the leaves Muon takes, an all-zero first and
+    second moment on the other float leaves, placeholders elsewhere, and
+    [step = 0].
+
+    A buffer is allocated where it is used, so the state costs one tensor per
+    parameter rather than one per algorithm: a matrix on Muon carries a momentum
+    buffer and no AdamW moments, a norm or a bias the other way round.
+
+    [use_muon] is {!muon_step}'s routing rule: a float leaf takes Muon iff the
+    rule accepts its shape. It defaults to leaves of two or more dimensions.
+    Pass the same rule to both functions, which must agree on the buffers a leaf
+    carries.
+
+    Raises [Invalid_argument] if [use_muon] selects a leaf of fewer than two
+    dimensions: Muon is a matrix method. *)
+
+val muon_step :
+  (module Nx.Ptree.S with type t = 'p) ->
+  lr:(float, 'b) Nx.t ->
+  aux_lr:(float, 'b) Nx.t ->
+  ?momentum:float ->
+  ?nesterov:bool ->
+  ?ns_steps:int ->
+  ?scaling:muon_scaling ->
+  ?use_muon:(int array -> bool) ->
+  ?b1:float ->
+  ?b2:float ->
+  ?eps:float ->
+  ?weight_decay:float ->
+  'p muon_state ->
+  params:'p ->
+  grads:'p ->
+  'p * 'p muon_state
+(** [muon_step (module P) ~lr ~aux_lr st ~params ~grads] is [(params', st')]
+    after one step of Muon on the leaves [use_muon] selects, with an auxiliary
+    AdamW on the rest. Per matrix leaf, with [t = st.step + 1]:
+
+    {v
+    v' = momentum * v + (1 - momentum) * g
+    d  = nesterov ? (1 - momentum) * g + momentum * v' : v'
+    p' = p - lr * (scale * O + weight_decay * p)
+    v}
+
+    where [O] is the Newton-Schulz orthogonalization of [d] viewed as a matrix
+    and [scale] the shape factor {!type:muon_scaling} selects. Per other float
+    leaf, exactly {!adamw_step} with the moments of [st] at [aux_lr]:
+
+    {v
+    mu' = b1 * mu + (1 - b1) * g
+    nu' = b2 * nu + (1 - b2) * g^2
+    p'  = p - aux_lr * (mu_hat / (sqrt nu_hat + eps) + weight_decay * p)
+    v}
+
+    [lr] and [aux_lr] are scalar tensors ({!lr}), cast to each leaf's dtype.
+    [aux_lr] has no default on purpose: Muon's update is a matrix of a fixed
+    RMS, AdamW's a coordinate-wise normalization, so their rates are not
+    interchangeable (a Muon rate is one to two orders of magnitude larger) and
+    the auxiliary optimizer's is always the caller's decision. [momentum]
+    defaults to [0.95] and [nesterov] to [true] — the reference implementation's
+    defaults: the momentum buffer is an EMA of the gradients, and its Nesterov
+    interpolation with the current gradient is what gets orthogonalized.
+    [ns_steps] defaults to [5] Newton-Schulz steps. [scaling] defaults to
+    [`Update_rms 0.2], so [lr] is a rate in that convention. [b1], [b2], [eps]
+    and [weight_decay] are the auxiliary AdamW's, defaulting to [0.9], [0.999],
+    [1e-8] and [0.01]; the reference implementation's own weight decay defaults
+    to [0.] instead, and the recipe that scaled Muon up turns it on.
+
+    The counter advances by one. Like every structural step, this one is tensor
+    arithmetic over [(params, st)] — it traces under {!Rune.val-jit} — and
+    leaves non-float leaves untouched. *)
+
 (** {1:chains Per-Tensor Transformation Chains}
 
     An Optax-style tier below the structural API. A {!type:t} is a composable
@@ -553,6 +706,46 @@ val scale_by_adan :
     State: 4 tensors (first moment, gradient difference moment, second moment,
     previous gradient). *)
 
+(** {2:muon Muon} *)
+
+val scale_by_muon :
+  ?momentum:float ->
+  ?nesterov:bool ->
+  ?ns_steps:int ->
+  ?scaling:muon_scaling ->
+  unit ->
+  t
+(** [scale_by_muon ?momentum ?nesterov ?ns_steps ?scaling ()] scales updates by
+    Muon's orthogonalized momentum. Per update, with [v] the momentum buffer,
+    [g] the update and [d] the interpolation:
+
+    {v
+    v' = momentum * v + (1 - momentum) * g
+    d  = nesterov ? (1 - momentum) * g + momentum * v' : v'
+    out = scale * NewtonSchulz5 d
+    v}
+
+    where [NewtonSchulz5 d] is a Newton-Schulz iteration applied to [d] as a
+    matrix — the polar factor of its SVD, approached in [ns_steps] quintic
+    steps. An update of more than two dimensions is orthogonalized as the matrix
+    [(dim 0) x (product of the rest)], the view the reference implementation
+    uses for convolutional filters.
+
+    Muon is defined for matrices, so this transform applies to parameters of two
+    or more dimensions, and {!init} raises [Invalid_argument] for anything else.
+    Embeddings and heads are matrices but are better optimized by a standard
+    method, and norms and biases cannot be optimized by this one: a chain is
+    per-parameter, so those take a chain of their own ({!adamw}) — {!muon_step}
+    is the structural step that routes between the two.
+
+    [momentum] defaults to [0.95] and [nesterov] to [true], the reference
+    implementation's defaults. [ns_steps] defaults to [5], the number of
+    Newton-Schulz steps it finds sufficient. [scaling] defaults to
+    [`Update_rms 0.2]; the rate {!scale_by_learning_rate} applies is in the
+    units of the chosen convention.
+
+    State: 1 tensor (the momentum buffer). *)
+
 (** {2:accumulation Accumulation Transforms} *)
 
 val trace : ?decay:float -> ?nesterov:bool -> unit -> t
@@ -637,6 +830,25 @@ val adamw :
     Equivalent to
     [chain [scale_by_adam ~b1 ~b2 ~eps (); add_decayed_weights
      ~rate:(Schedule.constant weight_decay) (); scale_by_learning_rate lr]]. *)
+
+val muon :
+  ?momentum:float ->
+  ?nesterov:bool ->
+  ?ns_steps:int ->
+  ?scaling:muon_scaling ->
+  Schedule.t ->
+  t
+(** [muon lr] is Muon: {!scale_by_muon} under [lr], for a matrix parameter.
+
+    Equivalent to
+    [chain [scale_by_muon ?momentum ?nesterov ?ns_steps ?scaling ();
+     scale_by_learning_rate lr]].
+
+    A chain is per-parameter, so the vectors and scalars of a model need a chain
+    of their own ({!adamw}), and its embeddings and heads — matrices that are
+    still better optimized by AdamW — a chain of either. The structural
+    {!muon_step} is the step that routes between Muon and AdamW by shape. [lr]
+    is in the units of [scaling]. *)
 
 val rmsprop : ?decay:float -> ?eps:float -> ?momentum:float -> Schedule.t -> t
 (** [rmsprop lr] is RMSprop.

@@ -497,6 +497,140 @@ let scale_by_adan ?(b1 = 0.98) ?(b2 = 0.92) ?(b3 = 0.99) ?(eps = 1e-8) () =
     };
   ]
 
+(* Muon. Muon is an optimizer for the matrices of a network's hidden layers: it
+   replaces the momentum buffer's update with the nearest semi-orthogonal matrix
+   to it — the polar factor [U V^T] of its SVD, which is steepest descent under
+   the spectral norm — and computes that factor with a Newton-Schulz iteration,
+   so no factorization is needed. *)
+
+(* How the orthogonalized update is rescaled by shape. The update's RMS is [1 /
+   sqrt (max rows cols)] before rescaling — a matrix's update is diluted over
+   more coordinates the wider it is — and the two recipes differ in the units
+   the learning rate is quoted in. *)
+type muon_scaling = [ `Update_rms of float | `Width ]
+
+(* Muon's Newton-Schulz coefficients: the quintic [phi s = a s + b s^3 + c s^5]
+   applied to the singular values, tuned to make the slope at zero as steep as
+   possible — small singular values then converge fastest — while every value in
+   [0, 1] still converges to within [0.7, 1.3] of one. The result is therefore
+   [U S' V^T] with S' around one rather than exactly the polar factor, which the
+   reference implementation finds harmless. Five steps are enough. *)
+let muon_ns_coeffs = (3.4445, -4.7750, 2.0315)
+
+(* [newton_schulz5 ~steps x] is Muon's orthogonalization of the matrix [x]: [x]
+   rescaled to unit Frobenius norm — which puts its spectral norm in [0, 1], the
+   range the iteration converges over — then [steps] quintic Newton-Schulz
+   steps. Rescaling by a positive constant does not change the direction of the
+   result, and [X X^T] and [X^T X] generate the same polynomial: [muon_axes]'s
+   two axes pick the smaller product. *)
+let newton_schulz5 (type a b) (x : (a, b) Nx.t) ~steps : (a, b) Nx.t =
+  let ca, cb, cc = muon_ns_coeffs in
+  let dt = Nx.dtype x in
+  let rows = Nx.dim 0 x in
+  let cols = Nx.dim 1 x in
+  let unit_frobenius =
+    Nx.div x (Nx.add (Nx.sqrt (Nx.sum (Nx.square x))) (scalar dt 1e-7))
+  in
+  let ns = ref unit_frobenius in
+  for _ = 1 to steps do
+    let xk = !ns in
+    let xt = Nx.transpose xk in
+    let gram = if rows <= cols then Nx.matmul xk xt else Nx.matmul xt xk in
+    let poly =
+      Nx.add
+        (Nx.mul gram (scalar dt cb))
+        (Nx.mul (Nx.matmul gram gram) (scalar dt cc))
+    in
+    let step = if rows <= cols then Nx.matmul poly xk else Nx.matmul xk poly in
+    ns := Nx.add (Nx.mul xk (scalar dt ca)) step
+  done;
+  !ns
+
+(* A leaf of two or more dimensions is optimized as the matrix [(dim 0) x
+   (product of the rest)] — the flattening the reference implementation uses for
+   convolutional filters — and [muon_axes] is that matrix's shape. *)
+let muon_axes (shape : int array) : int * int =
+  let rows = shape.(0) in
+  let cols =
+    Array.fold_left ( * ) 1 (Array.sub shape 1 (Array.length shape - 1))
+  in
+  (rows, cols)
+
+(* Muon's shape-dependent factor: [`Update_rms r] makes the update's RMS [r]
+   whatever the shape, which is the original definition's convention and the one
+   that transfers an AdamW learning rate; [`Width] makes it [1 / sqrt fan_in],
+   independent of the output width, which is the convention of the current
+   reference implementation. *)
+let muon_scale (scaling : muon_scaling) rows cols =
+  match scaling with
+  | `Update_rms rms -> rms *. sqrt (float_of_int (max rows cols))
+  | `Width -> sqrt (Float.max 1.0 (float_of_int rows /. float_of_int cols))
+
+(* Muon's momentum: an EMA of the gradients, advanced before the
+   orthogonalization, which discards the buffer's overall scale. *)
+let muon_momentum (type a b) ~(velocity : (a, b) Nx.t) ~(gradient : (a, b) Nx.t)
+    ~momentum =
+  let dt = Nx.dtype velocity in
+  Nx.add
+    (Nx.mul velocity (scalar dt momentum))
+    (Nx.mul gradient (scalar dt (1.0 -. momentum)))
+
+(* Muon's update for one leaf, in the leaf's shape: the Nesterov interpolation
+   of the advanced momentum buffer [velocity] with the gradient, the polar
+   factor of the resulting matrix, rescaled by shape. *)
+let muon_direction (type a b) ~(velocity : (a, b) Nx.t)
+    ~(gradient : (a, b) Nx.t) (shape : int array) ~momentum ~nesterov ~ns_steps
+    ~scaling =
+  let dt = Nx.dtype gradient in
+  let direction =
+    if nesterov then
+      Nx.add
+        (Nx.mul gradient (scalar dt (1.0 -. momentum)))
+        (Nx.mul velocity (scalar dt momentum))
+    else velocity
+  in
+  let rows, cols = muon_axes shape in
+  let orthogonal =
+    newton_schulz5 (Nx.reshape [| rows; cols |] direction) ~steps:ns_steps
+  in
+  let scaled = Nx.mul orthogonal (scalar dt (muon_scale scaling rows cols)) in
+  Nx.reshape shape scaled
+
+let scale_by_muon ?(momentum = 0.95) ?(nesterov = true) ?(ns_steps = 5)
+    ?(scaling = `Update_rms 0.2) () =
+  validate_unit_interval "Vega.scale_by_muon" "momentum" momentum;
+  if ns_steps < 1 then
+    invalid_argf "Vega.scale_by_muon: expected ns_steps >= 1, got %d" ns_steps;
+  (match scaling with
+  | `Update_rms rms -> validate_positive "Vega.scale_by_muon" "rms" rms
+  | `Width -> ());
+  [
+    {
+      n_tensors = 1;
+      prim_init =
+        (fun param ->
+          if Nx.ndim param < 2 then
+            invalid_argf
+              "Vega.scale_by_muon: Muon is defined for matrices, so this \
+               transform needs parameters of two or more dimensions, got %d; \
+               optimize vectors and scalars with a standard method such as \
+               Vega.adamw"
+              (Nx.ndim param);
+          [| Nx.zeros_like param |]);
+      prim_update =
+        (fun _count st grad _param ->
+          let shape = Nx.shape grad in
+          let velocity =
+            muon_momentum ~velocity:st.(0) ~gradient:grad ~momentum
+          in
+          let direction =
+            muon_direction ~velocity ~gradient:grad shape ~momentum ~nesterov
+              ~ns_steps ~scaling
+          in
+          (direction, [| velocity |]));
+    };
+  ]
+
 (* Accumulation transforms *)
 
 let trace ?(decay = 0.9) ?(nesterov = false) () =
@@ -683,6 +817,13 @@ let adamw ?b1 ?b2 ?eps ?(weight_decay = 0.01) lr =
     [
       scale_by_adam ?b1 ?b2 ?eps ();
       add_decayed_weights ~rate:(Schedule.constant weight_decay) ();
+      scale_by_learning_rate lr;
+    ]
+
+let muon ?momentum ?nesterov ?ns_steps ?scaling lr =
+  chain
+    [
+      scale_by_muon ?momentum ?nesterov ?ns_steps ?scaling ();
       scale_by_learning_rate lr;
     ]
 
@@ -932,6 +1073,20 @@ let adam_init (type p) (module P : Nx.Ptree.S with type t = p) (params : P.t) :
   let zeros () = P.map (fun leaf -> Nx.zeros_like leaf) params in
   { mu = zeros (); nu = zeros (); step = Nx.scalar Nx.int32 0l }
 
+(* The bias-corrected Adam direction for one leaf, from its advanced moments [m]
+   and [n] and the completed step count [step], which is cast to the leaf's
+   dtype like every other scalar: [adam_step] and [muon_step]'s auxiliary
+   optimizer share it. *)
+let adam_leaf_direction (type a b) (m : (a, b) Nx.t) (n : (a, b) Nx.t) ~step ~b1
+    ~b2 ~eps =
+  let dt = Nx.dtype m in
+  let t = Nx.cast dt step in
+  let c1 = Nx.sub (scalar dt 1.0) (Nx.pow (scalar dt b1) t) in
+  let c2 = Nx.sub (scalar dt 1.0) (Nx.pow (scalar dt b2) t) in
+  let mu_hat = Nx.div m c1 in
+  let nu_hat = Nx.div n c2 in
+  Nx.div mu_hat (Nx.add (Nx.sqrt nu_hat) (scalar dt eps))
+
 (* Advances the moments and computes the bias-corrected update direction shared
    by [adam_step] and [adamw_step]. The bias corrections [1 - b^t] are derived
    from the counter per leaf, at the leaf's dtype like every other scalar in
@@ -964,15 +1119,7 @@ let adam_direction (type p) (module P : Nx.Ptree.S with type t = p) ~b1 ~b2 ~eps
   let direction =
     P.map2
       (fun m n ->
-        let dt = Nx.dtype m in
-        if updates m then
-          let t = Nx.cast dt step in
-          let c1 = Nx.sub (scalar dt 1.0) (Nx.pow (scalar dt b1) t) in
-          let c2 = Nx.sub (scalar dt 1.0) (Nx.pow (scalar dt b2) t) in
-          let mu_hat = Nx.div m c1 in
-          let nu_hat = Nx.div n c2 in
-          Nx.div mu_hat (Nx.add (Nx.sqrt nu_hat) (scalar dt eps))
-        else m)
+        if updates m then adam_leaf_direction m n ~step ~b1 ~b2 ~eps else m)
       mu nu
   in
   (direction, { mu; nu; step })
@@ -1008,3 +1155,181 @@ let adamw_step (type p) (module P : Nx.Ptree.S with type t = p) ~lr ?(b1 = 0.9)
       params direction
   in
   (params, st)
+
+(* Muon, over parameter structures. Muon is defined for the matrices of a
+   network's hidden layers, so [muon_step] routes by shape: float leaves of two
+   or more dimensions take Muon's orthogonalized momentum, every other float
+   leaf takes an auxiliary AdamW — the arrangement the reference implementation
+   recommends, in which embeddings, classifier heads, norms and biases are
+   optimized by a standard method. The two learning rates are separate arguments
+   because they are not in the same units: Muon's update is a matrix whose RMS
+   [scaling] fixes, AdamW's a coordinate-wise normalization. *)
+
+type 'p muon_state = {
+  velocity : 'p;
+  aux_mu : 'p;
+  aux_nu : 'p;
+  step : Nx.int32_t;
+}
+
+module Muon_state (P : Nx.Ptree.S) = struct
+  type t = P.t muon_state
+
+  let map (f : 'a 'b. ('a, 'b) Nx.t -> ('a, 'b) Nx.t) (st : t) : t =
+    {
+      velocity = P.map f st.velocity;
+      aux_mu = P.map f st.aux_mu;
+      aux_nu = P.map f st.aux_nu;
+      step = f st.step;
+    }
+
+  let map2 (f : 'a 'b. ('a, 'b) Nx.t -> ('a, 'b) Nx.t -> ('a, 'b) Nx.t) (a : t)
+      (b : t) : t =
+    {
+      velocity = P.map2 f a.velocity b.velocity;
+      aux_mu = P.map2 f a.aux_mu b.aux_mu;
+      aux_nu = P.map2 f a.aux_nu b.aux_nu;
+      step = f a.step b.step;
+    }
+
+  let iter (f : 'a 'b. ('a, 'b) Nx.t -> unit) (st : t) : unit =
+    P.iter f st.velocity;
+    P.iter f st.aux_mu;
+    P.iter f st.aux_nu;
+    f st.step
+end
+
+(* The default routing rule, and its two sides for one leaf. A [Ptree.S]
+   structure carries no names, so a leaf's shape is all a step can route on: the
+   matrices of the structure take Muon, everything else the auxiliary AdamW. An
+   architecture whose embedding or head must stay on AdamW passes its own
+   rule. *)
+let muon_matrix_leaf shape = Array.length shape >= 2
+
+let takes_muon (use_muon : int array -> bool) (type a b) (leaf : (a, b) Nx.t) =
+  updates leaf && use_muon (Nx.shape leaf)
+
+let takes_aux (use_muon : int array -> bool) (type a b) (leaf : (a, b) Nx.t) =
+  updates leaf && not (use_muon (Nx.shape leaf))
+
+(* A state carries one buffer per parameter rather than one per algorithm:
+   [takes] decides whether a leaf's slot is a buffer of the leaf's shape or a
+   zero-dimensional placeholder. The routing rules above keep a placeholder out
+   of every full-size arithmetic, so a placeholder costs and carries nothing. *)
+let muon_allocate (type a b) ~(takes : bool) (leaf : (a, b) Nx.t) : (a, b) Nx.t
+    =
+  if takes then Nx.zeros_like leaf else Nx.zeros (Nx.dtype leaf) [||]
+
+let muon_init (type p) (module P : Nx.Ptree.S with type t = p)
+    ?(use_muon = muon_matrix_leaf) (params : P.t) : P.t muon_state =
+  P.iter
+    (fun leaf ->
+      if takes_muon use_muon leaf && Nx.ndim leaf < 2 then
+        invalid_argf
+          "Vega.muon_init: use_muon selected a leaf of %d dimensions; Muon is \
+           defined for matrices, so the routing rule must select leaves of two \
+           or more dimensions"
+          (Nx.ndim leaf))
+    params;
+  {
+    velocity =
+      P.map
+        (fun leaf -> muon_allocate ~takes:(takes_muon use_muon leaf) leaf)
+        params;
+    aux_mu =
+      P.map
+        (fun leaf -> muon_allocate ~takes:(takes_aux use_muon leaf) leaf)
+        params;
+    aux_nu =
+      P.map
+        (fun leaf -> muon_allocate ~takes:(takes_aux use_muon leaf) leaf)
+        params;
+    step = Nx.scalar Nx.int32 0l;
+  }
+
+let muon_step (type p) (module P : Nx.Ptree.S with type t = p) ~lr ~aux_lr
+    ?(momentum = 0.95) ?(nesterov = true) ?(ns_steps = 5)
+    ?(scaling = `Update_rms 0.2) ?(use_muon = muon_matrix_leaf) ?(b1 = 0.9)
+    ?(b2 = 0.999) ?(eps = 1e-8) ?(weight_decay = 0.01) (st : P.t muon_state)
+    ~(params : P.t) ~(grads : P.t) : P.t * P.t muon_state =
+  validate_unit_interval "Vega.muon_step" "momentum" momentum;
+  if ns_steps < 1 then
+    invalid_argf "Vega.muon_step: expected ns_steps >= 1, got %d" ns_steps;
+  (match scaling with
+  | `Update_rms rms -> validate_positive "Vega.muon_step" "rms" rms
+  | `Width -> ());
+  validate_unit_interval "Vega.muon_step" "b1" b1;
+  validate_unit_interval "Vega.muon_step" "b2" b2;
+  validate_positive "Vega.muon_step" "eps" eps;
+  validate_non_negative "Vega.muon_step" "weight_decay" weight_decay;
+  let velocity =
+    P.map2
+      (fun v g ->
+        if takes_muon use_muon g then
+          muon_momentum ~velocity:v ~gradient:g ~momentum
+        else v)
+      st.velocity grads
+  in
+  let aux_mu =
+    P.map2
+      (fun m g ->
+        if takes_aux use_muon g then
+          let dt = Nx.dtype m in
+          Nx.add (Nx.mul m (scalar dt b1)) (Nx.mul g (scalar dt (1.0 -. b1)))
+        else m)
+      st.aux_mu grads
+  in
+  let aux_nu =
+    P.map2
+      (fun n g ->
+        if takes_aux use_muon g then
+          let dt = Nx.dtype n in
+          Nx.add
+            (Nx.mul n (scalar dt b2))
+            (Nx.mul (Nx.mul g g) (scalar dt (1.0 -. b2)))
+        else n)
+      st.aux_nu grads
+  in
+  let step = Nx.add_s st.step 1l in
+  (* The auxiliary AdamW's direction, from the moments just advanced. A leaf on
+     Muon has placeholders here, so its share of this traversal is
+     zero-dimensional arithmetic with a zero result, which the parameter maps
+     below discard. *)
+  let aux_direction =
+    P.map2
+      (fun m n ->
+        if updates m then adam_leaf_direction m n ~step ~b1 ~b2 ~eps else m)
+      aux_mu aux_nu
+  in
+  (* Muon's directions, from the momentum just advanced: the Nesterov
+     interpolation of the buffer with this step's gradient, orthogonalized. *)
+  let muon_directions =
+    P.map2
+      (fun v g ->
+        if takes_muon use_muon g then
+          muon_direction ~velocity:v ~gradient:g (Nx.shape g) ~momentum
+            ~nesterov ~ns_steps ~scaling
+        else v)
+      velocity grads
+  in
+  let params =
+    P.map2
+      (fun p d ->
+        if takes_muon use_muon p then
+          let dt = Nx.dtype p in
+          let decayed = Nx.add d (Nx.mul p (scalar dt weight_decay)) in
+          Nx.sub p (Nx.mul decayed (Nx.cast dt lr))
+        else p)
+      params muon_directions
+  in
+  let params =
+    P.map2
+      (fun p d ->
+        if takes_aux use_muon p then
+          let dt = Nx.dtype p in
+          let decayed = Nx.add d (Nx.mul p (scalar dt weight_decay)) in
+          Nx.sub p (Nx.mul decayed (Nx.cast dt aux_lr))
+        else p)
+      params aux_direction
+  in
+  (params, { velocity; aux_mu; aux_nu; step })

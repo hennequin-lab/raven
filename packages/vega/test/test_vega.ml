@@ -304,6 +304,205 @@ let test_nesterov_differs () =
   is_true ~msg:"nesterov differs from standard"
     (Float.abs (a.(0) -. b.(0)) > 1e-6)
 
+(* Muon *)
+
+(* A matrix whose singular values span an order of magnitude, so the
+   orthogonalization is non-trivial. Its transpose exercises the other
+   association of [X X^T X] in the Newton-Schulz iteration. *)
+let muon_matrix =
+  mat 3 5
+    [|
+      1.0;
+      2.0;
+      3.0;
+      4.0;
+      0.5;
+      1.5;
+      -2.0;
+      0.25;
+      1.0;
+      -1.0;
+      2.5;
+      0.75;
+      -0.5;
+      1.25;
+      3.0;
+    |]
+
+(* The reference implementation of Newton-Schulz 5, transcribed from the
+   published code: transpose so that there are at most as many rows as columns,
+   then iterate with [X X^T] throughout. Vega chooses the narrower of [X X^T]
+   and [X^T X] instead, so this reaches the same polynomial by another route. *)
+let reference_ns5 ?(steps = 5) (x : Nx.float32_t) =
+  let rows = Nx.dim 0 x and cols = Nx.dim 1 x in
+  let tall = rows > cols in
+  let z = if tall then Nx.transpose x else x in
+  let norm = Nx.sqrt (Nx.sum (Nx.square z)) in
+  let ns = ref (Nx.div z (Nx.add_s norm 1e-7)) in
+  for _ = 1 to steps do
+    let xk = !ns in
+    let a = Nx.matmul xk (Nx.transpose xk) in
+    let b = Nx.add (Nx.mul_s a (-4.7750)) (Nx.mul_s (Nx.matmul a a) 2.0315) in
+    ns := Nx.add (Nx.mul_s xk 3.4445) (Nx.matmul b xk)
+  done;
+  if tall then Nx.transpose !ns else !ns
+
+(* One eager step of Muon's chain, returning the raw update. *)
+let muon_update ?(scaling = `Update_rms 1.0) ?(momentum = 0.0)
+    ?(nesterov = false) g =
+  let tx = Vega.scale_by_muon ~momentum ~nesterov ~scaling () in
+  fst (Vega.update (Vega.init tx g) ~grad:g ~param:g)
+
+let test_muon_matches_reference_ns5 () =
+  List.iter
+    (fun (name, g) ->
+      let rows = Nx.dim 0 g and cols = Nx.dim 1 g in
+      let expected =
+        Nx.mul_s (reference_ns5 g) (sqrt (Stdlib.float (max rows cols)))
+      in
+      equal ~msg:name
+        (array (float 1e-5))
+        (to_arr expected)
+        (to_arr (muon_update g)))
+    [ ("wide", muon_matrix); ("tall", Nx.transpose muon_matrix) ]
+
+let test_muon_transpose_equivariant () =
+  (* [X X^T] and [X^T X] generate the same quintic, so orthogonalizing a matrix
+     and its transpose gives transposes. *)
+  let tall = Nx.transpose (muon_update (Nx.transpose muon_matrix)) in
+  equal ~msg:"transpose"
+    (array (float 1e-6))
+    (to_arr (Nx.contiguous tall))
+    (to_arr (muon_update muon_matrix))
+
+let test_muon_orthogonalizes () =
+  (* Five Newton-Schulz steps approximate the polar factor rather than reach it:
+     the update's singular values land in the [0.5, 1.5] window the reference
+     implementation accepts, so its rows are approximately orthonormal. *)
+  let u = Nx.mul_s (muon_update muon_matrix) (1.0 /. sqrt 5.0) in
+  let gram = Nx.matmul u (Nx.transpose u) in
+  let deviation = Nx.sub gram (Nx.eye f32 3) in
+  is_true ~msg:"semi-orthogonal up to the iteration's error"
+    (Nx.item [] (Nx.max (Nx.abs deviation)) < 0.5)
+
+let test_muon_isotropic_spectrum () =
+  (* Equal nonzero singular values are each mapped through the quintic
+     polynomial, so the update is the polar direction times [phi^5 (1/sqrt 2)]
+     up to the rescaling by shape. *)
+  let iso = mat 2 3 [| 1.0; 0.0; 0.0; 0.0; 1.0; 0.0 |] in
+  let phi x =
+    (3.4445 *. x) -. (4.7750 *. x *. x *. x) +. (2.0315 *. (x ** 5.))
+  in
+  let s = ref (1.0 /. sqrt 2.0) in
+  for _ = 1 to 5 do
+    s := phi !s
+  done;
+  equal ~msg:"phi^5 on the spectrum"
+    (array (float 1e-5))
+    (to_arr (Nx.mul_s iso (!s *. sqrt 3.0)))
+    (to_arr (muon_update iso))
+
+let test_muon_scale_conventions () =
+  (* The two shape conventions in the units they promise: [`Update_rms r] gives
+     the update an RMS of [r] whatever the shape — the ideal polar factor's
+     would be exactly [r], and five steps land within a few percent of it —
+     while [`Width] gives it [1 /. sqrt cols], independent of the row count. *)
+  let rms t = sqrt (Nx.item [] (Nx.mean (Nx.square t))) in
+  List.iter
+    (fun (name, g) ->
+      let cols = Nx.dim 1 g in
+      equal ~msg:(name ^ " update rms") (float 0.02) 0.2
+        (rms (muon_update ~scaling:(`Update_rms 0.2) g));
+      equal ~msg:(name ^ " width scaling") (float 0.015)
+        (1.0 /. sqrt (Stdlib.float cols))
+        (rms (muon_update ~scaling:`Width g)))
+    [ ("wide", muon_matrix); ("tall", Nx.transpose muon_matrix) ]
+
+let test_muon_momentum () =
+  (* The buffer is an EMA of the updates — [0.09 * g1 + 0.1 * g2] after two
+     steps — and Nesterov interpolates it with the current update before the
+     orthogonalization, which changes the direction once the two differ. *)
+  let g2 =
+    Nx.transpose (mat 5 3 (Array.init 15 (fun i -> float_of_int i -. 7.0)))
+  in
+  let run ~nesterov =
+    let tx = Vega.scale_by_muon ~momentum:0.9 ~nesterov () in
+    let param = mat 3 5 (Array.make 15 0.0) in
+    let st = Vega.init tx param in
+    let _, st = Vega.update st ~grad:muon_matrix ~param in
+    let updates, st = Vega.update st ~grad:g2 ~param in
+    let _, tensors = Vega.state_to_tensors st in
+    (updates, tensors.(0))
+  in
+  let nesterov, buffer = run ~nesterov:true in
+  let plain, _ = run ~nesterov:false in
+  let expected = Nx.add (Nx.mul_s muon_matrix 0.09) (Nx.mul_s g2 0.1) in
+  equal ~msg:"momentum buffer"
+    (array (float 1e-6))
+    (to_arr expected) (to_arr buffer);
+  is_true ~msg:"nesterov changes the direction" (to_arr nesterov <> to_arr plain)
+
+let test_muon_flattens_higher_dimensions () =
+  (* A leaf of more than two dimensions is orthogonalized as the matrix [(dim 0)
+     x (product of the rest)] — the view the reference implementation uses for
+     convolutional filters — and comes back in its own shape. *)
+  let filter =
+    Nx.reshape [| 4; 2; 3; 3 |]
+      (mat 4 18
+         (Array.init 72 (fun i ->
+              let i = Stdlib.float_of_int i in
+              (sin (i *. 0.7) *. 2.0) +. (cos (i *. 0.31) *. 0.5))))
+  in
+  let updates = muon_update filter in
+  equal ~msg:"the update keeps the leaf's shape" (array int) [| 4; 2; 3; 3 |]
+    (Nx.shape updates);
+  equal ~msg:"flattened like the reference implementation"
+    (array (float 1e-6))
+    (to_arr (muon_update (Nx.reshape [| 4; 18 |] filter)))
+    (to_arr (Nx.reshape [| 4; 18 |] updates))
+
+let test_muon_converges () =
+  (* Muon descends: with the polar factor of the gradient every singular value
+     of the residual shrinks by [lr] a step, so a matrix quadratic converges
+     fast (and this checks the sign of the update). *)
+  let target =
+    mat 4 4
+      [|
+        0.5;
+        -1.0;
+        0.25;
+        2.0;
+        1.0;
+        0.0;
+        -0.5;
+        0.75;
+        1.5;
+        -0.25;
+        0.5;
+        1.0;
+        -1.25;
+        0.5;
+        0.25;
+        -0.75;
+      |]
+  in
+  let param = ref (mat 4 4 (Array.make 16 0.0)) in
+  let tx =
+    Vega.muon ~momentum:0.0 ~nesterov:false ~scaling:(`Update_rms 1.0)
+      (S.constant 0.1)
+  in
+  let st = ref (Vega.init tx !param) in
+  let residual p = sqrt (Nx.item [] (Nx.sum (Nx.square (Nx.sub p target)))) in
+  let start = residual !param in
+  for _ = 1 to 100 do
+    let grads = Nx.mul_s (Nx.sub !param target) 2.0 in
+    let p, s = Vega.step !st ~grad:grads ~param:!param in
+    param := p;
+    st := s
+  done;
+  is_true ~msg:"reaches the bottom of the matrix quadratic"
+    (residual !param < 0.2 *. start)
+
 (* Optimizer convergence *)
 
 let test_lion_converges () = converges ~msg:"lion" ~tol:1.0 (Vega.lion lr01)
@@ -477,6 +676,14 @@ let test_validation () =
   raises_match Exn.invalid_arg (fun () ->
       ignore (Vega.adan ~weight_decay:(-1.) lr01));
   raises_match Exn.invalid_arg (fun () ->
+      ignore (Vega.scale_by_muon ~momentum:1.0 ()));
+  raises_match Exn.invalid_arg (fun () ->
+      ignore (Vega.scale_by_muon ~ns_steps:0 ()));
+  raises_match Exn.invalid_arg (fun () ->
+      ignore (Vega.scale_by_muon ~scaling:(`Update_rms 0.0) ()));
+  raises_match Exn.invalid_arg (fun () ->
+      ignore (Vega.init (Vega.scale_by_muon ()) (vec [| 1.0 |])));
+  raises_match Exn.invalid_arg (fun () ->
       ignore (S.cosine_decay_restarts ~init_value:1. ~decay_steps:0 () : S.t));
   raises_match Exn.invalid_arg (fun () ->
       ignore (S.one_cycle ~max_value:1. ~total_steps:0 () : S.t))
@@ -548,6 +755,20 @@ let () =
           test "step 1 exact" test_scale_by_adam_step1;
           test "amsgrad holds max" test_amsgrad;
           test "nesterov differs" test_nesterov_differs;
+        ];
+      group "muon"
+        [
+          test "matches the reference Newton-Schulz iteration"
+            test_muon_matches_reference_ns5;
+          test "is transpose equivariant" test_muon_transpose_equivariant;
+          test "orthogonalizes the update" test_muon_orthogonalizes;
+          test "maps an isotropic spectrum through the quintic"
+            test_muon_isotropic_spectrum;
+          test "scaling conventions hold" test_muon_scale_conventions;
+          test "momentum is an EMA, nesterov interpolates" test_muon_momentum;
+          test "flattens convolutional filters"
+            test_muon_flattens_higher_dimensions;
+          test "converges on a matrix quadratic" test_muon_converges;
         ];
       group "optimizers"
         [

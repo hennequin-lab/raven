@@ -234,6 +234,139 @@ let test_pmap_matches_jit () =
   in
   check_trajectory ~msg:"pmap adam" 1e-5 jit pmapped
 
+(* Muon: the same compiled step, with the matrices on Muon's orthogonalized
+   momentum and the gains and biases on the auxiliary AdamW. The routing, the
+   Newton-Schulz iteration and the two sets of buffers all have to survive the
+   trace — the routing itself is by shape, which is a trace-time constant. *)
+
+module Muon_opt = Vega.Muon_state (Model)
+
+module Muon_in = struct
+  type t = {
+    params : Model.t;
+    opt : Muon_opt.t;
+    x : Nx.float32_t;
+    y : Nx.float32_t;
+  }
+
+  let map (f : 'a 'b. ('a, 'b) Nx.t -> ('a, 'b) Nx.t) s =
+    {
+      params = Model.map f s.params;
+      opt = Muon_opt.map f s.opt;
+      x = f s.x;
+      y = f s.y;
+    }
+
+  let map2 (f : 'a 'b. ('a, 'b) Nx.t -> ('a, 'b) Nx.t -> ('a, 'b) Nx.t) a b =
+    {
+      params = Model.map2 f a.params b.params;
+      opt = Muon_opt.map2 f a.opt b.opt;
+      x = f a.x b.x;
+      y = f a.y b.y;
+    }
+
+  let iter (f : 'a 'b. ('a, 'b) Nx.t -> unit) s =
+    Model.iter f s.params;
+    Muon_opt.iter f s.opt;
+    f s.x;
+    f s.y
+end
+
+module Muon_out = struct
+  type t = { params : Model.t; opt : Muon_opt.t; loss : Nx.float32_t }
+
+  let map (f : 'a 'b. ('a, 'b) Nx.t -> ('a, 'b) Nx.t) s =
+    {
+      params = Model.map f s.params;
+      opt = Muon_opt.map f s.opt;
+      loss = f s.loss;
+    }
+
+  let map2 (f : 'a 'b. ('a, 'b) Nx.t -> ('a, 'b) Nx.t -> ('a, 'b) Nx.t) a b =
+    {
+      params = Model.map2 f a.params b.params;
+      opt = Muon_opt.map2 f a.opt b.opt;
+      loss = f a.loss b.loss;
+    }
+
+  let iter (f : 'a 'b. ('a, 'b) Nx.t -> unit) s =
+    Model.iter f s.params;
+    Muon_opt.iter f s.opt;
+    f s.loss
+end
+
+let muon_sched = Vega.Schedule.cosine_decay ~init_value:0.05 ~decay_steps:64 ()
+
+let muon_aux_sched =
+  Vega.Schedule.cosine_decay ~init_value:1e-3 ~decay_steps:64 ()
+
+let muon_train_step { Muon_in.params; opt; x; y } =
+  let loss, grads = Rune.value_and_grad (module Model) (loss_fn x y) params in
+  let grads = Vega.clip_by_global_norm (module Model) ~max_norm:2.0 grads in
+  let params, opt =
+    Vega.muon_step
+      (module Model)
+      ~lr:(muon_sched opt.step) ~aux_lr:(muon_aux_sched opt.step) opt ~params
+      ~grads
+  in
+  { Muon_out.params; opt; loss }
+
+let muon_init () =
+  let s = init () in
+  {
+    Muon_in.params = s.Step_in.params;
+    opt = Vega.muon_init (module Model) s.Step_in.params;
+    x = s.Step_in.x;
+    y = s.Step_in.y;
+  }
+
+let muon_advance step0 s =
+  let out = step0 !s in
+  s := { !s with Muon_in.params = out.Muon_out.params; opt = out.Muon_out.opt };
+  (Nx.item [] out.Muon_out.loss, out.Muon_out.params)
+
+let muon_run_traj ~step0 n s0 =
+  let s = ref s0 in
+  Array.init n (fun _ -> muon_advance step0 s)
+
+let test_jit_muon_matches_eager () =
+  let eager = muon_run_traj ~step0:muon_train_step steps (muon_init ()) in
+  let compiled =
+    muon_run_traj
+      ~step0:
+        (Rune.jit2 ~device:dev
+           (module Muon_in)
+           (module Muon_out)
+           muon_train_step)
+      steps (muon_init ())
+  in
+  (* The orthogonalization is a chain of matmuls, so tracing it reassociates
+     more of the arithmetic than Adam's elementwise step: the trajectories agree
+     to fp32 reassociation, not bitwise. *)
+  check_trajectory ~msg:"jit muon" 1e-5 eager compiled
+
+let test_jit_muon_state_advances () =
+  let jitted =
+    Rune.jit2 ~device:dev (module Muon_in) (module Muon_out) muon_train_step
+  in
+  let s = ref (muon_init ()) in
+  for _ = 1 to steps do
+    ignore (muon_advance jitted s)
+  done;
+  let opt = !s.Muon_in.opt in
+  equal ~msg:"counter reads n after n calls" int steps
+    (Int32.to_int (Nx.item [] opt.step));
+  (* Both sets of buffers moved: the matrices' momentum and the gains' AdamW
+     moments rode the compiled step. *)
+  let abs_sum (type a b) (t : (a, b) Nx.t) : float =
+    Nx.item [] (Nx.sum (Nx.abs (Nx.cast Nx.float64 t)))
+  in
+  let momentum = ref 0.0 and moments = ref 0.0 in
+  Model.iter (fun t -> momentum := !momentum +. abs_sum t) opt.velocity;
+  Model.iter (fun t -> moments := !moments +. abs_sum t) opt.aux_mu;
+  is_true ~msg:"momentum moved" (!momentum > 0.0);
+  is_true ~msg:"auxiliary moments moved" (!moments > 0.0)
+
 let tests =
   [
     group "jitted optimizer state"
@@ -242,6 +375,10 @@ let tests =
         test "counter and schedule advance across compiled calls"
           test_state_advances_across_compiled_calls;
         test "pmap with replicated state matches jit" test_pmap_matches_jit;
+        test "jit muon step matches the eager trajectory"
+          test_jit_muon_matches_eager;
+        test "the muon state advances across compiled calls"
+          test_jit_muon_state_advances;
       ];
   ]
 

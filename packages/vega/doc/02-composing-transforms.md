@@ -83,6 +83,32 @@ let tx =
   ]
 ```
 
+### Muon, and Where It Applies
+
+Muon replaces the momentum buffer of a matrix parameter with the nearest
+semi-orthogonal matrix to it, which a Newton-Schulz iteration computes with
+matrix products alone — so the whole update direction is one primitive, and its
+alias is that primitive under the learning rate:
+
+<!-- $MDX skip -->
+```ocaml
+let tx =
+  Vega.chain [
+    Vega.scale_by_muon ~momentum:0.95 ~nesterov:true
+      ~scaling:(`Update_rms 0.2) ();
+    Vega.scale_by_learning_rate lr;
+  ]
+(* is Vega.muon ~momentum:0.95 ~nesterov:true ~scaling:(`Update_rms 0.2) lr *)
+```
+
+Muon is defined for matrices, so the chain applies to parameters of two or more
+dimensions and `init` raises for anything else. Embeddings and heads are
+matrices that are still better optimized by AdamW, and norms, biases and
+scalars cannot take Muon at all: a chain is per-parameter, so those need a chain
+of their own. Over a whole parameter structure the structural `muon_step` does
+that routing by shape, running the auxiliary AdamW on everything Muon does not
+take.
+
 ## Primitives Reference
 
 ### Scaling
@@ -105,6 +131,12 @@ let tx =
 | `scale_by_trust_ratio` | LAMB/LARS trust ratio `\|\|param\|\| / \|\|updates\|\|` | 0 tensors |
 | `scale_by_adafactor` | Factored 2nd moments for memory efficiency | 2 tensors |
 | `scale_by_adan` | Adan with gradient difference momentum | 4 tensors |
+
+### Muon
+
+| Primitive | Description | State |
+|-----------|-------------|-------|
+| `scale_by_muon` | Momentum orthogonalized by Newton-Schulz, scaled by shape | 1 tensor |
 
 ### Accumulation
 
