@@ -4,8 +4,8 @@
   ---------------------------------------------------------------------------*)
 
 (* Thread traces: the program each generation writes, the write pointer's units,
-   and the decoder against a captured gfx1201 trace, GFX12 traces this suite
-   writes from a list of events, and GFX9 and GFX11 traces written by hand. *)
+   and the decoder against a captured gfx1201 trace and GFX9, GFX11 and GFX12
+   traces written by hand. *)
 
 open Windtrap
 open Rig_amd_abi
@@ -26,66 +26,76 @@ let pp_use ppf u =
   Format.fprintf ppf "{ engine %d; dies %s; selected %s }" u.engine (opt u.dies)
     (opt u.selected)
 
-(* The words of [p] that make [n] 32-bit words, and the words after them. *)
-let rec split n (p : int Packet.t) =
-  if n <= 0 then ([], p)
-  else
-    match p with
-    | [] -> ([], [])
-    | w :: rest ->
-        let body, rest = split (n - Packet.size [ w ]) rest in
-        (w :: body, rest)
+(* The programs' addresses: engine [e]'s buffer of [size] bytes lies at
+   [buffers + e * size], and its end is the word at [ends + 4 * e]. *)
+let buffers = 0x10_0000
+let ends = 0x20_0000
+let page = 4096
 
-(* Walks [p], the words of a program over engine numbers, and gives each use of
-   an engine's number. Each packet starts with a constant header. *)
-let uses g (p : int Packet.t) =
+(* PACKET3_COPY_DATA's opcode, whose body is its control, its source's two words
+   and its destination's (soc15d.h, nvd.h). *)
+let copy_data = 0x40
+
+(* The register a start writes each engine's page to: the buffer's address
+   from bit 12, its low 32 bits. *)
+let page_register (g : Gpu.t) =
+  let name =
+    match g.gc with
+    | 9, _, _ -> "regSQ_THREAD_TRACE_BASE"
+    | 11, _, _ -> "regSQ_THREAD_TRACE_BUF0_BASE"
+    | _ -> "regSQ_THREAD_TRACE_BUF0_BASE_LO"
+  in
+  Register.address g (require_some (Register.find g name))
+
+(* Walks [p], the words of a program, and gives each use of an engine's
+   address: each write of its buffer's page, and each copy to its end. *)
+let uses g ~size p =
   let grbm = require_some (Register.find g "regGRBM_GFX_INDEX") in
-  let grbm_at = Register.address g grbm in
+  let grbm_at = Register.address g grbm and page_at = page_register g in
   let field w f =
     let lo, hi = List.assoc f grbm.fields in
     (w lsr lo) land ((1 lsl (hi - lo + 1)) - 1)
   in
   let selected = ref None and dies = ref None and predicated = ref 0 in
   let out = ref [] in
-  let rec engines : int Packet.term -> int list = function
-    | Value e -> [ e ]
-    | Add (t, _) | Shift (t, _) | Or (t, _) -> engines t
+  let on (op, body) =
+    let dies_now = if !predicated > 0 then !dies else None in
+    if !predicated > 0 then
+      predicated := !predicated - (List.length body + 1);
+    let use engine =
+      out := { engine; dies = dies_now; selected = !selected } :: !out
+    in
+    let write at v =
+      if at = grbm_at then
+        selected :=
+          if field v "se_broadcast_writes" = 1 then None
+          else Some (field v "se_index")
+      else if at = page_at then
+        let off = (v * page) - buffers in
+        if off < 0 || off mod size <> 0 then
+          failf "page 0x%x starts no engine's buffer" v
+        else use (off / size)
+    in
+    match body with
+    | [ w ] when op = S.pred_exec ->
+        dies := Some (w lsr 24);
+        predicated := w land 0x3fff
+    | off :: vs when op = S.set_uconfig_reg ->
+        List.iteri (fun i v -> write (S.uconfig_start + off + i) v) vs
+    | off :: vs when op = S.set_sh_reg ->
+        List.iteri (fun i v -> write (S.sh_start + off + i) v) vs
+    | [ _; _; _; lo; hi ] when op = copy_data ->
+        use (((lo lor (hi lsl 32)) - ends) / 4)
+    | _ -> ()
   in
-  let use dies t =
-    List.iter
-      (fun engine -> out := { engine; dies; selected = !selected } :: !out)
-      (engines t)
-  in
-  let rec go = function
-    | [] -> ()
-    | Packet.Dword h :: rest ->
-        let op = (h lsr 8) land 0xff and n = ((h lsr 16) land 0x3fff) + 1 in
-        let body, rest = split n rest in
-        let dies_now = if !predicated > 0 then !dies else None in
-        if !predicated > 0 then
-          predicated := !predicated - (Packet.size body + 1);
-        (match (op, body) with
-        | op, [ Dword w ] when op = S.pred_exec ->
-            dies := Some (w lsr 24);
-            predicated := w land 0x3fff
-        | op, Dword off :: [ Dword w ]
-          when op = S.set_uconfig_reg && S.uconfig_start + off = grbm_at ->
-            selected :=
-              if field w "se_broadcast_writes" = 1 then None
-              else Some (field w "se_index")
-        | _ -> ());
-        List.iter
-          (function Packet.W32 t | W64 t -> use dies_now t | Dword _ -> ())
-          body;
-        go rest
-    | (W32 _ | W64 _) :: _ -> fail "a packet starts with a term"
-  in
-  go p;
+  List.iter on (S.packets (S.words p));
   List.rev !out
 
 let engines (g : Gpu.t) = List.init (g.shader_engines * g.xccs) Fun.id
-let start g = Thread_trace.start g ~wgps:(S.harvest_none g)
-let stop g = Thread_trace.stop g ~wgps:(S.harvest_none g)
+let start g ~size =
+  Thread_trace.start g ~wgps:(S.harvest_none g) ~size ~address:buffers
+
+let stop g = Thread_trace.stop g ~wgps:(S.harvest_none g) ~address:ends
 
 (* The uses an engine's number must have: its die's predication on a GPU of
    several dies, and its engine selected. *)
@@ -115,53 +125,60 @@ let traced =
      and+ shader_engines = int_range 1 8 in
      gpu ~xccs ~shader_engines gc)
 
+(* Buffer sizes that tell an engine's offset [e * size] from [e * 4096]. *)
+let sizes = [ page; 3 * page; 1 lsl 20 ]
+
+(* Each engine that runs work uses its own address, as [expected] states. An
+   engine whose arrays all run no work, harvested, is neither programmed nor
+   awaited. An engine of one array off and one on runs work. *)
 let engine_law name program =
-  prop ~timeout name traced (fun g ->
-      let us = uses g (program g) in
-      List.iter
-        (fun e ->
-          let mine = List.filter (fun u -> u.engine = e) us in
-          if mine = [] then failf "engine %d is unused" e;
+  let gen =
+    Gen.with_pp
+      (fun ppf ((g : Gpu.t), size, off) ->
+        Format.fprintf ppf "GC %s, %d dies of %d engines, %d bytes each, %s off"
+          (S.version g.gc) g.xccs g.shader_engines size
+          (String.concat " " (List.map string_of_int off)))
+      (let open Gen in
+       let* g = traced in
+       let n = g.shader_engines * g.xccs in
+       let some = list ~size:(int_range 1 n) (int_range 0 (n - 1)) in
+       let+ size = of_list sizes
+       and+ off =
+         frequency
+           [
+             (1, constant []);
+             (1, constant (List.init n Fun.id));
+             (2, map (List.sort_uniq compare) some);
+           ]
+       in
+       (g, size, off))
+  in
+  prop ~timeout name gen (fun (g, size, off) ->
+      let n = g.shader_engines * g.xccs in
+      cover "a buffer of more than a page" (size > page);
+      cover "no engine off" (off = []);
+      cover "every engine off" (List.length off = n);
+      let wgps =
+        Array.init n (fun e ->
+            if List.mem e off then [| 0; 0 |] else [| 0; 1 |])
+      in
+      let us = uses g ~size (program g ~wgps ~size) in
+      let check e =
+        let mine = List.filter (fun u -> u.engine = e) us in
+        if List.mem e off then
+          equal int ~msg:(strf "uses of harvested engine %d" e) 0
+            (List.length mine)
+        else if mine = [] then failf "engine %d is unused" e
+        else
           List.iter
             (fun u ->
               equal ~msg:(strf "engine %d" e)
                 (Testable.make ~pp:pp_use ~equal:( = ))
                 (expected g e) u)
-            mine)
-        (engines g);
-      List.iter (fun u -> less int ~than:(List.length (engines g)) u.engine) us)
-
-(* An engine whose arrays all run no work, harvested, is neither programmed nor
-   awaited: its die's other engines are, each as [engine_law] states. *)
-let harvested name program =
-  let gen =
-    Gen.with_pp
-      (fun ppf ((g : Gpu.t), off) ->
-        Format.fprintf ppf "GC %s, %d dies of %d engines, %s off"
-          (S.version g.gc) g.xccs g.shader_engines
-          (String.concat " " (List.map string_of_int off)))
-      (let open Gen in
-       let* g = traced in
-       let n = g.shader_engines * g.xccs in
-       let+ off = list ~size:(int_range 1 n) (int_range 0 (n - 1)) in
-       (g, List.sort_uniq compare off))
-  in
-  prop ~timeout name gen (fun (g, off) ->
-      let wgps =
-        Array.init (g.shader_engines * g.xccs) (fun e ->
-            if List.mem e off then [| 0; 0 |] else [| 0; 1 |])
+            mine
       in
-      cover "every engine off" (List.length off = g.shader_engines * g.xccs);
-      let us = uses g (program g wgps) in
-      List.iter
-        (fun e ->
-          let mine = List.filter (fun u -> u.engine = e) us in
-          if List.mem e off then
-            equal int
-              ~msg:(strf "uses of harvested engine %d" e)
-              0 (List.length mine)
-          else if mine = [] then failf "engine %d is unused" e)
-        (engines g))
+      List.iter check (engines g);
+      List.iter (fun u -> less int ~than:n u.engine) us)
 
 (* The GC versions whose trace programs differ in their size register: GFX9's
    SQ_THREAD_TRACE_SIZE, GFX11's BUF0_SIZE beside the address's top bits,
@@ -180,7 +197,7 @@ let size_field (g : Gpu.t) size =
   in
   let r = Option.get (Register.find g name) in
   let lo, hi = List.assoc "size" r.fields in
-  let ws = S.encode (start g ~size (fun _ -> 0)) in
+  let ws = S.words (start g ~size) in
   let v = List.assoc (Register.address g r) (S.writes ws) in
   (v lsr lo) land ((1 lsl (hi - lo + 1)) - 1)
 
@@ -201,7 +218,7 @@ let selection () =
       | _ :: rest -> engines e rest
       | [] -> []
     in
-    engines 0 (S.writes (S.encode (start g ~size:4096 (fun _ -> 0))))
+    engines 0 (S.writes (S.words (start g ~size:4096)))
   in
   String.concat "\n" (List.concat_map lines trace_families)
 
@@ -220,54 +237,57 @@ let recording =
           GFX 12.0.0 engine 1: MASK 0x15400 TOKEN_MASK 0x83f6000
           GFX 12.0.0 engine 2: MASK 0x15400 TOKEN_MASK 0x83f6127
           |});
-      engine_law "a start programs each engine's buffer on that engine"
-        (fun g -> start g ~size:4096 Fun.id);
-      engine_law "a stop stores each engine's end from that engine" (fun g ->
-          stop g Fun.id);
-      harvested "a start programs no engine whose arrays run no work"
-        (fun g wgps -> Thread_trace.start g ~wgps ~size:4096 Fun.id);
-      harvested "a stop awaits no engine whose arrays run no work"
-        (fun g wgps -> Thread_trace.stop g ~wgps Fun.id);
+      engine_law
+        "a start programs each engine's buffer on it, and no harvested one"
+        (fun g ~wgps ~size ->
+          Thread_trace.start g ~wgps ~size ~address:buffers);
+      engine_law
+        "a stop stores each engine's end from it, and no harvested one's"
+        (fun g ~wgps ~size:_ -> Thread_trace.stop g ~wgps ~address:ends);
       prop "a start and a stop acquire every cache before and after" traced
         (fun g ->
           let acquire = S.encode (Pm4.acquire_mem g System) in
           let n = List.length acquire in
           List.iter
             (fun p ->
-              let ws = S.encode (p g) in
+              let ws = S.words (p g) in
               let k = List.length ws in
               equal
                 (pair (list int) (list int))
                 (acquire, acquire)
                 ( List.filteri (fun i _ -> i < n) ws,
                   List.filteri (fun i _ -> i >= k - n) ws ))
-            [
-              (fun g -> start g ~size:4096 (fun _ -> 0));
-              (fun g -> stop g (fun _ -> 0));
-            ]);
+            [ start ~size:page; stop ]);
       cases ~name:string_of_int "a size of no whole pages is refused"
         [ min_int; -4096; 0; 1; 4095; 4097 ] (fun size ->
           raises_match (Exn.invalid_arg ~substring:"Thread_trace.start")
-            (fun () -> start (gpu (11, 0, 0)) ~size (fun _ -> 0)));
+            (fun () -> start (gpu (11, 0, 0)) ~size));
+      cases ~name:string_of_int "a buffer address of no whole pages is refused"
+        [ min_int; -4096; -1; 1; 4095; 4097 ] (fun address ->
+          raises_match (Exn.invalid_arg ~substring:"Thread_trace.start")
+            (fun () ->
+              let g = gpu (11, 0, 0) in
+              Thread_trace.start g ~wgps:(S.harvest_none g) ~size:page ~address));
+      cases ~name:string_of_int "an end address of no whole words is refused"
+        [ min_int; -4; -1; 1; 2; 3; 4097 ] (fun address ->
+          raises_match (Exn.invalid_arg ~substring:"Thread_trace.stop")
+            (fun () ->
+              let g = gpu (11, 0, 0) in
+              Thread_trace.stop g ~wgps:(S.harvest_none g) ~address));
       cases ~name:string_of_int
         "a harvest of another number of engines than the GPU's is refused"
         [ 3; 5 ] (fun n ->
           let g = gpu (11, 0, 0) and wgps = Array.make n [| 1 |] in
           raises_match (Exn.invalid_arg ~substring:"Thread_trace.start")
-            (fun () -> Thread_trace.start g ~wgps ~size:4096 (fun _ -> 0));
+            (fun () -> Thread_trace.start g ~wgps ~size:page ~address:buffers);
           raises_match (Exn.invalid_arg ~substring:"Thread_trace.stop")
-            (fun () -> Thread_trace.stop g ~wgps (fun _ -> 0)));
+            (fun () -> Thread_trace.stop g ~wgps ~address:ends));
       test "a GC without the programs' registers is refused" (fun () ->
           let g = gpu (10, 3, 0) in
           raises_match (Exn.invalid_arg ~substring:"Thread_trace.start")
-            (fun () -> start g ~size:4096 (fun _ -> 0));
+            (fun () -> start g ~size:page);
           raises_match (Exn.invalid_arg ~substring:"Thread_trace.stop")
-            (fun () -> stop g (fun _ -> 0)));
-      cases ~name:string_of_int "a size of whole pages is taken"
-        [ 4096; 1 lsl 30 ]
-        (fun size ->
-          let p = start (gpu (11, 0, 0)) ~size (fun _ -> 0) in
-          greater int ~than:0 (Packet.size p));
+            (fun () -> stop g));
       cases
         ~name:(fun (g, size) -> strf "GC %s, %d" (S.version g.Gpu.gc) size)
         "a size past 2^22 - 1 pages is refused"
@@ -276,7 +296,7 @@ let recording =
            trace_families)
         (fun (g, size) ->
           raises_match (Exn.invalid_arg ~substring:"Thread_trace.start")
-            (fun () -> start g ~size (fun _ -> 0)));
+            (fun () -> start g ~size));
       cases
         ~name:(fun (g, size) -> strf "GC %s, %d" (S.version g.Gpu.gc) size)
         "a size up to 2^22 - 1 pages is the size field's pages"
@@ -300,76 +320,16 @@ let recording =
 
 (* Decoding *)
 
-(* Traces this suite writes from a list of events, as GFX12 lays out its
-   packets: AMD's MIT-licensed rocprof-trace-decoder, source/gfx12. *)
-
-type key = { sa : int; wgp : int; simd : int; slot : int }
-
-type event =
-  | Gap of int  (** Cycles pass. *)
-  | Start of key * bool  (** A wave starts; [true] holds the gap in it. *)
-  | End of key * bool  (** A wave ends. *)
-  | Mark of int  (** A clock marker, at a slope of the realtime clock. *)
-  | Data of int  (** An [s_ttracedata_imm]'s byte: a 0x46 packet. *)
-  | Nop
-
-let pp_key ppf k =
-  Format.fprintf ppf "{sa %d; wgp %d; simd %d; slot %d}" k.sa k.wgp k.simd
-    k.slot
-
-let pp_event ppf = function
-  | Gap n -> Format.fprintf ppf "Gap %d" n
-  | Start (k, i) -> Format.fprintf ppf "Start (%a, %b)" pp_key k i
-  | End (k, i) -> Format.fprintf ppf "End (%a, %b)" pp_key k i
-  | Mark s -> Format.fprintf ppf "Mark %d" s
-  | Data d -> Format.fprintf ppf "Data %d" d
-  | Nop -> Format.fprintf ppf "Nop"
-
-(* Keys of few values, so that waves share them, at the fields' edges. *)
-let key =
-  let open Gen in
-  let+ sa = int_range 0 1
-  and+ wgp = of_list [ 0; 1; 7 ]
-  and+ simd = int_range 0 3
-  and+ slot = of_list [ 0; 1; 15 ] in
-  { sa; wgp; simd; slot }
-
-let event key =
-  let open Gen in
-  frequency
-    [
-      (3, map (fun n -> Gap n) (int_range 0 20));
-      (1, map (fun n -> Gap n) (int_range 0 (1 lsl 24)));
-      (3, map (fun (k, i) -> Start (k, i)) (pair key bool));
-      (3, map (fun (k, i) -> End (k, i)) (pair key bool));
-      (1, map (fun s -> Mark s) (int_range 1 8));
-      (1, map (fun d -> Data d) (int_range 0 255));
-      (1, constant Nop);
-    ]
-
-(* Events over a few keys, so that waves end and keys come back. *)
-let traces =
-  Gen.with_pp
-    (fun ppf evs ->
-      Format.fprintf ppf "[%a]"
-        (Format.pp_print_list
-           ~pp_sep:(fun ppf () -> Format.fprintf ppf "; ")
-           pp_event)
-        evs)
-    (let open Gen in
-     let* keys = list ~size:(int_range 1 3) key in
-     list ~size:(int_range 0 60) (event (of_list keys)))
+(* GFX12 traces written by hand, as GFX12 lays out its packets: AMD's
+   MIT-licensed rocprof-trace-decoder, source/gfx12. *)
 
 let gfx12 = gpu (12, 0, 1)
 
 (* A stream of nibbles, least significant first. *)
-type stream = { mutable units : (int * int) list; mutable length : int }
+type stream = { mutable units : (int * int) list }
 
-let stream () = { units = []; length = 0 }
-
-let put s ~units v =
-  s.units <- (v, units) :: s.units;
-  s.length <- s.length + units
+let stream () = { units = [] }
+let put s ~units v = s.units <- (v, units) :: s.units
 
 let bytes s =
   let b = Buffer.create 64 and acc = ref 0 and bits = ref 0 in
@@ -391,6 +351,9 @@ let bytes s =
 (* The trace's header, of version 4. *)
 let header s = put s ~units:16 (0x11 lor (4 lsl 7))
 
+(* A wave's slot: its shader array, work-group processor, SIMD and slot. *)
+type key = { sa : int; wgp : int; simd : int; slot : int }
+
 (* A wave's compute unit: its work-group processor, its array above it. *)
 let cu k = k.wgp lor (k.sa lsl 4)
 
@@ -405,99 +368,31 @@ let wave ~start ~delta k =
       0b10101 lor (delta lsl 5) lor (k.sa lsl 8) lor (k.simd lsl 9)
       lor (k.wgp lsl 11) lor (k.slot lsl 15) )
 
-(* The largest delta a wave event's own field holds. *)
-let inline_max ~start = if start then 3 else 7
+(* A trace's events. A wave's start or end holds the cycles since the packet
+   before it in its own delta field: at most 3 for a start, 7 for an end. *)
+type event =
+  | Gap of int  (** Cycles pass: 4 to 19 in a short packet, others long. *)
+  | Start of key * int
+  | End of key * int
+  | Mark of int  (** A realtime marker of this realtime. *)
 
-type wave_t = { key : key; start : int; stop : int }
-
-(* What a trace of [events] holds, as the .mli states it: waves paired by key,
-   an end with its key's latest start, a start on an open key leaving the one
-   before it no wave, in the order they end, each with the nibble where its
-   end's packet ends; and markers, as (shader time, realtime). *)
-type model = {
-  trace : string;
-  waves : (wave_t * int) list;
-  markers : (int * int) list;
-}
-
-let write evs =
+let trace evs =
   let s = stream () in
   header s;
-  let time = ref 0 and pending = ref 0 in
-  let flush () =
-    let d = !pending in
-    pending := 0;
-    if d >= 4 && d <= 19 then put s ~units:2 (0b1000 lor ((d - 4) lsl 4))
-    else if d > 0 then put s ~units:16 (0x01 lor (d lsl 12))
+  let on = function
+    | Gap n when n >= 4 && n <= 19 ->
+        put s ~units:2 (0b1000 lor ((n - 4) lsl 4))
+    | Gap n -> put s ~units:16 (0x01 lor (n lsl 12))
+    | Start (k, delta) ->
+        let units, v = wave ~start:true ~delta k in
+        put s ~units v
+    | End (k, delta) ->
+        let units, v = wave ~start:false ~delta k in
+        put s ~units v
+    | Mark rt -> put s ~units:16 (0x01 lor (1 lsl 7) lor (rt lsl 12))
   in
-  let open_ = Hashtbl.create 8 in
-  let waves = ref [] and markers = ref [] and last_rt = ref None in
-  let on_wave ~start k inline =
-    let delta =
-      if inline && !pending <= inline_max ~start then begin
-        let d = !pending in
-        pending := 0;
-        d
-      end
-      else begin
-        flush ();
-        0
-      end
-    in
-    let units, v = wave ~start ~delta k in
-    put s ~units v
-  in
-  List.iter
-    (function
-      | Gap n ->
-          time := !time + n;
-          pending := !pending + n
-      | Start (k, inline) ->
-          on_wave ~start:true k inline;
-          Hashtbl.replace open_ k !time
-      | End (k, inline) ->
-          on_wave ~start:false k inline;
-          Option.iter
-            (fun start ->
-              Hashtbl.remove open_ k;
-              waves := ({ key = k; start; stop = !time }, s.length) :: !waves)
-            (Hashtbl.find_opt open_ k)
-      | Mark slope -> (
-          match !last_rt with
-          | Some (t, _) when t = !time -> ()
-          | last ->
-              flush ();
-              let rt =
-                match last with
-                | None -> 1_000_000 + !time
-                | Some (t, r) -> r + (slope * (!time - t))
-              in
-              put s ~units:16 (0x01 lor (1 lsl 7) lor (rt lsl 12));
-              last_rt := Some (!time, rt);
-              markers := (!time, rt) :: !markers)
-      | Data d ->
-          (* Its byte at bits 22 to 29, its delta field 0. *)
-          flush ();
-          put s ~units:8 (0x46 lor (d lsl 22))
-      | Nop -> put s ~units:1 0)
-    evs;
-  flush ();
-  { trace = bytes s; waves = List.rev !waves; markers = List.rev !markers }
-
-(* Whether [evs] start a key that is open: a trace that lost a wave's end. *)
-let restarts evs =
-  let open_ = Hashtbl.create 8 in
-  List.exists
-    (function
-      | Start (k, _) ->
-          let restart = Hashtbl.mem open_ k in
-          Hashtbl.replace open_ k ();
-          restart
-      | End (k, _) ->
-          Hashtbl.remove open_ k;
-          false
-      | Gap _ | Mark _ | Data _ | Nop -> false)
-    evs
+  List.iter on evs;
+  bytes s
 
 let decoded =
   Testable.make
@@ -506,22 +401,52 @@ let decoded =
         w.start w.stop)
     ~equal:( = )
 
-let as_decoded ({ key = k; start; stop }, _) : Thread_trace.wave =
+let wave_of k start stop : Thread_trace.wave =
   { cu = cu k; simd = k.simd; slot = k.slot; start; stop }
+
+(* A slot at each field's zero, one at each field's edge, and slots that
+   differ from the first in one field. *)
+let a = { sa = 0; wgp = 0; simd = 0; slot = 0 }
+let b = { sa = 1; wgp = 15; simd = 3; slot = 31 }
+
+let one_off =
+  [
+    { a with sa = 1 };
+    { a with wgp = 15 };
+    { a with simd = 3 };
+    { a with slot = 31 };
+  ]
+
+(* Traces and the waves the .mli states for them. *)
+let pairings =
+  [
+    ( "an end pairs with its slot's start, in the order waves end",
+      [
+        Start (a, 0);
+        Gap 5;
+        Start (b, 0);
+        Gap 10;
+        End (b, 0);
+        Gap 1000;
+        End (a, 7);
+      ],
+      [ wave_of b 5 15; wave_of a 0 1022 ] );
+    ( "a start on an open slot drops the wave before it",
+      [ Start (a, 3); Gap 4; Start (a, 0); Gap 19; End (a, 0) ],
+      [ wave_of a 7 26 ] );
+    ( "an end with no start since the slot's last end is dropped",
+      [ End (a, 0); Start (a, 1); Gap 20; End (a, 0); End (a, 2) ],
+      [ wave_of a 1 21 ] );
+    ( "slots that differ in one field pair apart",
+      List.map (fun k -> Start (k, 1)) (a :: one_off)
+      @ List.rev_map (fun k -> End (k, 1)) (a :: one_off),
+      List.rev
+        (List.mapi (fun i k -> wave_of k (i + 1) (10 - i)) (a :: one_off)) );
+  ]
 
 (* Zero bytes after a trace: no-ops, which the hardware writes up to a whole
    32-byte unit. *)
 let padding = String.make 32 '\000'
-
-(* The realtime of shader time [t] on the line of [markers] around it. *)
-let realtime markers t =
-  let rec go = function
-    | (s0, r0) :: ((s1, r1) :: rest' as rest) ->
-        if t < s1 || rest' = [] then r0 + ((t - s0) * (r1 - r0) / (s1 - s0))
-        else go rest
-    | _ -> invalid_arg "realtime"
-  in
-  go markers
 
 (* A trace an R9700 wrote (fixtures/README.md): its waves, each with its compute
    unit, SIMD, slot and times, and how many there are. Its 0x06 and 0x46 packets
@@ -689,47 +614,31 @@ let decoding =
           List.iter
             (fun offset -> extended_start ~offset continuations)
             [ 0; 1 ]);
-      prop "a trace's waves pair each end with its key's latest open start"
-        traces (fun evs ->
-          let m = write evs in
-          cover "a wave" (m.waves <> []);
-          cover "a 0x46 packet"
-            (List.exists (function Data _ -> true | _ -> false) evs);
-          cover "a wave whose key ends twice"
-            (List.length
-               (List.sort_uniq compare (List.map (fun (w, _) -> w.key) m.waves))
-            < List.length m.waves);
-          cover "a start on an open key" (restarts evs);
-          equal (list decoded)
-            (List.map as_decoded m.waves)
-            (Thread_trace.waves gfx12 (m.trace ^ padding)));
-      prop "a trace's clock passes through its markers, and their lines" traces
-        (fun evs ->
-          let m = write evs in
-          match (m.markers, Thread_trace.clock gfx12 (m.trace ^ padding)) with
-          | ([] | [ _ ]), c -> is_none ~msg:"fewer than two markers" c
-          | (s0, _) :: _, None -> failf "no clock from the markers at %d" s0
-          | markers, Some f ->
-              cover "three markers" (List.length markers > 2);
-              let first = fst (List.hd markers) in
-              let last = fst (List.hd (List.rev markers)) in
-              let ts =
-                [ first - 1000; first; last; last + 1000 ]
-                @ List.concat_map (fun (s, _) -> [ s; s + 1 ]) markers
-              in
-              List.iter
-                (fun t ->
-                  equal ~msg:(strf "time %d" t) int (realtime markers t) (f t))
-                ts);
-      prop "a trace cut short yields the waves of its whole packets" traces
-        (fun evs ->
-          let m = write evs in
-          for n = 0 to String.length m.trace do
-            let whole = List.filter (fun (_, e) -> e * 4 <= 8 * n) m.waves in
+      cases ~name:(fun (n, _, _) -> n) "a trace's waves" pairings
+        (fun (_, evs, expected) ->
+          equal (list decoded) expected (Thread_trace.waves gfx12 (trace evs)));
+      cases
+        ~name:(fun (n, _, _) -> n)
+        "a trace cut short yields a prefix of its waves" pairings
+        (fun (_, evs, expected) ->
+          let t = trace evs in
+          for n = 0 to String.length t - 1 do
+            let got = Thread_trace.waves gfx12 (String.sub t 0 n) in
+            let k = List.length got in
             equal ~msg:(strf "%d bytes" n) (list decoded)
-              (List.map as_decoded whole)
-              (Thread_trace.waves gfx12 (String.sub m.trace 0 n))
+              (List.filteri (fun i _ -> i < k) expected)
+              got
           done);
+      test "a trace's clock runs on the line through the markers around a time"
+        (fun () ->
+          let t = trace [ Mark 1000; Gap 10; Mark 1100; Gap 20; Mark 1140 ] in
+          let f = require_some (Thread_trace.clock gfx12 (t ^ padding)) in
+          equal (list int)
+            [ 900; 1000; 1010; 1050; 1100; 1102; 1120; 1140; 1142; 1160 ]
+            (List.map f [ -10; 0; 1; 5; 10; 11; 20; 30; 31; 40 ]));
+      test "a trace of one marker has no clock" (fun () ->
+          let t = trace [ Gap 5; Mark 1000 ] in
+          is_none (Thread_trace.clock gfx12 (t ^ padding)));
       cases ~name:S.version "an empty trace has no waves and no clock"
         [ (9, 4, 3); (11, 0, 0); (12, 0, 1) ]
         (fun v ->

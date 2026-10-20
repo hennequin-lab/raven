@@ -130,15 +130,6 @@ type 'region facts = {
           first queue lets copies run beside the first queue's work. *)
   completion : completion;  (** How the word advances. *)
   waits : waits;  (** The producers its queues wait for. *)
-  most_parts : int;
-      (** The most parts the idle device always runs in one submission, once
-          its queues have grown for them, [max_int] where the driver has no
-          such bound: that many launches and fills up to the argument size,
-          and copies up to the length, that the driver's [.mli] states.
-          [room] must never answer [RIG_NEVER] for such a submission of parts
-          the device runs ({!section-calls}), and may answer [RIG_GROW].
-          Words parts, and larger launches and copies, take the room their
-          sizes take, and [room] alone judges a submission of more parts. *)
   may_block : bool;
       (** Whether [room], [submit] and [commit] ({!section-calls}) may block
           on the device's own earlier work, its own transfers or its
@@ -186,8 +177,8 @@ type 'region facts = {
 (** The type for the facts of a device. A {!Driver.Fault} while rig reads
     them makes the open return [Error]. The open raises [Invalid_argument]
     if [copy_engine] names no queue of [queues] or one whose [runs] lacks
-    [Copy], [most_parts] or [hang_ms] is below [1], [alignment] is not a
-    power of two, [edge] is [0n], or the state's first member is [NULL]. rig
+    [Copy], [hang_ms] is below [1], [alignment] is not a power of two,
+    [edge] is [0n], or the state's first member is [NULL]. rig
     checks nothing else of [edge]. A region {!Driver.alloc} makes that breaks
     [host_addresses] or [alignment] is a fault of the device: rig frees the
     region and loses the device, and the allocation raises [Rig.Lost]. *)
@@ -218,10 +209,10 @@ type 'region facts = {
        encoded, and [RIG_FAILED] if it failed, which loses the device. While a
        profile is taken, it is given a pair of times, where it must write
        when the value's work started and ended on the device, on the host's
-       clock, or leave both [0] for work it cannot time. It writes them
-       before the word shows the value if [settle] is [NULL], and before
-       [settle] of the value returns otherwise. rig gives the pair to no
-       other value until then.}
+       clock ([rig_now_ns] in [rig_edge.h]), or leave both [0] for work it
+       cannot time. It writes them before the word shows the value if
+       [settle] is [NULL], and before [settle] of the value returns
+       otherwise. rig gives the pair to no other value until then.}
     {- [commit] is given a value [v] no greater than the last value given to
        [submit], and lets the work up to [v] run. Once that work has
        completed, the device writes [v] or a later value into the word.
@@ -252,7 +243,10 @@ type 'region facts = {
 
     rig calls the four one at a time for each device, with [room] before
     each [submit]. They must call no function of the OCaml runtime and read
-    no OCaml value, since rig may call them with the runtime released.
+    no OCaml value, since rig may call them with the runtime released. A
+    [submit], [commit] or [settle] that returns [RIG_FAILED] sets
+    [*failure] to the driver's message, which must live as long as the
+    device.
 
     Each submission holds [RIG_SCRATCH] bytes of {e scratch} for each of its
     parts, which rig hands to [room] and [submit] with the parts. Either may
@@ -378,8 +372,8 @@ type grown =
     public functions, must start the same way: each must raise
     [Invalid_argument], having changed nothing, while [rig_holds ()] is not
     [0]. {!Driver.locate}, {!Driver.peer} and {!Driver.val-signaled} check
-    nothing and must take no lock. rig calls [locate] and [peer] at any
-    time, and [signaled] while it holds a lock of its own. A function that
+    nothing and must take no lock, since rig calls [signaled] while it
+    holds a lock of its own and the other two at any time. A function that
     takes no lock may be called from a callback at any point.
 
     {b Warning.} Another caller must call the functions of this signature
@@ -592,11 +586,10 @@ end
     device. Any other reaches the caller, since no work of the device can
     see a change it left half done. The library must leave each region it
     made readable, writable and freeable after an exception escapes any of
-    its calls, and must give back its locks as a driver does
-    ({!section-drivers}).
+    its calls.
 
-    The library must count its locks and check its own functions as a
-    driver does ({!section-drivers}). *)
+    The library must count its locks, check its own functions and give back
+    its locks as a driver does ({!section-drivers}). *)
 module type Io = sig
   type t
   (** The type for open io devices. *)

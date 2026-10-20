@@ -10,9 +10,8 @@
     each over the values of the nodes it reads; a constant or a coordinate is a
     creation of the map's shape. A reduction or a scan that is not plain, one
     monoid of its operand itself accumulated and rounded in the operand's dtype,
-    expands into a map of each output it reduces into its accumulator ([float32]
-    for the floats narrower than 32 bits, the byte-wide dtype for the sub-byte
-    ones, the output's dtype otherwise), the plain loop, and a cast to the
+    expands into a map of each output it reduces into its accumulator, the
+    output's carrier ({!Nx_kernel.carrier}), the plain loop, and a cast to the
     result's dtype. A sum of complex numbers sums their parts, read as floats
     along a last axis of two.
 
@@ -52,18 +51,19 @@
     result of these scans, carried through the combinations with its bits,
     is then quieted, as the kernels give it.
 
-    A one-node map at a dtype other than a base one ({!base}), but a cast, a
-    bitcast or a copy, computes at its dtypes' accumulators, which hold their
-    values exactly, and rounds once to its dtype. A selection, a constant and a
-    copy move bits: they compute at the dtypes {!kept} gives; a [Copy] is the
-    map of one copy. An assembly expands into a fill of its flat result, then
-    per piece in order a scatter of the piece's elements at their flat
+    A one-node map at a dtype other than a base one ({!Nx_kernel.base}), but a
+    cast, a bitcast or a copy, computes at its dtypes' accumulators, which hold
+    their values exactly, and rounds once to its dtype. A selection, a constant
+    and a copy move bits: they compute at the dtypes {!kept} gives; a [Copy] is
+    the map of one copy. An assembly expands into a fill of its flat result,
+    then per piece in order a scatter of the piece's elements at their flat
     positions, a map of coordinates: O(n) per piece. A gather, a scatter or a
     sort of a sub-byte dtype casts its values to their accumulator, computes
     there and casts the result back once; an integer's [Add] wraps there to the
     same bits as at its own dtype. Any other scatter whose targets may repeat is
-    one unique scatter per position along its axis, in order, each of the target
-    so far: O(m |into|) for m positions. A sum associates left to right; a
+    a loop of one unique scatter per position along its axis, in order, each of
+    the target so far and of that position's indices and updates, gathered at a
+    broadcast of the trip's index: O(m |into|) for m positions. A sum associates left to right; a
     narrow float's sums in its accumulator, rounded once, and a [Set] of [true]
     at the same targets keeps the bits of each target no update reaches: twice
     the scatters.
@@ -99,16 +99,13 @@
     unit roundoff, and a [C2r]'s [x] its completed bins. A routine has no
     expansion yet. Every other operation is core. *)
 
-val base : Nx_array.Dtype.any -> bool
-(** [base dt] is [true] for the dtypes every library's kernels compute: float32,
-    float64, the 8- to 64-bit integers and bool. *)
-
 val kept : Nx_array.Dtype.any -> Nx_array.Dtype.any
 (** [kept d] is the dtype a selection, a constant or a copy of [d] computes in
-    where a library declines [d]: [d] itself for a base dtype; for a float of 8
-    or 16 bits, the unsigned integer of its width, over the same bits; for a
-    sub-byte dtype, its byte-wide accumulator, which holds each of its codes and
-    gives it back; [d] itself otherwise. *)
+    where a library declines [d]: [d] itself for a base dtype
+    ({!Nx_kernel.base}); for a float of 8 or 16 bits, the unsigned integer of
+    its width, over the same bits; for a sub-byte dtype, its byte-wide
+    accumulator, which holds each of its codes and gives it back; [d] itself
+    otherwise. *)
 
 val single : Nx_kernel.Prog.t -> Nx_kernel.Prog.node option
 (** [single p] is [Some n] where [p] is the one node [n] over its operands in
@@ -156,9 +153,25 @@ val square_mod :
 val run :
   ('q. by:string -> 'q Value.prim -> 'q) ->
   by:string ->
+  repeat:
+    ('d.
+    int ->
+    ('d Value.index -> 'd Value.any list -> 'd Value.any list) ->
+    'd Value.any list ->
+    'd Value.any list) ->
   'r Value.prim ->
   'r option
-(** [run apply ~by op] is [Some r], [r] [op]'s expansion applied through
-    [apply], or [None] for a core case. No result of [r] is one of [op]'s
-    operands: one that would be is its copy. *)
+(** [run apply ~by ~repeat op] is [Some r], [r] [op]'s expansion applied
+    through [apply], or [None] for a core case. A loop of [n] trips runs as
+    [repeat n step init], whose law {!Nx.Prim.expand} states. No result of [r]
+    is one of [op]'s operands: one that would be is its copy. *)
+
+val folded :
+  ('q. by:string -> 'q Value.prim -> 'q) ->
+  by:string ->
+  'r Value.prim ->
+  'r option
+(** [folded apply ~by op] is {!run} with its loops folded now: each trip's
+    position is known, so a step reads it as views where {!run}'s gathers it
+    at a 0-d index. Its values are {!run}'s with a [repeat] that folds. *)
 

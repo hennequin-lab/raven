@@ -34,12 +34,16 @@ val max_numel : int
     product of any of its extents, a position times a width of at most 128
     bits, and a sum of a few of these fit in an [int]. *)
 
+val fits : int array -> bool
+(** [fits s] is [true] iff [s] is a layout's shape: at most {!max_rank}
+    extents, none negative, and those other than [0] multiplying to at most
+    {!max_numel}. It allocates nothing. *)
+
 val contiguous : int array -> t
 (** [contiguous s] is the layout of shape [s] in C order at offset 0: element
     [k] in C order is at position [k].
 
-    Raises [Invalid_argument] if [s] has more than {!max_rank} axes, a negative
-    extent, or extents other than [0] whose product exceeds {!max_numel}. *)
+    Raises [Invalid_argument] unless {!fits}[ s]. *)
 
 val v : ?offset:int -> strides:int array -> int array -> t
 (** [v ~offset ~strides s] is the layout of shape [s] with [strides] and
@@ -112,8 +116,8 @@ val coalesce : t array -> t array
     adjacent axes merged where every layout lays them out as one run. Each has
     at least one axis.
 
-    Raises [Invalid_argument] unless [ls] has 1 to 16 layouts, the most
-    operands and outputs of a program, all of one shape. *)
+    Raises [Invalid_argument] unless [ls] has 1 to {!Nx_array.max_operands}
+    layouts, all of one shape. *)
 
 (** {1:eq Equality} *)
 

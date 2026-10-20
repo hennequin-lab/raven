@@ -266,7 +266,6 @@ let account ?(reached_by = []) id ~reaches : Wire.account =
     name = (if id = 0 then "CPU" else Printf.sprintf "MEM:%d" id);
     arch = (if id = 0 then "arm64" else Printf.sprintf "mem%d" id);
     budget = (1 lsl 30) + id;
-    most_parts = 100 + id;
     alignment = 16 lsl id;
     reaches;
     reached_by;
@@ -400,8 +399,6 @@ let far_of_string d s =
   let b = B.create d (String.length s) in
   B.copy ~src:(host_buffer s) ~dst:b;
   b
-
-let random_string n = String.init n (fun _ -> Char.chr (Random.int 256))
 
 let copy_submission d ~src ~dst =
   Sub.make d

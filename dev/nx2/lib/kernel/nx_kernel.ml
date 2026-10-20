@@ -32,6 +32,35 @@ let accepts (type v s) r (dt : (v, s) D.t) =
   | (Monoid Logsumexp | Moments), _ -> false
   | _ -> true
 
+type any_float = Any_float : (float, 's) D.t -> any_float [@@unboxed]
+
+let float_carrier (type s) (dt : (float, s) D.t) =
+  match dt with
+  | Float16 | Bfloat16 | Float8_e4m3fn | Float8_e5m2 | Float4_e2m1fn ->
+      Any_float Float32
+  | Float32 | Float64 -> Any_float dt
+
+let carrier (D.Any dt as d) =
+  match D.kind dt with
+  | D.Float ->
+      let (Any_float c) = float_carrier dt in
+      D.Any c
+  | D.Complex | D.Signed | D.Unsigned | D.Boolean -> (
+      match dt with
+      | Int4 -> D.Any Int8
+      | Uint4 -> D.Any Uint8
+      | Bit -> D.Any Bool
+      | _ -> d)
+
+let base (D.Any dt) =
+  match dt with
+  | Float32 | Float64 | Int64 | Uint64 | Int32 | Uint32 | Int16 | Uint16 | Int8
+  | Uint8 | Bool ->
+      true
+  | Float16 | Bfloat16 | Float8_e4m3fn | Float8_e5m2 | Float4_e2m1fn | Int4
+  | Uint4 | Bit | Complex64 | Complex128 ->
+      false
+
 type order = Chain | Lane
 type combine = Set | Add | Max | Min
 
@@ -171,31 +200,34 @@ module Shape = struct
       Array.of_list
         (List.filteri (fun i _ -> not (Iarray.mem i axes)) (Array.to_list y))
     in
-    let terms = Iarray.fold_left (fun n a -> n * y.(a)) 1 axes in
     let total = Array.fold_left ( * ) 1 kept in
     let extreme = function Monoid (Max | Min) | Arg _ -> true | _ -> false in
-    if terms = 0 && total > 0 && Array.exists extreme rs then
-      Error "an extreme of no term"
-    else Ok kept
+    match Iarray.find_opt (fun a -> y.(a) = 0) axes with
+    | Some a when total > 0 && Array.exists extreme rs ->
+        errorf "an extreme of no term: no element along axis %d of %a" a pp y
+    | Some _ | None -> Ok kept
 
   let scan ~axis y =
     let* () = check_axes [| axis |] (Array.length y) in
     Ok y
 
-  (* Whether [x] and [y] have one rank, above [axis], and one extent along
-     every other axis. *)
+  (* Whether [x] and [y] have one rank and one extent along every axis but
+     [axis]. *)
   let off_axis axis x y =
     Array.length x = Array.length y
-    && axis >= 0
-    && axis < Array.length x
     && Array.for_all Fun.id (Array.mapi (fun i d -> i = axis || d = y.(i)) x)
 
   let gather ~axis idx x =
-    if off_axis axis idx x then Ok idx
+    if axis < 0 || axis >= Array.length x then
+      errorf "axis %d of an operand of rank %d" axis (Array.length x)
+    else if off_axis axis idx x then Ok idx
     else errorf "positions %a do not fit %a along axis %d" pp idx pp x axis
 
   let scatter ~axis into idx u =
-    if idx <> u then errorf "positions %a, updates %a" pp idx pp u
+    if axis < 0 || axis >= Array.length into then
+      errorf "axis %d of a target of rank %d" axis (Array.length into)
+    else if idx <> u then
+      errorf "positions %a and updates %a differ" pp idx pp u
     else if off_axis axis u into then Ok into
     else errorf "updates %a do not fit %a along axis %d" pp u pp into axis
 

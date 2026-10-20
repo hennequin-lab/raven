@@ -22,8 +22,8 @@ let unaries =
   P.
     [
       Neg; Recip; Abs; Sign; Sqrt; Exp; Exp2; Log; Log2; Log1p; Expm1; Sin;
-      Cos; Tan; Asin; Acos; Atan; Sinh; Cosh; Tanh; Erf; Floor; Ceil; Round;
-      Trunc;
+      Cos; Tan; Asin; Acos; Atan; Sinh; Cosh; Tanh; Asinh; Acosh; Atanh; Erf;
+      Floor; Ceil; Round; Trunc;
     ]
 
 let binaries =
@@ -64,6 +64,9 @@ let unary_name : P.unary -> string = function
   | Sinh -> "sinh"
   | Cosh -> "cosh"
   | Tanh -> "tanh"
+  | Asinh -> "asinh"
+  | Acosh -> "acosh"
+  | Atanh -> "atanh"
   | Erf -> "erf"
   | Floor -> "floor"
   | Ceil -> "ceil"
@@ -121,17 +124,20 @@ let numbers = Complex :: reals
 let every = Boolean :: numbers
 
 let unary_domain : P.unary -> cls list = function
-  | Neg | Recip -> numbers
-  | Abs | Sign | Floor | Ceil | Round | Trunc -> reals
-  | Sqrt | Exp | Exp2 | Log | Log2 | Log1p | Expm1 | Sin | Cos | Tan | Asin
-  | Acos | Atan | Sinh | Cosh | Tanh | Erf ->
-      [ Float ]
+  | Neg | Recip | Sign -> numbers
+  | Abs | Floor | Ceil | Round | Trunc -> reals
+  | Sqrt | Exp | Exp2 | Log | Log2 | Sin | Cos | Tan | Asin | Acos | Atan
+  | Sinh | Cosh | Tanh ->
+      [ Float; Complex ]
+  | Log1p | Expm1 | Erf -> [ Float ]
+  | Asinh | Acosh | Atanh -> [ Complex ]
 
 let binary_domain : P.binary -> cls list = function
   | Add | Sub | Mul -> numbers
   | Fdiv -> [ Float; Complex ]
   | Idiv -> integers
-  | Mod | Pow -> reals
+  | Mod -> reals
+  | Pow -> numbers
   | Atan2 -> [ Float ]
   | Maximum | Minimum -> every
   | And | Or | Xor -> Boolean :: integers
@@ -222,7 +228,8 @@ let test_domains_computed () =
     D.
       [
         Any Float32; Any Float64; Any Int8; Any Uint8; Any Int16; Any Uint16;
-        Any Int32; Any Uint32; Any Int64; Any Uint64; Any Bool;
+        Any Int32; Any Uint32; Any Int64; Any Uint64; Any Bool; Any Complex64;
+        Any Complex128;
       ]
   in
   let compute (D.Any dt as d) =
@@ -233,13 +240,16 @@ let test_domains_computed () =
     | Signed, _ -> `Int "i32"
     | Unsigned, 64 -> `Int "u64"
     | (Unsigned | Boolean), _ -> `Int "u32"
-    | Complex, _ -> invalid_arg "no compute type"
+    | Complex, 64 -> `C64
+    | Complex, _ -> `C128
   in
   let calls kind arity d =
     match compute d with
     | `F32 -> ignore (Nx_kinds_support.f32 kind (Array.make arity 0))
     | `F64 -> ignore (Nx_kinds_support.f64 kind (Array.make arity 0.))
     | `Int ty -> ignore (Nx_kinds_support.int ty kind (Array.make arity 0L))
+    | `C64 -> ignore (Nx_kinds_support.c64 kind (Array.make (2 * arity) 0))
+    | `C128 -> ignore (Nx_kinds_support.c128 kind (Array.make (2 * arity) 0.))
   in
   let identity = P.[ Floor; Ceil; Round; Trunc ] in
   List.iter
@@ -1050,12 +1060,22 @@ let test_exprs_kind_functions () =
   let u k f = same (unary_name k) (P.E.any (f x)) (P.E.any (P.E.op1 (Unary k) D.Float32 x)) in
   let b k f = same (binary_name k) (P.E.any (f x y)) (P.E.any (P.E.binary k x y)) in
   let cmp k f = same (compare_name k) (P.E.any (f x y)) (P.E.any (P.E.compare k x y)) in
-  List.iter2 u unaries
+  let complex_only = P.[ Asinh; Acosh; Atanh ] in
+  List.iter2 u
+    (List.filter (fun k -> not (List.mem k complex_only)) unaries)
     P.E.
       [
         neg; recip; abs; sign; sqrt; exp; exp2; log; log2; log1p; expm1; sin; cos;
         tan; asin; acos; atan; sinh; cosh; tanh; erf; floor; ceil; round; trunc;
       ];
+  let z = P.E.input 0 D.Complex64 in
+  let lowered_z e = (P.of_exprs ~ins:[| D.Any D.Complex64 |] [| e |]).nodes in
+  List.iter2
+    (fun k f ->
+      equal ~msg:(unary_name k) (array node)
+        (Iarray.to_array (lowered_z (P.E.any (P.E.op1 (Unary k) D.Complex64 z))))
+        (Iarray.to_array (lowered_z (P.E.any (f z)))))
+    complex_only P.E.[ asinh; acosh; atanh ];
   List.iter2 b
     P.[ Add; Sub; Mul; Fdiv; Mod; Pow; Atan2; Maximum; Minimum ]
     P.E.[ add; sub; mul; fdiv; rem; pow; atan2; maximum; minimum ];
@@ -1108,6 +1128,30 @@ let test_exprs_refuse () =
             P.[ Where; Fma ])
         base_dtypes)
     base_dtypes;
+  (* The kinds of floats and complex numbers check their operand, as no type
+     states that domain. *)
+  let z = P.E.input 0 D.Complex64 and n = P.E.input 0 D.Int32 in
+  let takes name (f : 'v 's. ('v, 's) P.E.t -> ('v, 's) P.E.t) =
+    refuses ~msg:(name ^ " complex64") false (fun () -> f z);
+    refuses ~msg:(name ^ " int32") true (fun () -> f n)
+  in
+  takes "sqrt" P.E.sqrt;
+  takes "exp" P.E.exp;
+  takes "exp2" P.E.exp2;
+  takes "log" P.E.log;
+  takes "log2" P.E.log2;
+  takes "sin" P.E.sin;
+  takes "cos" P.E.cos;
+  takes "tan" P.E.tan;
+  takes "asin" P.E.asin;
+  takes "acos" P.E.acos;
+  takes "atan" P.E.atan;
+  takes "sinh" P.E.sinh;
+  takes "cosh" P.E.cosh;
+  takes "tanh" P.E.tanh;
+  takes "asinh" P.E.asinh;
+  takes "acosh" P.E.acosh;
+  takes "atanh" P.E.atanh;
   raises_match ~msg:"an axis past max_rank" Exn.invalid_arg (fun () ->
       P.E.coord Nx_array.Layout.max_rank);
   raises_match ~msg:"a negative axis" Exn.invalid_arg (fun () -> P.E.coord (-1));

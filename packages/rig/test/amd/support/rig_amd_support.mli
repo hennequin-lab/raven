@@ -12,7 +12,8 @@ val driverless : unit -> bool
 val gpus : unit -> int
 (** [gpus ()] is the number of AMD GPUs the suites can open: amdgpu's
     ({!Rig_amd_amdgpu.count}), or, where the variable [RIG_AMD_PCI_FIRMWARE] is
-    set, the machine's ({!Rig_amd_pci.count}). *)
+    set, the machine's ({!Rig_amd_pci.count}), and [0] where the path cannot
+    list them. *)
 
 val gpu : unit -> Rig_amd.t Rig_edge.opener
 (** [gpu ()] describes GPU [0] through the selected kernel or PCI path. *)
@@ -92,8 +93,9 @@ module Edge : sig
       fill with a null function, or a copy of [n] bytes between address [0] and
       itself. It is a part a device may refuse. *)
 
-  val room : Rig_amd.t -> part array -> [ `Fits | `Later | `Never ]
-  (** [room g ps] is what [g]'s room entry answers for [ps]. *)
+  val room : Rig_amd.t -> part array -> [ `Fits | `Later | `Never | `Grow ]
+  (** [room g ps] is what [g]'s room entry answers for [ps]. A [`Grow]
+      leaves its request for {!Rig_amd.grow} on the calling thread. *)
 
   val submit :
     Rig_amd.t ->

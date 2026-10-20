@@ -276,6 +276,23 @@ let law_contiguous s =
   equal ints s (L.shape l);
   equal (list int) (List.init n Fun.id) (positions l)
 
+(* [fits] is the test its interface states, and {!L.contiguous} takes exactly
+   the shapes it holds of. *)
+let law_fits (s, _, _) =
+  let natural = Array.for_all (fun d -> d >= 0) s in
+  let expected = Array.length s <= L.max_rank && natural && numel s <> None in
+  cover "a layout's shape" expected;
+  cover "a negative extent" (not natural);
+  cover "too many elements" (natural && numel s = None);
+  let taken =
+    match L.contiguous s with _ -> true | exception Invalid_argument _ -> false
+  in
+  equal (pair bool bool) (expected, expected) (L.fits s, taken)
+
+let test_fits_rank () =
+  equal (pair bool bool) (true, false)
+    (L.fits (Array.make L.max_rank 1), L.fits (Array.make (L.max_rank + 1) 1))
+
 let refusals =
   [
     ("contiguous of too many axes", fun () -> L.contiguous (Array.make 33 1));
@@ -571,10 +588,6 @@ let law_header l =
 
 (* Coalescing *)
 
-(* CR: Extend this law to 16 layouts. The count case repeats one
-   contiguous layout, so it misses a later operand vetoing a merge.
-   Include 15 contiguous [2;3] layouts and a last [2;3] layout with
-   strides [1;2]; keep the existing position oracle and 16/17 checks. *)
 let same_shape =
   let open Gen in
   with_pp
@@ -588,11 +601,11 @@ let same_shape =
 (* Whether axes [i] and [i + 1] of [l] lie as one run. *)
 let one_run l i = L.stride l i = L.dim l (i + 1) * L.stride l (i + 1)
 
-let law_coalesce ls =
+(* [coalesce ls] checked against what its interface states: the layouts it
+   answers, of one shape. *)
+let coalesced ls =
   let cs = L.coalesce (Array.of_list ls) in
   let s = L.shape cs.(0) in
-  let rank = List.fold_left (fun r l -> max r (L.rank l)) 1 ls in
-  cover "merges axes" (Array.length s < rank);
   equal ~msg:"layouts" int (List.length ls) (Array.length cs);
   at_least ~msg:"rank" int ~than:1 (Array.length s);
   Array.iter (fun c -> equal ~msg:"one shape" ints s (L.shape c)) cs;
@@ -602,13 +615,24 @@ let law_coalesce ls =
     if Array.for_all (fun c -> one_run c i) cs then
       failf "axes %d and %d of %a lie as one run" i (i + 1) pp_ints s
   done;
-  List.iteri (fun k l -> equal (list int) (positions l) (positions cs.(k))) ls
+  List.iteri (fun k l -> equal (list int) (positions l) (positions cs.(k))) ls;
+  cs
 
+let law_coalesce ls =
+  let cs = coalesced ls in
+  let rank = List.fold_left (fun r l -> max r (L.rank l)) 1 ls in
+  cover "merges axes" (L.rank cs.(0) < rank)
+
+(* Up to 18 layouts, the last vetoing the merge of the contiguous ones
+   before it. *)
 let test_coalesce_counts () =
-  let a = L.contiguous [| 2; 3 |] in
-  equal int 16 (Array.length (L.coalesce (Array.make 16 a)));
+  let a = L.contiguous [| 2; 3 |] and t = L.v ~strides:[| 1; 2 |] [| 2; 3 |] in
+  let layouts n = List.init n (fun k -> if k = n - 1 then t else a) in
+  equal ~msg:"max_operands" int 18 Nx_array.max_operands;
+  List.iter (fun n -> ignore (coalesced (layouts n))) [ 1; 2; 17; 18 ];
   raises_match Exn.invalid_arg (fun () -> L.coalesce [||]);
-  raises_match Exn.invalid_arg (fun () -> L.coalesce (Array.make 17 a));
+  raises_match Exn.invalid_arg (fun () ->
+      L.coalesce (Array.of_list (layouts 19)));
   raises_match Exn.invalid_arg (fun () ->
       L.coalesce [| a; L.contiguous [| 3; 2 |] |])
 
@@ -642,6 +666,9 @@ let tests =
            fit"
           v_args law_v;
         prop "contiguous places element k at position k" shape law_contiguous;
+        prop ~count:1000 "fits is its test, and contiguous takes what it fits"
+          v_args law_fits;
+        test "fits takes max_rank axes and refuses one more" test_fits_rank;
         cases ~name:fst "refuses" refusals test_refuses;
         test "a shape with no element takes other extents up to max_numel"
           test_no_element;
@@ -697,7 +724,8 @@ let tests =
           "merges every run, drops extent-1 axes and keeps each layout's \
            positions in order"
           same_shape law_coalesce;
-        test "takes 1 to 16 layouts of one shape" test_coalesce_counts;
+        test "takes 1 to max_operands, 18, layouts of one shape"
+          test_coalesce_counts;
       ];
     test "pp shows shape, strides and offset" test_pp;
   ]

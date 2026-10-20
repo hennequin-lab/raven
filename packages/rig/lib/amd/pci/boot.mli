@@ -63,17 +63,17 @@ val space : Rig_pci.Space.t
     {!start}'s caller reserves it ({!Rig_pci.Machine.val-reserve}). *)
 
 val start :
-  gpus:int Lazy.t ->
+  gpus:(int, string) result Lazy.t ->
   Rig_pci.Function.t ->
   (Discovery.t ->
   (Regs.layout * Firmware.t, string) result) ->
   (t, [ `Refused of string | `Running | `Lost of string ]) result
-(** [start ~gpus f first] boots the GPU of [f], partially or fully as
-    {!plan} says. The caller took [f], reserved {!space} on its machine, and
-    counts [gpus] AMD GPUs there. [first d] returns the registers' layout
-    and the firmware from the GPU's discovery table [d], which the boot reads
-    before it writes anything. The GPU's memory joins its fabric as
-    {!Gmc.link} says.
+(** [start ~gpus f first] boots the GPU of [f], partially or fully as {!plan}
+    says. The caller took [f], reserved {!space} on its machine, and counts
+    [gpus] AMD GPUs there, or [Error why] if it cannot list them. [first d]
+    returns the registers' layout and the firmware from the GPU's discovery
+    table [d], which the boot reads before it writes anything. The GPU's memory
+    joins its fabric as {!Gmc.link} says.
 
     The GPU masters the bus only once it is booted, every flush has been
     confirmed ({!confirm}), and both hubs read back as translating
@@ -177,12 +177,31 @@ val queue :
   bytes:int ->
   read:int ->
   write:int ->
-  (int, string) result
+  (int, Rig_amd.refusal) result
 (** [queue g kind ~ring ~bytes ~read ~write] is [Rig_amd.path]'s [queue]:
-    the host address of the queue's doorbell. A compute queue's end-of-pipe
-    buffer is the GPU's own memory. The result is [Error msg] if the doorbell
-    BAR is not mapped into the process, or no GPU memory is left for the
-    buffer. *)
+    the host address of the queue's doorbell. It programs one of two
+    hardware queues of the kind ({!Gfx.queue}, {!Sdma.queue}), and SDMA 4's
+    gfx queue alone. A compute queue's end-of-pipe buffer is the GPU's own
+    memory, made for a queue's slot at its first queue and kept to the stop,
+    so a queue after a retired one allocates nothing. The result is
+    [Error (Full _)] if the queues of the kind all run, [Error (Lacking _)]
+    if no GPU memory is left for the buffer, and [Error (Refused _)] if the
+    doorbell BAR is not mapped into the process or a dequeue before it does
+    not complete. *)
+
+val retire : t -> int -> unit
+(** [retire g bell] is [Rig_amd.path]'s [retire]: it dequeues or disables the
+    queue {!queue} made whose doorbell is at the host address [bell].
+
+    Raises {!Rig_amd.Fault} if a compute queue's dequeue does not complete. *)
+
+val most_ring : t -> [ `Pm4 | `Aql | `Sdma ] -> int
+(** [most_ring g kind] is [Rig_amd.path]'s [most_ring]: 16 GiB for a compute
+    queue, whose read position (CP_HQD_PQ_RPTR) holds 32 bits of 4-byte
+    words, and 8 GiB for a copy queue, whose ring takes 2{^n} words for the
+    5-bit RB_SIZE field [n] of its RB_CNTL register, at most 31; but 16 MiB
+    on SDMA 4, the ring the device opens with, as {!queue} programs its gfx
+    queue alone. *)
 
 val hdp : t -> int option
 (** [hdp g] is the host address of the HDP flush register, if the register

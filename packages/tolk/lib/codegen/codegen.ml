@@ -612,7 +612,11 @@ let same_nodes s0 s1 =
 
 let merge_reduce_ends sink =
   (* merge ENDs that share the same range and nesting context (only those created by reduce_to_acc) *)
-  (* ENDs at different nesting depths get cloned RANGEs so each RANGE maps to one END *)
+  (* An END that closes a range an earlier END closes, at another nesting depth
+     or along other ranges, gets cloned RANGEs so each RANGE maps to one END.
+     Reductions that share a loop can stop closing the same ranges: a sum over
+     [i] and [k] of a source that does not read [i] closes [k] alone, where a
+     maximum beside it closes [k] within [i]'s loop. *)
   let slice = Nodes.to_list (backward_slice ~calls:Skip sink) in
   let range_to_ends =
     List.fold_left
@@ -622,7 +626,7 @@ let merge_reduce_ends sink =
         else acc)
       [] slice
   in
-  let subs = ref [] in
+  let subs = ref [] and claimed = Tbl.create 16 in
   let next_axis =
     ref
       (1
@@ -630,43 +634,40 @@ let merge_reduce_ends sink =
           (fun m u -> if is Op.Range u then max m (List.hd (axis_id u)) else m)
           (-1) slice)
   in
+  let clone rr =
+    if not (Tbl.mem claimed rr) then rr
+    else
+      let axis_id = !next_axis :: List.tl (axis_id rr) in
+      incr next_axis;
+      replace rr ~arg:(Range { axis_id; axis_type = axis_type rr })
+  in
   List.iter
     (fun (r, ends) ->
-      if List.length ends > 1 then
-        let by_ctx =
-          List.fold_left
-            (fun acc e -> add_to (ranges e) same_nodes e acc)
-            [] ends
-        in
-        List.iteri
-          (fun i (_, ends) ->
-            let tr =
-              if i = 0 then r
-              else
-                List.mapi
-                  (fun j rr ->
-                    let axis_id = (!next_axis + j) :: List.tl (axis_id rr) in
-                    replace rr
-                      ~arg:(Range { axis_id; axis_type = axis_type rr }))
-                  r
-            in
-            if i > 0 then next_axis := !next_axis + List.length r;
-            let mapped =
-              if i = 0 then ends
-              else
-                List.map
-                  (fun e ->
-                    substitute ~calls:Skip ~pass:Fixed_point e
-                      (List.combine r tr))
-                  ends
-            in
-            let merged =
-              match mapped with
-              | [ e ] -> e
-              | _ -> end_ (group (List.map (fun e -> nth e 0) mapped)) tr
-            in
-            List.iter (fun e -> subs := (e, merged) :: !subs) ends)
-          by_ctx)
+      let by_ctx =
+        List.fold_left (fun acc e -> add_to (ranges e) same_nodes e acc) [] ends
+      in
+      List.iter
+        (fun (_, ends) ->
+          let tr = List.map clone r in
+          List.iter (fun rr -> Tbl.replace claimed rr ()) tr;
+          let mapped =
+            if List.equal ( == ) r tr then ends
+            else
+              List.map
+                (fun e ->
+                  substitute ~calls:Skip ~pass:Fixed_point e (List.combine r tr))
+                ends
+          in
+          match mapped with
+          | [ e ] when e == List.hd ends -> ()
+          | _ ->
+              let merged =
+                match mapped with
+                | [ e ] -> e
+                | _ -> end_ (group (List.map (fun e -> nth e 0) mapped)) tr
+              in
+              List.iter (fun e -> subs := (e, merged) :: !subs) ends)
+        by_ctx)
     range_to_ends;
   match !subs with
   | [] -> None
@@ -1525,8 +1526,9 @@ let compiled compile_source prg (ren : Renderer.t) =
 let compile prg ren = compiled Renderer.Compiler.compile prg ren
 
 (* Each kernel's program is made once: a domain that asks for one being made
-   waits for it, holding the entry's lock, rather than making it again. *)
-type entry = { lock : Mutex.t; mutable prg : Ops.t option }
+   waits for it, holding the entry's lock, rather than making it again. [made]
+   reads a made program without waiting. *)
+type entry = { lock : Mutex.t; prg : Ops.t option Atomic.t }
 
 let to_program_cache = Hashtbl.create 64
 let to_program_lock = Mutex.create ()
@@ -1547,35 +1549,31 @@ let program_key ast (ren : Renderer.t) =
      ]
     @ List.map (fun (k, v) -> k ^ "=" ^ v) (Setting.shaping ()))
 
-(* A program holds its binary: it is kept on disk only while its compiler's
-   binaries are, under a table that names the compiler. A kernel that asks for a
-   beam search is not kept, since its program is what the search found. *)
+(* A program is kept on disk up to its source, only while its compiler's
+   binaries are, under a table that names the compiler: its binary is the
+   compiler's entry for that source, so each binary is stored once. A kernel
+   that asks for a beam search is not kept, since its program is what the
+   search found. *)
 let kept (k : kernel_info) (ren : Renderer.t) =
   Setting.value Setting.ccache
   && Option.is_some (Renderer.Compiler.cachekey ren.compiler)
   && k.beam = 0
 
-let program prg = op prg = Op.Program && List.length (src prg) = 4
+let rendered prg = op prg = Op.Program && List.length (src prg) = 3
 
-(* A program read back is shown as a compiled one is: its source from DEBUG 4,
-   its instructions from 7. *)
-let show_kept (ren : Renderer.t) prg =
-  match (arg (nth prg 2), arg (nth prg 3)) with
-  | String source, Bytes lib ->
-      if setting Setting.debug >= 4 then print_endline source;
-      if setting Setting.debug >= 7 then
-        Renderer.Compiler.disassemble ren.compiler lib
-  | _ -> ()
-
-let made_program ?beam ~key ~kernel ast ren =
-  let make () =
-    compiled Renderer.Compiler.compile_cached (linearized ?beam ast ren) ren
+(* A program read back is compiled as a made one is, so it shows its source
+   from DEBUG 4 and its instructions from 7. *)
+let made_program ?beam ~key ~kernel ast (ren : Renderer.t) =
+  let render () =
+    let prg = linearized ?beam ast ren in
+    Option.get (do_render ren prg (nth prg 1))
   in
-  if not (kept kernel ren) then make ()
-  else
-    let prg, hit = Graph.cached ~table:"to_program" ~key ~valid:program make in
-    if hit then show_kept ren prg;
-    prg
+  let prg =
+    if not (kept kernel ren) then render ()
+    else fst (Graph.cached ~table:"to_program" ~key ~valid:rendered render)
+  in
+  Option.get
+    (do_compile (ren, Renderer.Compiler.compile_cached) prg (nth prg 2))
 
 let to_program ?beam ast ren =
   let kernel = kernel_of ast in
@@ -1585,14 +1583,20 @@ let to_program ?beam ast ren =
         match Hashtbl.find_opt to_program_cache key with
         | Some entry -> entry
         | None ->
-            let entry = { lock = Mutex.create (); prg = None } in
+            let entry = { lock = Mutex.create (); prg = Atomic.make None } in
             Hashtbl.replace to_program_cache key entry;
             entry)
   in
   Mutex.protect entry.lock (fun () ->
-      match entry.prg with
+      match Atomic.get entry.prg with
       | Some prg -> prg
       | None ->
           let prg = made_program ?beam ~key ~kernel ast ren in
-          entry.prg <- Some prg;
+          Atomic.set entry.prg (Some prg);
           prg)
+
+let made ast ren =
+  let key = program_key ast ren in
+  Mutex.protect to_program_lock (fun () ->
+      Hashtbl.find_opt to_program_cache key)
+  |> Option.fold ~none:None ~some:(fun e -> Atomic.get e.prg)

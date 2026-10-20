@@ -23,6 +23,15 @@
 
 #include <stdint.h>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+#if defined(__AVX__)
+#include <immintrin.h>
+#elif defined(__x86_64__)
+#include <emmintrin.h>
+#endif
+
 #include <caml/signals.h>
 
 #include "nx_array.h"
@@ -37,6 +46,14 @@
    A target is the instruction set the kernels' runs are compiled for: one
    table per target, chosen once at initialisation. Every table computes the
    same bits. */
+
+/* The target's vector, in bytes: 32 where the target has AVX (x86-64's
+   v3 table, built for AVX2), else 16. */
+#if defined(__AVX__)
+#define NX_VECTOR_BYTES 32
+#else
+#define NX_VECTOR_BYTES 16
+#endif
 
 /* A run converts [n] contiguous elements at [src] into [dst]. */
 typedef void (*nx_cpu_run)(const void *src, void *dst, int64_t n);
@@ -400,10 +417,9 @@ typedef struct {
      NX_CPU_MOMENTS) at dt: block NULL where the table declines. */
   nx_cpu_stateful stateful[NX_CPU_STATEFUL][NX_DTYPE_COUNT];
   /* fft runs fft.c's transform t (its C2C, R2C or C2R; inverse for C2C's
-     Inverse) of x into y along [axes] on [threads] threads: 0 if memory
-     runs out. */
+     Inverse) of x into y along [axes]: 0 if memory runs out. */
   int (*fft)(int t, int inverse, const nx_array *x, const nx_array *y,
-             const int *axes, int na, int threads);
+             const int *axes, int na);
   /* linalg runs units of linalg.c's call [ctx], a job's body. */
   rig_pool_body linalg;
 } nx_cpu_target;
@@ -490,7 +506,9 @@ static inline double nx_cpu_bytes(const nx_array *a) {
    price reaches NX_CPU_RELEASE_BYTES, and a held call runs its jobs on
    the calling thread alone (job.c). The work reads no OCaml value and
    raises nothing, held or released, so every call that passes
-   nx_cpu_release reaches nx_cpu_reacquire.
+   nx_cpu_release reaches nx_cpu_reacquire. A call reads many operands
+   through nx_read_each, and a long program or many reductions as
+   NX_CPU_ITEM says, so that no count of them lengthens a held stretch.
 
    NX_CPU_HOLD_BYTES is 1 MiB: one core copies it in 12 to 15 us (M1 Max,
    fudge's Core Ultra 5 235), and a release and reacquisition cost 9 to
@@ -526,6 +544,16 @@ static inline double nx_cpu_bytes(const nx_array *a) {
    cost at which a job takes a second thread. */
 #define NX_CPU_RELEASE_BYTES (2 * NX_CPU_THREAD_BYTES)
 
+/* An item of a call's own reading and analysis, before its work: a
+   program's node or a reduction, each copied, checked and priced. A node
+   took about 20 ns (M1 alone, a 20000-node map under load), 1.6 KiB of
+   memcpy. A call whose items cost NX_CPU_RELEASE_BYTES releases the domain
+   lock before it analyses them, and a held loop that reads them from
+   OCaml lets other domains collect (nx_let_collect) every NX_CPU_ITEMS
+   items, a release's worth. */
+#define NX_CPU_ITEM 4096
+#define NX_CPU_ITEMS (NX_CPU_RELEASE_BYTES / NX_CPU_ITEM)
+
 /* A cache line's fetch for an element or term that touches its own, on
    top of the term's own price: Logsumexp along strided float32 terms, its
    worst member, took 900 a term (M1 alone), which this and the term's 512
@@ -540,6 +568,10 @@ double nx_cpu_kind_cost(int arity, int k, int dt);
    on it alone (job.c): nx_cpu_release writes it at every call's entry and
    nx_cpu_reacquire clears it at its exit. */
 extern _Thread_local int nx_cpu_held;
+
+/* Whether the calling thread runs every job on itself alone, as a test of
+   nx_cpu.ml's one_thread asks: the bits are those of any threads. */
+extern _Thread_local int nx_cpu_one;
 
 /* Releases the domain lock for a call's work that costs [price],
    NX_CPU_RELEASE_BYTES or more, else marks the call held; answers
@@ -579,7 +611,8 @@ void nx_cpu_job(int64_t total, int64_t bytes, double cost, rig_pool_body body,
 
 /* The threads nx_cpu_job gives such work, if it has as many units: at
    least 1, one per NX_CPU_THREAD_BYTES of cost, the bytes a core moves in
-   the time a job takes to start, and 1 in a held call (job.c). */
+   the time a job takes to start, and 1 in a held call or under
+   nx_cpu_one (job.c). */
 int nx_cpu_threads(int64_t bytes, double cost);
 
 /* nx_cpu_job and nx_cpu_threads with one thread per [thread_bytes] of
@@ -588,6 +621,93 @@ int nx_cpu_threads(int64_t bytes, double cost);
 void nx_cpu_job_at(int64_t total, int64_t bytes, double cost,
                    double thread_bytes, rig_pool_body body, void *ctx);
 int nx_cpu_threads_at(int64_t bytes, double cost, double thread_bytes);
+
+/* Boxes (copy.c) */
+
+/* A box: [extent[0]] planes of [extent[1]] rows of [extent[2]] elements, in
+   C order, as nx_loop's axes. Element (p, i, j) of operand k, 0 the
+   destination and 1 the source, lies at position
+   first[k] + p·step[k][0] + i·step[k][1] + j·step[k][2], counted in
+   elements from its base. Positions are at least 0; steps have either
+   sign. */
+typedef struct {
+  int64_t extent[3];
+  int64_t first[2];
+  int64_t step[2][3]; /* elements, by operand then axis */
+} nx_box;
+
+/* Copies the box [b] of elements of [bits] bits from [src] to [dst], bits
+   for bits. The destination's elements are distinct and share no byte with
+   the source's. Bytes that hold only copied elements take plain stores; a
+   byte shared with other elements takes a compare-and-swap, as
+   nx_sub_store does. Each plane copies as one block: rows of adjacent
+   elements are memcpy; where one operand steps one element across rows and
+   the other one along them, whichever operand is transposed, it moves
+   square blocks through registers, 8x8 of 4-byte elements, 32 bytes from
+   each of eight columns into each of eight rows, and 4x4 of the others.
+   Two adjacent runs of the source interleaved into adjacent elements, as a
+   window two elements wide reads its rows, zip in registers. The case is
+   chosen once per box. */
+void nx_copy_box(uint8_t *dst, const uint8_t *src, const nx_box *b,
+                 int bits);
+
+/* nx_copy_box, its square blocks of 4- and 8-byte elements storing each
+   row's 32 bytes past the caches (nx_stream32) where the destination's
+   rows, and each plane's pieces of them, lie on whole 64-byte lines,
+   drained before it returns: for a destination far larger than the
+   caches. A line that plain and streamed stores share, or that a stream
+   fills in parts far apart in time, is written in parts: on x86-64 a
+   transposed 4000x4000 float32 copy in tiles 65 elements wide took twice
+   as long streamed. */
+void nx_stream_box(uint8_t *dst, const uint8_t *src, const nx_box *b,
+                   int bits);
+
+/* Stores past the caches
+
+   A store into a line the cache lacks first reads the line. A result far
+   larger than the caches, written in pieces that lie apart, as a
+   transpose's rows are, reads each line it writes: stores that bypass the
+   caches read none. NX_STREAMS is 1 where the target has them: x86-64's
+   movntdq, arm64's stnp. Which results gain is each kernel's rule. */
+
+#if defined(__x86_64__) || defined(__aarch64__)
+#define NX_STREAMS 1
+#else
+#define NX_STREAMS 0
+#endif
+
+/* Stores the 32 bytes at [s] at [d], on 32 bytes, past the caches where
+   NX_STREAMS: one AVX store or two SSE2 ones on x86-64, arm64's stnp in
+   assembly, since clang lowers __builtin_nontemporal_store to plain
+   stores there. Inline, a source in registers stays in them. */
+static inline __attribute__((always_inline)) void nx_stream32(void *d,
+                                                              const void *s) {
+#if defined(__AVX__)
+  _mm256_stream_si256((__m256i *)d, _mm256_loadu_si256((const __m256i *)s));
+#elif defined(__x86_64__)
+  _mm_stream_si128((__m128i *)d, _mm_loadu_si128((const __m128i *)s));
+  _mm_stream_si128((__m128i *)d + 1,
+                   _mm_loadu_si128((const __m128i *)s + 1));
+#elif defined(__aarch64__)
+  uint8x16_t lo = vld1q_u8((const uint8_t *)s);
+  uint8x16_t hi = vld1q_u8((const uint8_t *)s + 16);
+  __asm__ volatile("stnp %q0, %q1, [%2]" : : "w"(lo), "w"(hi), "r"(d)
+                   : "memory");
+#else
+  __builtin_memcpy(d, s, 32);
+#endif
+}
+
+/* Orders the stores past the caches before the stores that follow: x86's
+   are weakly ordered and need a fence. arm64's stnp relaxes ordering only
+   for a load's address dependency (the non-temporal hint), so like any
+   store it is ordered by the release with which a job's worker leaves
+   (rig_pool.c) and the acquire with which its caller sees the job end. */
+static inline void nx_stream_drain(void) {
+#if defined(__x86_64__)
+  _mm_sfence();
+#endif
+}
 
 /* Scratch */
 
@@ -772,12 +892,14 @@ int nx_cpu_unpad(const nx_array *a, const nx_cpu_pad *p,
    the loop's shape, of no buffer. */
 typedef struct nx_cpu_prog nx_cpu_prog;
 
-/* The Prog.t [vp] copied, or NULL if host memory runs out. Reads [vp]
-   alone. */
-nx_cpu_prog *nx_cpu_prog_copy(value vp);
+/* The Prog.t at the root [vp] copied, or NULL if host memory runs out.
+   Reads [vp] alone, letting other domains collect every NX_CPU_ITEMS
+   nodes. */
+nx_cpu_prog *nx_cpu_prog_copy(const value *vp);
 void nx_cpu_prog_free(nx_cpu_prog *j);
 
-/* [j]'s loads and outputs, and their dtypes. */
+/* [j]'s nodes, its loads and outputs, and their dtypes. */
+int nx_cpu_prog_nodes(const nx_cpu_prog *j);
 int nx_cpu_prog_ins(const nx_cpu_prog *j);
 int nx_cpu_prog_in(const nx_cpu_prog *j, int k);
 int nx_cpu_prog_outs(const nx_cpu_prog *j);

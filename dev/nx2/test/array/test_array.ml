@@ -447,8 +447,8 @@ let law_set_get (Case (a, _)) =
   in
   check a
 
-(* An [int] outside its dtype's range is refused by [set] and [of_array], and
-   one inside stores as itself. *)
+(* An [int] outside its dtype's range is one the dtype does not hold, refused
+   by [set] and [of_array], and one inside stores as itself. *)
 let law_range (type s) (dt : (int, s) D.t) =
   let lo = D.min_value dt and hi = D.max_value dt in
   let x =
@@ -464,11 +464,13 @@ let law_range (type s) (dt : (int, s) D.t) =
       let a = A.create Rig.host dt [| 1 |] in
       if x < lo || x > hi then begin
         cover "out of range" true;
+        equal ~msg:"holds" bool false (D.holds dt x);
         raises_match Exn.invalid_arg (fun () -> A.set a [| 0 |] x);
         raises_match Exn.invalid_arg (fun () -> A.of_array dt [| 1 |] [| x |])
       end
       else begin
         cover "a bound" (x = lo || x = hi);
+        equal ~msg:"holds" bool true (D.holds dt x);
         A.set a [| 0 |] x;
         equal int x (A.get a [| 0 |]);
         equal (array int) [| x |] (A.to_array (A.of_array dt [| 1 |] [| x |]))
@@ -1642,6 +1644,83 @@ let test_ocaml_door_runs () =
   released [| z; x |];
   equal (pair answer (option bool)) (A.Done, Some true) (ocaml_door [||] [||])
 
+(* However many arrays the door claims and releases, it holds the domain
+   lock for no stretch longer than the bound: the least of three runs'
+   longest stretch, in CPU time, as test_release takes it. *)
+let test_ocaml_door_holds () =
+  let holds ~msg written read =
+    let e = ref A.Done in
+    let call () = e := A.door ~written ~read ignore () in
+    call ();
+    Gc.full_major ();
+    let least = ref max_int in
+    for _ = 1 to 3 do
+      let ~releases:_, ~held, ~cpu:_ = Nx_release_support.watch call in
+      least := min !least held
+    done;
+    equal ~msg answer A.Done !e;
+    less int
+      ~msg:(msg ^ ": the longest stretch held, in ns of CPU time")
+      ~than:(Nx_release_support.bound ()) !least;
+    released (Array.append written read)
+  in
+  holds ~msg:"many arrays"
+    [| A.Any (zeros [| 1 |]) |]
+    (Array.init 32768 (fun _ -> A.Any (zeros [| 1 |])));
+  (* Few written arrays, each compared with many it skips. *)
+  holds ~msg:"many empty arrays"
+    (Array.init 8 (fun _ -> A.Any (zeros [| 1 |])))
+    (Array.init 32768 (fun _ -> A.Any (zeros [| 0 |])))
+
+(* The door claims every array, then checks the rest: an array claimed in
+   a later run than a written array's other faults is refused first. *)
+let test_ocaml_door_order () =
+  let one = zeros [| 1 |] in
+  let w = Option.get (A.move (M.Broadcast [| 2 |]) one) in
+  let dead = zeros [| 2 |] in
+  kill (A.buffer dead);
+  let read =
+    Array.init (2 * A.max_operands) (fun i ->
+        if i = A.max_operands then A.Any dead else A.Any (zeros [| 2 |]))
+  in
+  equal (pair answer (option bool)) (A.Dead_buffer, None)
+    (ocaml_door [| A.Any w |] read);
+  released (Array.append [| A.Any one |] read)
+
+(* Around each run of claims, the door claims every array while its function
+   runs, then releases them. *)
+let test_ocaml_door_counts () =
+  let m = A.max_operands in
+  List.iter
+    (fun n ->
+      let written = [| A.Any (zeros [| 2 |]) |] in
+      let read = Array.init (n - 1) (fun _ -> A.Any (zeros [| 2 |])) in
+      equal
+        ~msg:(Printf.sprintf "%d arrays" n)
+        (pair answer (option bool)) (A.Done, Some true)
+        (ocaml_door written read);
+      released (Array.append written read))
+    [ m - 1; m; m + 1; (2 * m) - 1; 2 * m; (2 * m) + 1 ]
+
+(* A refusal of an array claimed in a later run than the first leaves no
+   claim on any. *)
+let test_ocaml_door_late_refusals () =
+  let n = 3 * A.max_operands in
+  let refuses ~msg r last =
+    let written = [| A.Any (zeros [| 2 |]) |] in
+    let read = Array.init n (fun _ -> A.Any (zeros [| 2 |])) in
+    read.(n - 1) <- last written.(0);
+    equal ~msg (pair answer (option bool)) (r, None) (ocaml_door written read);
+    released (Array.append written read)
+  in
+  refuses ~msg:"the last read overlapping the written" A.Overlapping
+    (fun (A.Any z) ->
+      A.Any (A.v f32 (L.v ~offset:1 ~strides:[| 1 |] [| 1 |]) (A.buffer z)));
+  refuses ~msg:"the last read dead" A.Dead_buffer (fun _ ->
+      let d = zeros [| 2 |] in
+      kill (A.buffer d);
+      A.Any d)
+
 let test_ocaml_door_refuses () =
   let x = floats32 [| 3 |] [| 1.; 2.; 3. |] in
   let refuses ~msg r written read =
@@ -1733,6 +1812,153 @@ let test_ocaml_door_bigarrays () =
     (ocaml_door [| tail (over 0) |] [| head (over 1) |]);
   equal ~msg:"beside" (pair answer (option bool)) (A.Done, Some true)
     (ocaml_door [| head (over 0) |] [| head (over 2) |])
+
+(* An io memory of 32 bytes on the mapped io device, a host borrow of it,
+   whose bytes are its pages, and those pages as a bigarray. *)
+let mapped_io () =
+  let bytes = A.of_array D.Uint8 [| 32 |] (Array.make 32 0) in
+  let io = A.to_device (S.mapped_io_device ()) bytes in
+  let host = Option.get (A.borrow Rig.host io) in
+  (A.buffer io, A.buffer host, S.mapped_pages (A.buffer io))
+
+(* An array of [dt] over [count] elements of [b] from element [offset]. *)
+let view dt b offset count =
+  A.Any (A.v dt (L.v ~offset ~strides:[| 1 |] [| count |]) b)
+
+(* An io memory lies in its own space and, once a borrow maps its pages, at
+   their host address too: its views and its borrow's compare by offset, a
+   bigarray over its pages by address, int4 views by their bits. *)
+let test_ocaml_door_io_pages () =
+  let io, host, pages = mapped_io () in
+  let io_at = view f32 io and borrow_at = view f32 host in
+  let over first count =
+    let b = Bigarray.Array1.sub pages (4 * first) (4 * count) in
+    view f32 (B.of_bigarray b) 0 count
+  in
+  let door = pair answer (option bool) in
+  let check ~msg r written read =
+    let ran = if r = A.Done then Some true else None in
+    equal ~msg door (r, ran) (ocaml_door [| written |] [| read |])
+  in
+  check ~msg:"io beside its pages' bigarray" A.Done (io_at 0 2) (over 4 4);
+  check ~msg:"io meeting its pages' bigarray" A.Overlapping (io_at 0 3) (over 2 2);
+  check ~msg:"io identical to its pages' bigarray" A.Done (io_at 2 2) (over 2 2);
+  check ~msg:"the bigarray meeting io" A.Overlapping (over 0 3) (io_at 2 2);
+  check ~msg:"a borrow beside io" A.Done (borrow_at 0 2) (io_at 2 2);
+  check ~msg:"a borrow meeting io" A.Overlapping (borrow_at 0 3) (io_at 2 2);
+  check ~msg:"a borrow identical to io" A.Done (borrow_at 1 2) (io_at 1 2);
+  check ~msg:"a borrow meeting the bigarray" A.Overlapping (borrow_at 0 3)
+    (over 2 2);
+  (* int4 elements of byte 0 of the pages, through a bigarray of that byte
+     alone: identity is by bits, and one byte holds two elements. *)
+  let int4 = view D.Int4 io in
+  let nibble = view D.Int4 (B.of_bigarray (Bigarray.Array1.sub pages 0 1)) in
+  check ~msg:"one int4 element, through io and the bigarray" A.Done
+    (int4 1 1) (nibble 1 1);
+  check ~msg:"the other int4 element of the byte" A.Overlapping (int4 0 1)
+    (nibble 1 1);
+  check ~msg:"an int4 element of the next byte" A.Done (int4 2 1)
+    (nibble 1 1)
+
+(* nx_read compares host-addressed operands by address: a borrow of an io
+   memory and a bigarray over its pages. *)
+let test_door_io_pages () =
+  let _, host, pages = mapped_io () in
+  let borrow_at offset = A.v f32 (L.v ~offset ~strides:[| 1 |] [| 2 |]) host in
+  let over first =
+    A.v f32 (L.contiguous [| 2 |])
+      (B.of_bigarray (Bigarray.Array1.sub pages (4 * first) 8))
+  in
+  let x = zeros [| 2 |] in
+  equal ~msg:"meeting" answer A.Overlapping (S.add (borrow_at 0) x (over 1));
+  equal ~msg:"beside" answer A.Done (S.add (borrow_at 0) x (over 2));
+  equal ~msg:"identical" answer A.Done (S.add (borrow_at 2) x (over 2))
+
+(* The door's overlap is Rig.Buffer.overlaps of the arrays' bytes, and its
+   identity is one width and one first bit, wherever the bytes lie: views of
+   an io memory, of its borrow, of a bigarray over its pages and of plain
+   host memory, of uint16, uint8 and int4. *)
+type side = Io | Borrow | Pages | Plain
+
+type operand = { side : side; bits : int; offset : int; count : int }
+
+let pp_operand ppf o =
+  Format.fprintf ppf "%s %d-bit elements %d+%d"
+    (match o.side with
+    | Io -> "io"
+    | Borrow -> "borrow"
+    | Pages -> "pages"
+    | Plain -> "plain")
+    o.bits o.offset o.count
+
+let operand_gen =
+  let open Gen in
+  let* side = one_of (List.map constant [ Io; Borrow; Pages; Plain ]) in
+  let* bits = one_of (List.map constant [ 4; 8; 16 ]) in
+  let n = 256 / bits in
+  let* offset = int_range 0 (n - 1) in
+  let+ count = int_range 1 (n - offset) in
+  { side; bits; offset; count }
+
+(* A pair, the second a copy of the first's elements on another side as
+   often as not, so that identical pairs come up. *)
+let operands_gen =
+  let open Gen in
+  let* a = operand_gen in
+  let* copy = bool in
+  let* side = one_of (List.map constant [ Io; Borrow; Pages; Plain ]) in
+  let+ b = operand_gen in
+  (a, if copy then { a with side } else b)
+
+let operands_gen =
+  Gen.with_pp
+    (fun ppf (a, b) ->
+      Format.fprintf ppf "%a into %a" pp_operand b pp_operand a)
+    operands_gen
+
+let law_door_overlaps =
+  let io, host, pages = mapped_io () in
+  let pages = B.of_bigarray pages in
+  let plain =
+    B.of_bigarray (Bigarray.Array1.create Bigarray.char Bigarray.c_layout 32)
+  in
+  let buffer = function
+    | Io -> io
+    | Borrow -> host
+    | Pages -> pages
+    | Plain -> plain
+  in
+  let array o =
+    let b = buffer o.side in
+    match o.bits with
+    | 4 -> view D.Int4 b o.offset o.count
+    | 8 -> view D.Uint8 b o.offset o.count
+    | _ -> view D.Uint16 b o.offset o.count
+  in
+  (* [o]'s bytes from byte [first] on, [length] of them. *)
+  let bytes o first length = B.view (buffer o.side) ~first ~length in
+  let span o =
+    let lo = o.offset * o.bits / 8 in
+    bytes o lo ((((o.offset + o.count) * o.bits) + 7) / 8 - lo)
+  in
+  fun (a, b) ->
+    let meet = B.overlaps (span a) (span b) in
+    let first o = o.offset * o.bits in
+    let identical =
+      a.bits = b.bits && a.count = b.count
+      && first a mod 8 = first b mod 8
+      && B.overlaps (bytes a (first a / 8) 1) (bytes b (first b / 8) 1)
+    in
+    cover "a pair the host does not address both of"
+      (a.side = Io || b.side = Io);
+    cover "sub-byte" (a.bits = 4);
+    cover "meeting" meet;
+    cover "identical" (meet && identical);
+    cover "beside" (not meet);
+    let want = if meet && not identical then A.Overlapping else A.Done in
+    equal (pair answer (option bool))
+      (want, if want = A.Done then Some true else None)
+      (ocaml_door [| array a |] [| array b |])
 
 exception Raised
 
@@ -1866,6 +2092,119 @@ let test_ocaml_door_pending () =
   equal ~msg:"ran before the pending work" bool true !behind;
   no_claim x
 
+(* Scoped reads *)
+
+let read_fails ?msg substring f =
+  raises_match ?msg
+    (fun e ->
+      Exn.invalid_arg ~substring:"Nx_array.read" e
+      && Exn.invalid_arg ~substring e)
+    f
+
+(* [read] passes a bigarray of a C-contiguous array's shape holding its
+   elements, on the host and on a memory device, and refuses a strided one. It
+   leaves no claim. *)
+let law_read (Case (a, m)) =
+  let check : type v s. (v, s) A.t -> unit =
+   fun a ->
+    let l = A.layout a in
+    let contiguous = L.is_contiguous l in
+    cover "contiguous" contiguous;
+    cover "strided" (not contiguous);
+    cover "an offset" (contiguous && L.offset l > 0);
+    cover "no element" (L.numel l = 0);
+    (match kind (A.dtype a) with
+    | None -> ()
+    | Some k when contiguous ->
+        let elements g =
+          Array.of_list
+            (List.map (Bigarray.Genarray.get g) (indices (L.shape l)))
+        in
+        let dims, xs =
+          A.read k a (fun g -> (Bigarray.Genarray.dims g, elements g))
+        in
+        equal ints (L.shape l) dims;
+        equal (values (A.dtype a)) (A.to_array a) xs
+    | Some k -> read_fails "contiguous" (fun () -> A.read k a ignore));
+    equal ~msg:"released" bool true (unclaimed (A.buffer a))
+  in
+  let a =
+    match Option.bind m (fun m -> A.move m a) with Some b -> b | None -> a
+  in
+  check a;
+  check (Option.get (A.borrow (Lazy.force memory) a));
+  (* The elements after the first as a vector: C-contiguous at an offset. *)
+  let l = A.layout a in
+  let n = L.numel l in
+  if L.is_contiguous l && n >= 2 then
+    check
+      (A.v (A.dtype a)
+         (L.v ~offset:(L.offset l + 1) ~strides:[| 1 |] [| n - 1 |])
+         (A.buffer a))
+
+(* The claim holds while [f] runs and ends when it returns or raises, leaving
+   the memory to later donations. *)
+let test_read_claim () =
+  let a = floats32 [| 2 |] [| 1.; 2. |] in
+  let inside = A.read Bigarray.float32 a (fun _ -> unclaimed (A.buffer a)) in
+  equal ~msg:"claimed while f runs" bool false inside;
+  equal ~msg:"released" bool true (unclaimed (A.buffer a));
+  raises Raised (fun () -> A.read Bigarray.float32 a (fun _ -> raise Raised));
+  equal ~msg:"released after a raise" bool true (unclaimed (A.buffer a))
+
+let test_read_refuses () =
+  let off = A.to_device (S.io_device ()) (floats32 [| 2 |] [| 1.; 2. |]) in
+  read_fails ~msg:"off the host" "host" (fun () ->
+      A.read Bigarray.float32 off ignore);
+  let dead = floats32 [| 2 |] [| 1.; 2. |] in
+  kill (A.buffer dead);
+  read_fails ~msg:"dead" "consumed by the test" (fun () ->
+      A.read Bigarray.float32 dead ignore);
+  let held = floats32 [| 2 |] [| 1.; 2. |] in
+  Rig.Claim.with_ ~read:[]
+    ~donate:[ A.buffer held ]
+    (fun _ ->
+      read_fails ~msg:"held exclusive" "exclusive" (fun () ->
+          A.read Bigarray.float32 held ignore));
+  let a = A.create Rig.host D.Uint8 (Array.make 16 1) in
+  equal ~msg:"16 axes" ints (Array.make 16 1)
+    (A.read Bigarray.int8_unsigned a Bigarray.Genarray.dims);
+  let a = A.create Rig.host D.Uint8 (Array.make 17 1) in
+  read_fails ~msg:"17 axes" "17" (fun () ->
+      A.read Bigarray.int8_unsigned a ignore)
+
+(* An array with no element reads as an empty bigarray, whatever its memory. *)
+let test_read_empty () =
+  let dims a = A.read Bigarray.float32 a Bigarray.Genarray.dims in
+  equal ~msg:"on the host" ints [| 2; 0 |]
+    (dims (A.create Rig.host f32 [| 2; 0 |]));
+  equal ~msg:"off the host" ints [| 0 |]
+    (dims (A.create (S.io_device ()) f32 [| 0 |]))
+
+let test_wait_read () =
+  let d, _ = late () in
+  let a = on_late d [| 0.; 0. |] in
+  pending a [| 3.; 4. |];
+  equal (values f32) [| 3.; 4. |]
+    (A.read Bigarray.float32 a (fun g ->
+         Array.init 2 (fun i -> Bigarray.Genarray.get g [| i |])));
+  no_claim a
+
+(* A lost device's array raises Lost at the claim, before [f] runs. *)
+let test_read_lost () =
+  let ran = ref false in
+  let read a = A.read Bigarray.float32 a (fun _ -> ran := true) in
+  let d, l = late () in
+  let x = on_late d [| 1.; 2. |] in
+  pending x [| 3.; 4. |];
+  S.Late.fault l "gone";
+  raises_match ~msg:"faulted" lost (fun () -> read x);
+  let d, _ = late () in
+  let y = on_late d [| 1.; 2. |] in
+  Rig.close d;
+  raises_match ~msg:"closed" lost (fun () -> read y);
+  equal ~msg:"ran" bool false !ran
+
 (* Two domains: kernels that read an array on a Late device, against submits
    that write it and donations that consume it. Every submit stores ones, so a
    kernel that ran reads ones. A kernel refuses the array as dead, or as held
@@ -1906,6 +2245,11 @@ let kernel x =
 
 let to_array x = equal (values f32) ones (A.to_array x)
 
+let read x =
+  equal (values f32) ones
+    (A.read Bigarray.float32 x (fun g ->
+         Array.init 4 (fun i -> Bigarray.Genarray.get g [| i |])))
+
 let submit x =
   Rig.Claim.with_ ~read:[ A.buffer x ] ~donate:[] (fun _ -> pending x ones)
 
@@ -1928,6 +2272,7 @@ let door_commands =
       (shared ^-> judges (pair answer (values f32)))
       judge_kernel kernel;
     command "to_array" (shared ^-> judges unit) judge_live to_array;
+    command "read" (shared ^-> judges unit) judge_live read;
     command "submit" (shared ^-> judges unit) judge_live submit;
     command "donate" (shared ^-> judges bool) judge_donate donate;
   ]
@@ -2057,6 +2402,17 @@ let tests =
         test "of_bigarray refuses a bigarray misaligned for its elements"
           test_of_bigarray_misaligned;
       ];
+    group "read"
+      [
+        prop "read passes a C-contiguous host-addressed array's bytes" case
+          law_read;
+        test "read claims the memory while its function runs" test_read_claim;
+        test "read refuses what it cannot pass" test_read_refuses;
+        test "read passes an array with no element, whatever its memory"
+          test_read_empty;
+        test "read waits for the work on its array" test_wait_read;
+        test "read raises Lost for a lost device's array" test_read_lost;
+      ];
     group "door"
       [
         test "a kernel reads its operands through the door" test_door_add;
@@ -2073,6 +2429,8 @@ let tests =
           test_door_empty;
         test "a read releases its claims" test_door_releases;
         test "a read survives a moving collection" test_door_moving_gc;
+        test "host-addressed operands compare by address"
+          test_door_io_pages;
       ];
     group "OCaml door"
       [
@@ -2080,12 +2438,26 @@ let tests =
           test_ocaml_door_runs;
         test "refuses before claiming or running anything"
           test_ocaml_door_refuses;
+        test "a refusal in a later run of claims leaves no claim"
+          test_ocaml_door_late_refusals;
+        test "holds the lock for no long stretch, however many arrays"
+          test_ocaml_door_holds;
+        test "refuses a dead array before a written one's other faults"
+          test_ocaml_door_order;
+        test "claims and releases arrays around each run of claims"
+          test_ocaml_door_counts;
         test "a written array may be identical to read ones, claimed once"
           test_ocaml_door_identical;
         test "off the host, views overlap by their offsets"
           test_ocaml_door_off_host;
         test "bigarrays over one memory overlap by their addresses"
           test_ocaml_door_bigarrays;
+        test "an io memory overlaps its borrow and its pages' bigarrays"
+          test_ocaml_door_io_pages;
+        prop ~count:500
+          "overlap is Rig.Buffer.overlaps of the arrays' bytes, identity one \
+           width and one first bit"
+          operands_gen law_door_overlaps;
         test "releases its claims when its function raises"
           test_ocaml_door_raises;
       ];

@@ -6,15 +6,13 @@
 #include <stdlib.h>
 #include <string.h>
 
-#if defined(__x86_64__)
-#include <emmintrin.h>
-#endif
-
 #include <caml/alloc.h>
 #include <caml/bigarray.h>
+#include <caml/callback.h>
 #include <caml/fail.h>
 #include <caml/memory.h>
 #include <caml/mlvalues.h>
+#include <caml/signals.h>
 
 #include "nx_array.h"
 #include "nx_layout.h"
@@ -77,15 +75,46 @@ static int claim_code(enum rig_claim c) {
   caml_fatal_error("nx_read: rig_buffer_claim answered %d", (int)c);
 }
 
-/* Whether the descriptors [a] and [b], both with elements, are identical:
-   one width, and every index at one byte: equal extents and strides, and
-   one first bit. */
+/* Where an operand's bytes lie: [lo, hi) bytes past its buffer's first,
+   from its layout's span. */
+typedef struct {
+  int64_t lo, hi;
+} where;
+
+/* Whether the operands [a] and [b], both with elements, share a byte. Two
+   the host addresses compare host addresses; others ask rig, as
+   Rig.Buffer.overlaps of the views of their bytes would answer, which sees
+   a borrow and the memory it maps, and an io memory and a bigarray over
+   its pages. A layout lies within its buffer (Nx_array.v), so rig's bounds
+   hold; were one past it, the pair would count as sharing. */
+static int meet(const nx_array *a, const where *wa, const nx_array *b,
+                const where *wb) {
+  if (a->base != NULL && b->base != NULL) {
+    intptr_t x = (intptr_t)a->base, y = (intptr_t)b->base;
+    return x + wa->lo < y + wb->hi && y + wb->lo < x + wa->hi;
+  }
+  if ((size_t)wa->hi > rig_buffer_bytes(a->buffer) ||
+      (size_t)wb->hi > rig_buffer_bytes(b->buffer))
+    return 1;
+  return rig_buffers_overlap(a->buffer, wa->lo, wa->hi - wa->lo, b->buffer,
+                             wb->lo, wb->hi - wb->lo);
+}
+
+/* Whether [a] and [b], which share a byte, are identical: one width, and
+   every index at one byte: equal extents and strides, and one first bit,
+   the bits of its byte compared, the byte by host address or by rig. */
 static int identical(const nx_array *a, const nx_array *b) {
   if (a->bits != b->bits || a->rank != b->rank) return 0;
   for (int i = 0; i < 2 * a->rank; i++)
     if (a->dim[i] != b->dim[i]) return 0;
-  return (int64_t)(intptr_t)a->base * 8 + a->offset * a->bits ==
-         (int64_t)(intptr_t)b->base * 8 + b->offset * b->bits;
+  int64_t fa = a->offset * a->bits, fb = b->offset * b->bits;
+  if (fa % 8 != fb % 8) return 0;
+  if (a->base != NULL && b->base != NULL)
+    return (intptr_t)a->base + fa / 8 == (intptr_t)b->base + fb / 8;
+  if ((size_t)(fa / 8) >= rig_buffer_bytes(a->buffer) ||
+      (size_t)(fb / 8) >= rig_buffer_bytes(b->buffer))
+    return 0;
+  return rig_buffers_overlap(a->buffer, fa / 8, 1, b->buffer, fb / 8, 1);
 }
 
 /* Releases the claims of the first [n] operands [a] made, and answers [e]: a
@@ -95,9 +124,11 @@ static int refuse_claimed(int n, const nx_array *a, int e) {
   return e;
 }
 
-/* nx_read's checks, which claim every operand or none: [span] holds 2n
-   words for the operands' bytes. */
-static int admit(int n, const nx_operand *in, nx_array *out, int64_t *span) {
+/* The door's checks, which claim every operand or none, for [host] kernels
+   or for a kernel that submits device work: [w] holds n operands' byte
+   ranges. */
+static int checks(int n, const nx_operand *in, nx_array *out, where *w,
+                  int host) {
   for (int k = 0; k < n; k++) {
     value v = in[k].array;
     nx_array *a = &out[k];
@@ -127,27 +158,23 @@ static int admit(int n, const nx_operand *in, nx_array *out, int64_t *span) {
     int refused = rig_buffers_claim(m, buffer, access, answer);
     if (refused >= 0)
       return refuse_claimed(at, out, claim_code(answer[refused]));
-    /* A loss's wait raises it. */
-    for (int j = 0; j < m; j++) out[at + j].wait = answer[j] != RIG_CLAIMED;
+    for (int j = 0; j < m; j++) out[at + j].wait = answer[j];
   }
-  /* Each operand's bytes, as host addresses, read once with its layout's
-     span: [first, last) at span[2k], span[2k + 1]. */
+  /* Each operand's bytes, read once with its layout's span. */
   for (int k = 0; k < n; k++) {
     nx_array *a = &out[k];
-    int64_t *first = &span[2 * k], *last = &span[2 * k + 1];
     if (in[k].written && !(a->flags & NX_DISTINCT))
       return refuse_claimed(n, out, NX_NOT_DISTINCT);
     if (a->flags & NX_EMPTY) {
       a->base = NULL;
-      *first = *last = 0;
+      w[k].lo = w[k].hi = 0;
       continue;
     }
-    if ((a->base = rig_buffer_host(a->buffer)) == NULL)
-      return refuse_claimed(n, out, NX_NOT_HOST);
+    a->base = rig_buffer_host(a->buffer);
+    if (host && a->base == NULL) return refuse_claimed(n, out, NX_NOT_HOST);
     value l = Field(in[k].array, ARRAY_LAYOUT);
-    int64_t base = (int64_t)(intptr_t)a->base;
-    *first = base + Long_val(Field(l, NX_LAYOUT_LO)) * a->bits / 8;
-    *last = base + (Long_val(Field(l, NX_LAYOUT_HI)) * a->bits + 7) / 8;
+    w[k].lo = Long_val(Field(l, NX_LAYOUT_LO)) * a->bits / 8;
+    w[k].hi = (Long_val(Field(l, NX_LAYOUT_HI)) * a->bits + 7) / 8;
   }
   /* A written operand shares bytes with no other but a read operand
      identical to it, which is marked its alias. Identity is of bytes, and
@@ -157,11 +184,10 @@ static int admit(int n, const nx_operand *in, nx_array *out, int64_t *span) {
      loss. Read operands may share bytes, so only pairs with a written
      operand are compared. */
   for (int k = 0; k < n; k++) {
-    int64_t fk = span[2 * k], lk = span[2 * k + 1];
-    if (!in[k].written || fk == lk) continue;
+    if (!in[k].written || w[k].lo == w[k].hi) continue;
     for (int j = 0; j < n; j++) {
-      if (j == k || out[j].alias) continue;
-      if (!(span[2 * j] < lk && fk < span[2 * j + 1])) continue;
+      if (j == k || out[j].alias || w[j].lo == w[j].hi) continue;
+      if (!meet(&out[k], &w[k], &out[j], &w[j])) continue;
       if (in[j].written || !identical(&out[k], &out[j]))
         return refuse_claimed(n, out, NX_OVERLAP);
       out[j].alias = 1;
@@ -170,17 +196,302 @@ static int admit(int n, const nx_operand *in, nx_array *out, int64_t *span) {
   return NX_OK;
 }
 
+/* checks, its byte ranges on the stack up to NX_MAX_OPERANDS operands,
+   beyond on the heap, allocated before any claim. */
+static int admit(int n, const nx_operand *in, nx_array *out, int host) {
+  where local[NX_MAX_OPERANDS], *w = local;
+  if (n > NX_MAX_OPERANDS) {
+    w = malloc((size_t)n * sizeof *w);
+    if (w == NULL) caml_raise_out_of_memory();
+  }
+  int e = checks(n, in, out, w, host);
+  if (w != local) free(w);
+  return e;
+}
+
+/* Unlinks the roots of the [n] operands [a], pushed in order through
+   a[0].local, under any pushed since. */
+static void unlink_roots(int n, nx_array *a) {
+  struct caml__roots_block **p = a[0].local;
+  while (*p != &a[n - 1].roots) {
+    if (*p == NULL)
+      caml_fatal_error("nx_done: the descriptors' roots were popped before "
+                       "nx_done");
+    p = &(*p)->next;
+  }
+  *p = a[0].roots.next;
+}
+
+/* Many operands
+
+   Past NX_MAX_OPERANDS operands the door works in runs of that many, and
+   releases the domain lock and takes it back between two runs
+   (nx_let_collect), so that no stretch it holds the lock grows with the
+   count. A run first reads its operands and links their buffers as roots,
+   as a release may move OCaml values; then each run claims its operands;
+   then the checks that read C data alone run with the lock released, the
+   tables sized by the count are freed released, and a wait or a raise
+   goes in runs too. The refusals keep nx_read's order: the dtypes, then
+   the claims, then the rest. */
+
+void nx_let_collect(void) {
+  caml_enter_blocking_section_no_pending();
+  caml_leave_blocking_section();
+}
+
+void nx_free_released(void *p) {
+  if (p == NULL) return;
+  caml_enter_blocking_section_no_pending();
+  free(p);
+  caml_leave_blocking_section();
+}
+
+/* The end of the run of operands from [at], of [n]. */
+static int run_end(int at, int n) {
+  return n - at < NX_MAX_OPERANDS ? n : at + NX_MAX_OPERANDS;
+}
+
+/* Releases the claims of the [n] operands [a], collecting between runs. */
+static void release_runs(int n, const nx_array *a) {
+  for (int at = 0; at < n; at = run_end(at, n)) {
+    if (at > 0) nx_let_collect();
+    for (int k = at; k < run_end(at, n); k++) rig_buffer_release(a[k].buffer);
+  }
+}
+
+/* Links the buffers of [a][at, end) as local roots on top of [*roots]. */
+static void push_roots(nx_array *a, int at, int end,
+                       struct caml__roots_block **roots) {
+  struct caml__roots_block *top = *roots;
+  for (int k = at; k < end; k++) {
+    a[k].roots.next = top;
+    a[k].roots.ntables = 1;
+    a[k].roots.nitems = 1;
+    a[k].roots.tables[0] = &a[k].buffer;
+    top = &a[k].roots;
+  }
+  *roots = top;
+}
+
+/* Reads, in runs, the [n] operands [operand] gives into [in], [out] and
+   [w]: the dtype checked, the layout, the byte range and the buffer, which
+   it links as a root through out[0].local. Answers NX_OK, or NX_DTYPE or
+   [operand]'s refusal with no root linked. */
+static int read_runs(int n, int (*operand)(void *, int, nx_operand *),
+                     void *ctx, nx_operand *in, nx_array *out, where *w) {
+  out[0].local = &CAML_LOCAL_ROOTS;
+  for (int at = 0; at < n; at = run_end(at, n)) {
+    if (at > 0) nx_let_collect();
+    for (int k = at; k < run_end(at, n); k++) {
+      int e = operand(ctx, k, &in[k]);
+      nx_array *a = &out[k];
+      value v = in[k].array;
+      if (!e && (a->dtype = nx_array_dtype(v)) != in[k].dtype) e = NX_DTYPE;
+      if (e) {
+        if (at > 0) unlink_roots(at, out);
+        return e;
+      }
+      a->bits = nx_dtype_row_of(a->dtype).bits;
+      read_layout(Field(v, ARRAY_LAYOUT), a);
+      a->buffer = Field(v, ARRAY_BUFFER);
+      a->alias = 0;
+      value l = Field(v, ARRAY_LAYOUT);
+      w[k].lo = w[k].hi = 0;
+      if (!(a->flags & NX_EMPTY)) {
+        w[k].lo = Long_val(Field(l, NX_LAYOUT_LO)) * a->bits / 8;
+        w[k].hi = (Long_val(Field(l, NX_LAYOUT_HI)) * a->bits + 7) / 8;
+      }
+    }
+    push_roots(out, at, run_end(at, n), out[0].local);
+  }
+  return NX_OK;
+}
+
+/* Claims, in runs, the [n] operands read_runs read, each one's wait and
+   host address recorded: NX_OK, [*waits] set if one waits and [*lost] to
+   the first a lost device holds, if one does; or a refusal with none
+   claimed and every root unlinked. */
+static int claim_runs(int n, const nx_operand *in, nx_array *out, int *waits,
+                      int *lost) {
+  value buffer[NX_MAX_OPERANDS];
+  enum rig_access access[NX_MAX_OPERANDS];
+  enum rig_claim answer[NX_MAX_OPERANDS];
+  for (int at = 0; at < n; at = run_end(at, n)) {
+    int m = run_end(at, n) - at;
+    nx_let_collect();
+    for (int j = 0; j < m; j++) {
+      buffer[j] = out[at + j].buffer;
+      access[j] = in[at + j].written ? RIG_READ_WRITE : RIG_READ;
+    }
+    int refused = rig_buffers_claim(m, buffer, access, answer);
+    if (refused >= 0) {
+      release_runs(at, out);
+      unlink_roots(n, out);
+      return claim_code(answer[refused]);
+    }
+    for (int j = 0; j < m; j++) {
+      nx_array *a = &out[at + j];
+      a->wait = answer[j];
+      *waits |= a->wait;
+      if (answer[j] == RIG_LOST && *lost > at + j) *lost = at + j;
+      a->base = a->flags & NX_EMPTY ? NULL : rig_buffer_host(a->buffer);
+    }
+  }
+  return NX_OK;
+}
+
+/* The checks of claimed operands that read C data alone, as nx_read
+   orders them: a written operand distinct, a [host] one's memory the
+   host's. */
+static int faults(int n, const nx_operand *in, const nx_array *out,
+                  int host) {
+  for (int k = 0; k < n; k++) {
+    if (in[k].written && !(out[k].flags & NX_DISTINCT)) return NX_NOT_DISTINCT;
+    if (host && !(out[k].flags & NX_EMPTY) && out[k].base == NULL)
+      return NX_NOT_HOST;
+  }
+  return NX_OK;
+}
+
+/* A written operand's bytes, by host address. */
+typedef struct {
+  intptr_t lo, hi;
+  int k;
+} span;
+
+static int by_lo(const void *x, const void *y) {
+  intptr_t a = ((const span *)x)->lo, b = ((const span *)y)->lo;
+  return (a > b) - (a < b);
+}
+
+/* nx_read's overlap check of [n] claimed host operands, by address, in
+   O(n log n) for [n] of any size: [s] holds n spans. The written spans are
+   sorted; two that meet overlap, and a read operand meets at most one,
+   which it is identical to. Reads C data alone. */
+static int host_overlaps(int n, const nx_operand *in, nx_array *out,
+                         const where *w, span *s) {
+  int ns = 0;
+  for (int k = 0; k < n; k++) {
+    if (!in[k].written || w[k].lo == w[k].hi) continue;
+    intptr_t b = (intptr_t)out[k].base;
+    s[ns++] = (span){b + w[k].lo, b + w[k].hi, k};
+  }
+  qsort(s, (size_t)ns, sizeof *s, by_lo);
+  for (int i = 1; i < ns; i++)
+    if (s[i].lo < s[i - 1].hi) return NX_OVERLAP;
+  for (int j = 0; j < n; j++) {
+    if (in[j].written || w[j].lo == w[j].hi) continue;
+    intptr_t lo = (intptr_t)out[j].base + w[j].lo;
+    intptr_t hi = (intptr_t)out[j].base + w[j].hi;
+    /* The first written span past [lo]: the spans are disjoint, so sorted
+       by their ends too. */
+    int a = 0, b = ns;
+    while (a < b) {
+      int c = a + (b - a) / 2;
+      if (s[c].hi <= lo) a = c + 1;
+      else b = c;
+    }
+    if (a == ns || s[a].lo >= hi) continue;
+    if ((a + 1 < ns && s[a + 1].lo < hi) || !identical(&out[s[a].k], &out[j]))
+      return NX_OVERLAP;
+    out[j].alias = 1;
+  }
+  return NX_OK;
+}
+
+/* The overlap check of [n] claimed operands wherever their memory lies,
+   held, as rig compares memory off the host: it collects every
+   NX_MAX_OPERANDS steps of its loops, compared or skipped. */
+static int collecting_overlaps(int n, const nx_operand *in, nx_array *out,
+                               const where *w) {
+  int64_t steps = 0;
+  for (int k = 0; k < n; k++) {
+    if (++steps % NX_MAX_OPERANDS == 0) nx_let_collect();
+    if (!in[k].written || w[k].lo == w[k].hi) continue;
+    for (int j = 0; j < n; j++) {
+      if (++steps % NX_MAX_OPERANDS == 0) nx_let_collect();
+      if (j == k || out[j].alias || w[j].lo == w[j].hi) continue;
+      if (!meet(&out[k], &w[k], &out[j], &w[j])) continue;
+      if (in[j].written || !identical(&out[k], &out[j])) return NX_OVERLAP;
+      out[j].alias = 1;
+    }
+  }
+  return NX_OK;
+}
+
+/* The exception [r] holds. OCaml 5.5's public caml_result interface has
+   no accessor for it that does not raise it, and it must stay rooted
+   while the claims are released in runs: it reads the field, so that a
+   change to the field fails the build. */
+static value exception_of(caml_result r) { return r.data; }
+
+/* Waits under the claims, in runs, for the device work of the [n]
+   operands [out] read for [in]. If a wait raises, it releases every claim
+   in runs, holding the exception as a root, unlinks the roots, frees
+   [scratch] and raises. */
+static void waits_runs(int n, const nx_operand *in, nx_array *out,
+                       void *scratch) {
+  CAMLparam0();
+  CAMLlocal1(exn);
+  for (int at = 0; at < n; at = run_end(at, n)) {
+    if (at > 0) nx_let_collect();
+    for (int k = at; k < run_end(at, n); k++) {
+      if (!out[k].wait) continue;
+      caml_result r = rig_buffer_wait(
+          out[k].buffer, in[k].written ? RIG_READ_WRITE : RIG_READ);
+      if (!caml_result_is_exception(r)) continue;
+      exn = exception_of(r);
+      release_runs(n, out);
+      /* The frame goes before the roots under it: no collection runs
+         until the raise. */
+      CAMLdrop;
+      unlink_roots(n, out);
+      free(scratch);
+      caml_raise(exn);
+    }
+  }
+  CAMLreturn0;
+}
+
+int nx_read_each(int n, int (*operand)(void *ctx, int k, nx_operand *in),
+                 void *ctx, nx_array *out) {
+  if (n <= 0) return NX_OK;
+  /* The operands, their byte ranges and the spans of the overlap check, on
+     the heap, allocated before any claim. */
+  size_t one = sizeof(nx_operand) + sizeof(where) + sizeof(span);
+  uint8_t *b = malloc((size_t)n * one);
+  if (b == NULL) caml_raise_out_of_memory();
+  nx_operand *in = (nx_operand *)b;
+  where *w = (where *)(in + n);
+  span *s = (span *)(w + n);
+  int waiting = 0, lost = n;
+  int e = read_runs(n, operand, ctx, in, out, w);
+  if (e) {
+    nx_free_released(b);
+    return e;
+  }
+  if ((e = claim_runs(n, in, out, &waiting, &lost))) {
+    nx_free_released(b);
+    return e;
+  }
+  caml_enter_blocking_section_no_pending();
+  e = faults(n, in, out, 1);
+  if (!e) e = host_overlaps(n, in, out, w, s);
+  caml_leave_blocking_section();
+  if (e) {
+    release_runs(n, out);
+    unlink_roots(n, out);
+    nx_free_released(b);
+    return e;
+  }
+  if (waiting) waits_runs(n, in, out, b);
+  nx_free_released(b);
+  return NX_OK;
+}
+
 int nx_read(int n, const nx_operand *in, nx_array *out) {
   if (n <= 0) return NX_OK;
-  /* The spans live on the stack up to NX_MAX_OPERANDS operands, beyond on
-     the heap, allocated before any claim. */
-  int64_t local[2 * NX_MAX_OPERANDS], *span = local;
-  if (n > NX_MAX_OPERANDS) {
-    span = malloc(2 * (size_t)n * sizeof *span);
-    if (span == NULL) caml_raise_out_of_memory();
-  }
-  int e = admit(n, in, out, span);
-  if (span != local) free(span);
+  int e = admit(n, in, out, 1);
   if (e) return e;
   int waits = 0;
   for (int k = 0; k < n; k++) waits |= out[k].wait;
@@ -208,7 +519,10 @@ int nx_read(int n, const nx_operand *in, nx_array *out) {
     caml_result r = rig_buffer_wait(
         out[k].buffer, in[k].written ? RIG_READ_WRITE : RIG_READ);
     if (caml_result_is_exception(r)) {
-      nx_done(n, out);
+      /* The exception is no root: the claims end without a release of
+         the lock, which nx_done makes past NX_MAX_OPERANDS. */
+      for (int j = 0; j < n; j++) rig_buffer_release(out[j].buffer);
+      unlink_roots(n, out);
       (void)caml_get_value_or_raise(r);
     }
   }
@@ -217,71 +531,134 @@ int nx_read(int n, const nx_operand *in, nx_array *out) {
 
 void nx_done(int n, nx_array *a) {
   if (n <= 0) return;
-  for (int k = 0; k < n; k++) rig_buffer_release(a[k].buffer);
-  /* Unlink the roots nx_read pushed, under any pushed since. */
-  struct caml__roots_block **p = a[0].local;
-  while (*p != &a[n - 1].roots) {
-    if (*p == NULL)
-      caml_fatal_error("nx_done: the descriptors' roots were popped before "
-                       "nx_done");
-    p = &(*p)->next;
-  }
-  *p = a[0].roots.next;
+  if (n <= NX_MAX_OPERANDS)
+    for (int k = 0; k < n; k++) rig_buffer_release(a[k].buffer);
+  else release_runs(n, a);
+  unlink_roots(n, a);
 }
 
-/* The OCaml door (Nx_array.door) claims through these, in C, so that no
+/* The OCaml door (Nx_array.door) admits through admit, in C, so that no
    OCaml code, and so no asynchronous exception, runs between two claims.
    [written] and [read] are OCaml arrays of Nx_array.any, which is unboxed:
    an any is its array's block. */
 
-static value any_buffer(value anys, mlsize_t k) {
-  return Field(Field(anys, k), ARRAY_BUFFER);
-}
-
-/* The buffer of the [k]th array of [written], then [read]. */
-static value nth_buffer(value written, value read, mlsize_t k) {
+static value nth_array(value written, value read, mlsize_t k) {
   mlsize_t nw = Wosize_val(written);
-  return k < nw ? any_buffer(written, k) : any_buffer(read, k - nw);
+  return k < nw ? Field(written, k) : Field(read, k - nw);
 }
 
 static void release_first(value written, value read, mlsize_t n) {
   for (mlsize_t k = 0; k < n; k++)
-    rig_buffer_release(nth_buffer(written, read, k));
+    rig_buffer_release(Field(nth_array(written, read, k), ARRAY_BUFFER));
 }
 
-/* Claims every array of [written] for writing and of [read] for reading, or
-   none, and waits for nothing. Answers the refusal's code, with nothing
-   claimed; or NX_OK, every array claimed, plus 256 times one more than the
-   index of the first array whose claim answered RIG_LOST, 0 for none: a
-   lost device is behind it, which the door probes for its exception. The
-   index counts [written], then [read]. A read array identical to a written
-   one is claimed too: claims are counted, so two of one memory do not
-   conflict. It claims in runs, as nx_read does. */
-intnat nx_array_claim_all(value written, value read) {
-  mlsize_t nw = Wosize_val(written), n = nw + Wosize_val(read);
-  value buffer[NX_MAX_OPERANDS];
-  enum rig_access access[NX_MAX_OPERANDS];
-  enum rig_claim answer[NX_MAX_OPERANDS];
-  mlsize_t lost = 0;
+/* Admits every array of [written] for writing and of [read] for reading, of
+   any dtype and wherever its memory lies, and waits for nothing: NX_OK with
+   every array claimed, or a refusal's code with none. A read array
+   identical to a written one is claimed too: claims are counted, so two of
+   one memory do not conflict. If an array is a lost device's memory, or
+   follows a lost device's work, it raises Rig.Lost, as the wait for its
+   access does at once, holding no claim. */
+/* The door's arrays at the roots [written] and [read], as read_runs reads
+   them. */
+typedef struct {
+  const value *written, *read;
+} door_arrays;
+
+static int door_operand(void *ctx, int k, nx_operand *in) {
+  const door_arrays *d = ctx;
+  value v = nth_array(*d->written, *d->read, (mlsize_t)k);
+  *in = (nx_operand){v, nx_array_dtype(v),
+                     (mlsize_t)k < Wosize_val(*d->written)};
+  return NX_OK;
+}
+
+/* Releases the claims of the first [n] arrays of the roots [written] and
+   [read], collecting between runs. */
+static void release_first_runs(const value *written, const value *read,
+                               mlsize_t n) {
   for (mlsize_t at = 0; at < n; at += NX_MAX_OPERANDS) {
-    int m = n - at < NX_MAX_OPERANDS ? (int)(n - at) : NX_MAX_OPERANDS;
-    for (int j = 0; j < m; j++) {
-      buffer[j] = nth_buffer(written, read, at + j);
-      access[j] = at + j < nw ? RIG_READ_WRITE : RIG_READ;
-    }
-    int refused = rig_buffers_claim(m, buffer, access, answer);
-    if (refused >= 0) {
-      release_first(written, read, at);
-      return claim_code(answer[refused]);
-    }
-    for (int j = 0; j < m && lost == 0; j++)
-      if (answer[j] == RIG_LOST) lost = at + j + 1;
+    if (at > 0) nx_let_collect();
+    mlsize_t end = n - at < NX_MAX_OPERANDS ? n : at + NX_MAX_OPERANDS;
+    for (mlsize_t k = at; k < end; k++)
+      rig_buffer_release(Field(nth_array(*written, *read, k), ARRAY_BUFFER));
   }
-  return NX_OK + 256 * (intnat)lost;
 }
 
-value nx_array_claim_all_byte(value written, value read) {
-  return Val_long(nx_array_claim_all(written, read));
+/* nx_array_admit past NX_MAX_OPERANDS arrays, in runs (Many operands). */
+static value admit_many(value written, value read) {
+  CAMLparam2(written, read);
+  CAMLlocal1(exn);
+  int n = (int)(Wosize_val(written) + Wosize_val(read));
+  uint8_t *b = malloc((size_t)n * (sizeof(nx_operand) + sizeof(nx_array) +
+                                   sizeof(where)));
+  if (b == NULL) caml_raise_out_of_memory();
+  nx_array *out = (nx_array *)b;
+  where *w = (where *)(out + n);
+  nx_operand *in = (nx_operand *)(w + n);
+  door_arrays d = {&written, &read};
+  int waiting = 0, lost = n;
+  int e = read_runs(n, door_operand, &d, in, out, w);
+  if (!e && !(e = claim_runs(n, in, out, &waiting, &lost))) {
+    caml_enter_blocking_section_no_pending();
+    e = faults(n, in, out, 0);
+    caml_leave_blocking_section();
+    if (!e) e = collecting_overlaps(n, in, out, w);
+    if (e) release_runs(n, out);
+    /* The claims stay until release_all; the roots end here. */
+    unlink_roots(n, out);
+  }
+  nx_free_released(b);
+  if (e || lost == n) CAMLreturn(Val_int(e));
+  value a = nth_array(written, read, (mlsize_t)lost);
+  caml_result r = rig_buffer_wait(Field(a, ARRAY_BUFFER),
+                                  (mlsize_t)lost < Wosize_val(written)
+                                      ? RIG_READ_WRITE
+                                      : RIG_READ);
+  if (caml_result_is_exception(r)) {
+    exn = exception_of(r);
+    release_first_runs(&written, &read, (mlsize_t)n);
+    caml_raise(exn);
+  }
+  CAMLreturn(Val_int(NX_OK));
+}
+
+value nx_array_admit(value written, value read) {
+  if (Wosize_val(written) + Wosize_val(read) > NX_MAX_OPERANDS)
+    return admit_many(written, read);
+  CAMLparam2(written, read);
+  mlsize_t n = Wosize_val(written) + Wosize_val(read);
+  /* The operands, their descriptors and their byte ranges, on the stack
+     up to NX_MAX_OPERANDS, past it in one block of the heap. */
+  nx_operand local_in[NX_MAX_OPERANDS], *in = local_in;
+  nx_array local_out[NX_MAX_OPERANDS], *out = local_out;
+  where local_w[NX_MAX_OPERANDS], *w = local_w;
+  if (n > NX_MAX_OPERANDS) {
+    uint8_t *b = malloc(n * (sizeof *in + sizeof *out + sizeof *w));
+    if (b == NULL) caml_raise_out_of_memory();
+    out = (nx_array *)b;
+    w = (where *)(b + n * sizeof *out);
+    in = (nx_operand *)(b + n * (sizeof *out + sizeof *w));
+  }
+  for (mlsize_t k = 0; k < n; k++) {
+    value v = nth_array(written, read, k);
+    in[k] = (nx_operand){v, nx_array_dtype(v), k < Wosize_val(written)};
+  }
+  int e = checks((int)n, in, out, w, 0);
+  mlsize_t lost = n;
+  for (mlsize_t k = 0; !e && k < n && lost == n; k++)
+    if (out[k].wait == RIG_LOST) lost = k;
+  if (out != local_out) free(out);
+  if (e || lost == n) CAMLreturn(Val_int(e));
+  value a = nth_array(written, read, lost);
+  caml_result r = rig_buffer_wait(Field(a, ARRAY_BUFFER),
+                                  lost < Wosize_val(written) ? RIG_READ_WRITE
+                                                             : RIG_READ);
+  if (caml_result_is_exception(r)) {
+    release_first(written, read, n);
+    (void)caml_get_value_or_raise(r);
+  }
+  CAMLreturn(Val_int(NX_OK));
 }
 
 value nx_array_release_all(value written, value read) {
@@ -289,82 +666,12 @@ value nx_array_release_all(value written, value read) {
   return Val_unit;
 }
 
-/* Claims [b]'s memory for [access], RIG_READ or RIG_READ_WRITE as the
-   constructors of Rig.access, and waits for nothing: NX_OK with the claim
-   held, which nx_array_end_claim ends, plus 256 if the access must wait first
-   (RIG_WAIT or RIG_LOST); or a refusal's code with none. */
-intnat nx_array_claim(value b, value v_access) {
-  enum rig_claim c = rig_buffer_claim(b, (enum rig_access)Int_val(v_access));
-  int e = claim_code(c);
-  if (e) return e;
-  return c == RIG_CLAIMED ? NX_OK : NX_OK + 256;
-}
-
-value nx_array_claim_byte(value b, value v_access) {
-  return Val_long(nx_array_claim(b, v_access));
-}
-
-/* Ends a claim nx_array_claim took on [b]. */
-value nx_array_end_claim(value b) {
-  rig_buffer_release(b);
-  return Val_unit;
-}
-
-/* Whether the arrays [a] and [b] reach a common byte. Their buffers' first
-   bytes lie at their host addresses where the host addresses both, and
-   otherwise at [pa] and [pb] of one memory. */
-value nx_array_shares(value a, value b, intnat pa, intnat pb) {
-  value la = Field(a, ARRAY_LAYOUT), lb = Field(b, ARRAY_LAYOUT);
-  if ((Long_val(Field(la, NX_LAYOUT_FLAGS)) |
-       Long_val(Field(lb, NX_LAYOUT_FLAGS))) &
-      NX_EMPTY)
-    return Val_false;
-  uint8_t *ha = rig_buffer_host(Field(a, ARRAY_BUFFER));
-  uint8_t *hb = rig_buffer_host(Field(b, ARRAY_BUFFER));
-  if (ha != NULL && hb != NULL) {
-    pa = (intnat)(intptr_t)ha;
-    pb = (intnat)(intptr_t)hb;
-  }
-  /* A span's end is at most NX_MAX_NUMEL: times 128 bits, it fits. */
-  int64_t bits_a = nx_dtype_row_of(nx_array_dtype(a)).bits;
-  int64_t bits_b = nx_dtype_row_of(nx_array_dtype(b)).bits;
-  int64_t first_a = pa + Long_val(Field(la, NX_LAYOUT_LO)) * bits_a / 8;
-  int64_t last_a = pa + (Long_val(Field(la, NX_LAYOUT_HI)) * bits_a + 7) / 8;
-  int64_t first_b = pb + Long_val(Field(lb, NX_LAYOUT_LO)) * bits_b / 8;
-  int64_t last_b = pb + (Long_val(Field(lb, NX_LAYOUT_HI)) * bits_b + 7) / 8;
-  return Val_bool(first_a < last_b && first_b < last_a);
-}
-
-value nx_array_shares_byte(value a, value b, value pa, value pb) {
-  return nx_array_shares(a, b, Long_val(pa), Long_val(pb));
-}
-
-/* Whether the arrays [a] and [b], which share a byte, are identical: one
-   width, equal extents and strides, and one first bit, their buffers placed
-   as nx_array_shares places them. */
-value nx_array_identical(value a, value b, intnat pa, intnat pb) {
-  value la = Field(a, ARRAY_LAYOUT), lb = Field(b, ARRAY_LAYOUT);
-  int64_t bits = nx_dtype_row_of(nx_array_dtype(a)).bits;
-  if (bits != nx_dtype_row_of(nx_array_dtype(b)).bits) return Val_false;
-  value sa = Field(la, NX_LAYOUT_SHAPE), sb = Field(lb, NX_LAYOUT_SHAPE);
-  value ta = Field(la, NX_LAYOUT_STRIDES), tb = Field(lb, NX_LAYOUT_STRIDES);
-  mlsize_t r = Wosize_val(sa);
-  if (Wosize_val(sb) != r) return Val_false;
-  for (mlsize_t i = 0; i < r; i++)
-    if (Field(sa, i) != Field(sb, i) || Field(ta, i) != Field(tb, i))
-      return Val_false;
-  uint8_t *ha = rig_buffer_host(Field(a, ARRAY_BUFFER));
-  uint8_t *hb = rig_buffer_host(Field(b, ARRAY_BUFFER));
-  if (ha != NULL && hb != NULL) {
-    pa = (intnat)(intptr_t)ha;
-    pb = (intnat)(intptr_t)hb;
-  }
-  return Val_bool(pa * 8 + Long_val(Field(la, NX_LAYOUT_OFFSET)) * bits ==
-                  pb * 8 + Long_val(Field(lb, NX_LAYOUT_OFFSET)) * bits);
-}
-
-value nx_array_identical_byte(value a, value b, value pa, value pb) {
-  return nx_array_identical(a, b, Long_val(pa), Long_val(pb));
+/* nx_array_release_all past NX_MAX_OPERANDS arrays, collecting between
+   runs. */
+value nx_array_release_many(value written, value read) {
+  CAMLparam2(written, read);
+  release_first_runs(&written, &read, Wosize_val(written) + Wosize_val(read));
+  CAMLreturn(Val_unit);
 }
 
 /* Coalescing */
@@ -619,31 +926,9 @@ static void store_int(uint8_t *base, int dt, int64_t p, int64_t x) {
   }
 }
 
-/* Element access from OCaml, on a buffer the caller claimed and waited
-   for, at a position its layout reaches. */
-
 intnat nx_array_host(value b) {
   void *p = rig_buffer_host(b);
   return p == NULL ? -1 : (intnat)(intptr_t)p;
-}
-
-double nx_array_get_float(value b, intnat dt, intnat p, intnat part) {
-  return load_float(rig_buffer_host(b), (int)dt, p, (int)part);
-}
-
-int64_t nx_array_get_int(value b, intnat dt, intnat p) {
-  return load_int(rig_buffer_host(b), (int)dt, p);
-}
-
-value nx_array_set_float(value b, intnat dt, intnat p, intnat part,
-                         double x) {
-  store_float(rig_buffer_host(b), (int)dt, p, (int)part, x);
-  return Val_unit;
-}
-
-value nx_array_set_int(value b, intnat dt, intnat p, int64_t x) {
-  store_int(rig_buffer_host(b), (int)dt, p, x);
-  return Val_unit;
 }
 
 value nx_array_host_byte(value b) { return Val_long(nx_array_host(b)); }
@@ -659,23 +944,78 @@ value nx_array_load_byte_byte(value b, value i) {
   return Val_long(nx_array_load_byte(b, Long_val(i)));
 }
 
-value nx_array_get_float_byte(value b, value dt, value p, value part) {
-  return caml_copy_double(
-      nx_array_get_float(b, Long_val(dt), Long_val(p), Long_val(part)));
+/* get: [v]'s element at position [vp], which its layout reaches, read
+   through the door and boxed as its dtype's OCaml values are. A refusal
+   raises Nx_array's Refused with its code, holding no claim. The element
+   is loaded under the claim and boxed after it, so that an allocation that
+   raises holds no claim. */
+value nx_array_get(value v, value vp) {
+  CAMLparam1(v);
+  CAMLlocal1(x);
+  nx_operand in = {v, nx_array_dtype(v), 0};
+  nx_array a;
+  int e = nx_read(1, &in, &a);
+  if (e) {
+    static const value *refused = NULL;
+    if (refused == NULL) refused = caml_named_value("Nx_array.Refused");
+    caml_raise_with_arg(*refused, Val_int(e));
+  }
+  int dt = a.dtype;
+  int64_t p = Long_val(vp), i = 0;
+  double re = 0, im = 0;
+  int kind = nx_dtype_row_of(dt).kind;
+  if (kind == NX_KIND_FLOAT || kind == NX_KIND_COMPLEX) {
+    re = load_float(a.base, dt, p, 0);
+    if (kind == NX_KIND_COMPLEX) im = load_float(a.base, dt, p, 1);
+  } else
+    i = load_int(a.base, dt, p);
+  nx_done(1, &a);
+  switch (kind) {
+    case NX_KIND_FLOAT: x = caml_copy_double(re); break;
+    case NX_KIND_COMPLEX:
+      x = caml_alloc_small(2 * Double_wosize, Double_array_tag);
+      Store_double_flat_field(x, 0, re);
+      Store_double_flat_field(x, 1, im);
+      break;
+    default:
+      if (dt == NX_INT64 || dt == NX_UINT64) x = caml_copy_int64(i);
+      else if (dt == NX_INT32 || dt == NX_UINT32)
+        x = caml_copy_int32((int32_t)i);
+      else if (dt == NX_BOOL || dt == NX_BIT) x = Val_bool(i != 0);
+      else x = Val_long(i);
+  }
+  CAMLreturn(x);
 }
 
-value nx_array_get_int_byte(value b, value dt, value p) {
-  return caml_copy_int64(nx_array_get_int(b, Long_val(dt), Long_val(p)));
-}
-
-value nx_array_set_float_byte(value b, value dt, value p, value part,
-                              value x) {
-  return nx_array_set_float(b, Long_val(dt), Long_val(p), Long_val(part),
-                            Double_val(x));
-}
-
-value nx_array_set_int_byte(value b, value dt, value p, value x) {
-  return nx_array_set_int(b, Long_val(dt), Long_val(p), Int64_val(x));
+/* set: stores [x] at [v]'s position [vp], which its layout reaches, through
+   the door, and answers its code. [x] is read before the door, whose wait
+   may move it. */
+value nx_array_set(value v, value vp, value x) {
+  CAMLparam1(v);
+  int dt = nx_array_dtype(v);
+  int kind = nx_dtype_row_of(dt).kind;
+  double re = 0, im = 0;
+  int64_t i = 0;
+  if (kind == NX_KIND_FLOAT) re = Double_val(x);
+  else if (kind == NX_KIND_COMPLEX) {
+    re = Double_flat_field(x, 0);
+    im = Double_flat_field(x, 1);
+  } else if (dt == NX_INT64 || dt == NX_UINT64) i = Int64_val(x);
+  else if (dt == NX_INT32 || dt == NX_UINT32) i = Int32_val(x);
+  else if (dt == NX_BOOL || dt == NX_BIT) i = Bool_val(x);
+  else i = Long_val(x);
+  nx_operand in = {v, dt, 1};
+  nx_array a;
+  int e = nx_read(1, &in, &a);
+  if (e) CAMLreturn(Val_int(e));
+  int64_t p = Long_val(vp);
+  if (kind == NX_KIND_FLOAT || kind == NX_KIND_COMPLEX) {
+    store_float(a.base, dt, p, 0, re);
+    if (kind == NX_KIND_COMPLEX) store_float(a.base, dt, p, 1, im);
+  } else
+    store_int(a.base, dt, p, i);
+  nx_done(1, &a);
+  CAMLreturn(Val_int(NX_OK));
 }
 
 /* Bulk access */
@@ -692,6 +1032,32 @@ static int representation(int dt) {
       return nx_dtype_row_of(dt).bits >= 32 ? TO_BOXED : TO_IMMEDIATE;
   }
 }
+
+/* float16 runs from and to doubles. arm64 widens float16 with FCVT and
+   FCVTL, exactly, and narrows a double to __fp16 in one rounding, as the
+   codecs do, a vector at a time; elsewhere the runs are the codecs'
+   loops. */
+#if defined(__aarch64__)
+typedef __fp16 __attribute__((may_alias)) fp16;
+
+static void f16_to_double(const uint16_t *src, double *dst, size_t n) {
+  const fp16 *h = (const fp16 *)src;
+  for (size_t i = 0; i < n; i++) dst[i] = (double)h[i];
+}
+
+static void double_to_f16(const double *src, uint16_t *dst, size_t n) {
+  fp16 *h = (fp16 *)dst;
+  for (size_t i = 0; i < n; i++) h[i] = (__fp16)src[i];
+}
+#else
+static void f16_to_double(const uint16_t *src, double *dst, size_t n) {
+  for (size_t i = 0; i < n; i++) dst[i] = nx_f16_to_float(src[i]);
+}
+
+static void double_to_f16(const double *src, uint16_t *dst, size_t n) {
+  for (size_t i = 0; i < n; i++) dst[i] = nx_double_to_f16(src[i]);
+}
+#endif
 
 typedef struct {
   const nx_array *a;
@@ -726,7 +1092,7 @@ static void to_run(void *ctx, const int64_t *at, int64_t len) {
     case NX_FLOAT32: DECODE(float, (double)); return;
     case NX_FLOAT16:
       if (step == 1)
-        nx_f16_to_double_run((const uint16_t *)a->base + p, dst, (size_t)len);
+        f16_to_double((const uint16_t *)a->base + p, dst, (size_t)len);
       else DECODE(uint16_t, nx_f16_to_float);
       return;
     case NX_BFLOAT16: DECODE(uint16_t, nx_bf16_to_float); return;
@@ -788,7 +1154,7 @@ static void of_run(void *ctx, const int64_t *at, int64_t len) {
         case NX_FLOAT32: ENCODE(float, (float)); return;
         case NX_FLOAT16:
           if (step == 1)
-            nx_double_to_f16_run(src, (uint16_t *)a->base + p, (size_t)len);
+            double_to_f16(src, (uint16_t *)a->base + p, (size_t)len);
           else ENCODE(uint16_t, nx_double_to_f16);
           return;
         case NX_BFLOAT16: ENCODE(uint16_t, nx_double_to_bf16); return;
@@ -840,8 +1206,8 @@ value nx_array_of_array(value v, value values) {
 
 /* copy: gathers [src]'s elements into [dst], a fresh contiguous array of
    its dtype and shape, bits for bits: one walk over coalesced runs, each
-   run through a plane of nx_copy_box. The host's strided copy, tiled and
-   threaded, is nx.cpu's. */
+   run a memcpy where both operands' elements are adjacent, else element by
+   element. The host's strided copy, tiled and threaded, is nx.cpu's. */
 
 typedef struct {
   const nx_array *a; /* dst, src */
@@ -878,263 +1244,6 @@ static inline __attribute__((always_inline)) void strided(
   for (int64_t k = 0; k < n; k++, d += bd, s += bs) memcpy(d, s, w);
 }
 
-/* Copies the 4x4 block whose column q is the [4·w] bytes at [s + q·sc]
-   into the rows at [d + p·dr], [4·w] bytes each: a transpose. */
-static inline __attribute__((always_inline)) void block(
-    uint8_t *d, int64_t dr, const uint8_t *s, int64_t sc, size_t w) {
-  uint8_t x[4][4 * 16];
-  for (int q = 0; q < 4; q++) memcpy(x[q], s + q * sc, 4 * w);
-  for (int p = 0; p < 4; p++)
-    for (int q = 0; q < 4; q++) memcpy(d + p * dr + q * w, x[q] + p * w, w);
-}
-
-/* The 8x8 block of 4-byte elements whose column q is the 32 bytes at
-   [s + q·sc] into the rows at [d + p·dr], in registers: each column read
-   and each row written as two 16-byte vectors, four 4x4 transposes
-   between. 32 bytes of each line at a time beat the 16 of 4x4 blocks: a
-   transposed 512x512 float32 copy on one thread takes 36.4 us against
-   59.2 in 4x4 blocks on the M1, where Accelerate's vDSP_mtrans takes 35.4,
-   and 35.5 against 61.7 on kimchi, where OpenBLAS takes 41.2. */
-#if defined(__aarch64__)
-static inline __attribute__((always_inline)) void transpose4(
-    uint32x4_t a, uint32x4_t b, uint32x4_t c, uint32x4_t e, uint32x4_t *o) {
-  uint64x2_t t0 = vreinterpretq_u64_u32(vtrn1q_u32(a, b));
-  uint64x2_t t1 = vreinterpretq_u64_u32(vtrn2q_u32(a, b));
-  uint64x2_t t2 = vreinterpretq_u64_u32(vtrn1q_u32(c, e));
-  uint64x2_t t3 = vreinterpretq_u64_u32(vtrn2q_u32(c, e));
-  o[0] = vreinterpretq_u32_u64(vtrn1q_u64(t0, t2));
-  o[1] = vreinterpretq_u32_u64(vtrn1q_u64(t1, t3));
-  o[2] = vreinterpretq_u32_u64(vtrn2q_u64(t0, t2));
-  o[3] = vreinterpretq_u32_u64(vtrn2q_u64(t1, t3));
-}
-
-static inline __attribute__((always_inline)) void block8(uint8_t *d, int64_t dr,
-                                                         const uint8_t *s,
-                                                         int64_t sc) {
-  uint32x4_t x[8][2], o[4];
-  for (int q = 0; q < 8; q++)
-    for (int h = 0; h < 2; h++)
-      x[q][h] = vld1q_u32((const uint32_t *)(s + q * sc + 16 * h));
-  for (int h = 0; h < 2; h++)
-    for (int v = 0; v < 2; v++) {
-      transpose4(x[4 * v][h], x[4 * v + 1][h], x[4 * v + 2][h],
-                 x[4 * v + 3][h], o);
-      for (int p = 0; p < 4; p++)
-        vst1q_u32((uint32_t *)(d + (4 * h + p) * dr + 16 * v), o[p]);
-    }
-}
-#elif defined(__x86_64__)
-/* x86-64 writes each row's 32 bytes with two adjacent stores: a transposed
-   512x512 float32 copy on one kimchi thread takes 35.5 us against 43.8
-   with the halves of four rows interleaved. arm64 gains nothing from it. */
-static inline __attribute__((always_inline)) void block8(uint8_t *d, int64_t dr,
-                                                         const uint8_t *s,
-                                                         int64_t sc) {
-  for (int h = 0; h < 2; h++) {
-    __m128 t[2][4];
-    for (int v = 0; v < 2; v++) {
-      const uint8_t *b = s + 4 * v * sc + 16 * h;
-      __m128 x0 = _mm_loadu_ps((const float *)b);
-      __m128 x1 = _mm_loadu_ps((const float *)(b + sc));
-      __m128 x2 = _mm_loadu_ps((const float *)(b + 2 * sc));
-      __m128 x3 = _mm_loadu_ps((const float *)(b + 3 * sc));
-      _MM_TRANSPOSE4_PS(x0, x1, x2, x3);
-      t[v][0] = x0, t[v][1] = x1, t[v][2] = x2, t[v][3] = x3;
-    }
-    for (int p = 0; p < 4; p++) {
-      uint8_t *o = d + (4 * h + p) * dr;
-      _mm_storeu_ps((float *)o, t[0][p]);
-      _mm_storeu_ps((float *)(o + 16), t[1][p]);
-    }
-  }
-}
-#else
-static inline __attribute__((always_inline)) void block8(uint8_t *d, int64_t dr,
-                                                         const uint8_t *s,
-                                                         int64_t sc) {
-  for (int h = 0; h < 2; h++)
-    for (int v = 0; v < 2; v++)
-      block(d + 4 * h * dr + 16 * v, dr, s + 4 * v * sc + 16 * h, sc, 4);
-}
-#endif
-
-/* The 4x4 block of 8-byte elements whose column q is the 32 bytes at
-   [s + q·sc] into the rows at [d + p·dr], in registers: each column read
-   and each row written as two 16-byte vectors, the pairs of columns
-   interleaved. block's round trip through memory made a transposed
-   float64 pack of 96 rows by 256 7.5% slower than moving its elements one
-   by one on six kimchi cores. */
-#if defined(__aarch64__)
-static inline __attribute__((always_inline)) void block4x8(uint8_t *d,
-                                                           int64_t dr,
-                                                           const uint8_t *s,
-                                                           int64_t sc) {
-  uint64x2_t x[4][2];
-  for (int q = 0; q < 4; q++)
-    for (int h = 0; h < 2; h++)
-      x[q][h] = vld1q_u64((const uint64_t *)(s + q * sc + 16 * h));
-  for (int h = 0; h < 2; h++)
-    for (int v = 0; v < 2; v++) {
-      uint64x2_t a = x[2 * v][h], b = x[2 * v + 1][h];
-      vst1q_u64((uint64_t *)(d + 2 * h * dr + 16 * v), vtrn1q_u64(a, b));
-      vst1q_u64((uint64_t *)(d + (2 * h + 1) * dr + 16 * v),
-                vtrn2q_u64(a, b));
-    }
-}
-#elif defined(__x86_64__)
-static inline __attribute__((always_inline)) void block4x8(uint8_t *d,
-                                                           int64_t dr,
-                                                           const uint8_t *s,
-                                                           int64_t sc) {
-  for (int h = 0; h < 2; h++)
-    for (int v = 0; v < 2; v++) {
-      __m128d a = _mm_loadu_pd((const double *)(s + 2 * v * sc + 16 * h));
-      __m128d b = _mm_loadu_pd((const double *)(s + (2 * v + 1) * sc + 16 * h));
-      _mm_storeu_pd((double *)(d + 2 * h * dr + 16 * v), _mm_unpacklo_pd(a, b));
-      _mm_storeu_pd((double *)(d + (2 * h + 1) * dr + 16 * v),
-                    _mm_unpackhi_pd(a, b));
-    }
-}
-#else
-static inline __attribute__((always_inline)) void block4x8(uint8_t *d,
-                                                           int64_t dr,
-                                                           const uint8_t *s,
-                                                           int64_t sc) {
-  block(d, dr, s, sc, 8);
-}
-#endif
-
-/* The square blocks past the caches: block8's and block4x8's rows, each
-   row's 32 bytes in one nx_stream32. They are functions of their own: one
-   stream takes a row's two halves together, and the plain blocks rewritten
-   so, their stores reordered, made a transposed 512x512 float32 copy 18%
-   slower on one fudge core under gcc. A target without such stores stores
-   plainly. */
-#if defined(__aarch64__)
-static inline __attribute__((always_inline)) void block8_nt(uint8_t *d,
-                                                            int64_t dr,
-                                                            const uint8_t *s,
-                                                            int64_t sc) {
-  uint32x4_t x[8][2], r[4][2];
-  for (int q = 0; q < 8; q++)
-    for (int h = 0; h < 2; h++)
-      x[q][h] = vld1q_u32((const uint32_t *)(s + q * sc + 16 * h));
-  for (int h = 0; h < 2; h++) {
-    uint32x4_t lo[4], hi[4];
-    transpose4(x[0][h], x[1][h], x[2][h], x[3][h], lo);
-    transpose4(x[4][h], x[5][h], x[6][h], x[7][h], hi);
-    for (int p = 0; p < 4; p++) {
-      r[p][0] = lo[p];
-      r[p][1] = hi[p];
-      nx_stream32(d + (4 * h + p) * dr, r[p]);
-    }
-  }
-}
-
-static inline __attribute__((always_inline)) void block4x8_nt(
-    uint8_t *d, int64_t dr, const uint8_t *s, int64_t sc) {
-  uint64x2_t x[4][2];
-  for (int q = 0; q < 4; q++)
-    for (int h = 0; h < 2; h++)
-      x[q][h] = vld1q_u64((const uint64_t *)(s + q * sc + 16 * h));
-  for (int h = 0; h < 2; h++) {
-    uint64x2_t r[2][2] = {
-        {vtrn1q_u64(x[0][h], x[1][h]), vtrn1q_u64(x[2][h], x[3][h])},
-        {vtrn2q_u64(x[0][h], x[1][h]), vtrn2q_u64(x[2][h], x[3][h])}};
-    nx_stream32(d + 2 * h * dr, r[0]);
-    nx_stream32(d + (2 * h + 1) * dr, r[1]);
-  }
-}
-#elif defined(__x86_64__)
-static inline __attribute__((always_inline)) void block8_nt(uint8_t *d,
-                                                            int64_t dr,
-                                                            const uint8_t *s,
-                                                            int64_t sc) {
-  for (int h = 0; h < 2; h++) {
-    __m128 t[4][2];
-    for (int v = 0; v < 2; v++) {
-      const uint8_t *b = s + 4 * v * sc + 16 * h;
-      __m128 x0 = _mm_loadu_ps((const float *)b);
-      __m128 x1 = _mm_loadu_ps((const float *)(b + sc));
-      __m128 x2 = _mm_loadu_ps((const float *)(b + 2 * sc));
-      __m128 x3 = _mm_loadu_ps((const float *)(b + 3 * sc));
-      _MM_TRANSPOSE4_PS(x0, x1, x2, x3);
-      t[0][v] = x0, t[1][v] = x1, t[2][v] = x2, t[3][v] = x3;
-    }
-    for (int p = 0; p < 4; p++) nx_stream32(d + (4 * h + p) * dr, t[p]);
-  }
-}
-
-static inline __attribute__((always_inline)) void block4x8_nt(
-    uint8_t *d, int64_t dr, const uint8_t *s, int64_t sc) {
-  for (int h = 0; h < 2; h++) {
-    __m128d x[4];
-    for (int q = 0; q < 4; q++)
-      x[q] = _mm_loadu_pd((const double *)(s + q * sc + 16 * h));
-    __m128d r[2][2] = {
-        {_mm_unpacklo_pd(x[0], x[1]), _mm_unpacklo_pd(x[2], x[3])},
-        {_mm_unpackhi_pd(x[0], x[1]), _mm_unpackhi_pd(x[2], x[3])}};
-    nx_stream32(d + 2 * h * dr, r[0]);
-    nx_stream32(d + (2 * h + 1) * dr, r[1]);
-  }
-}
-#else
-#define block8_nt block8
-#define block4x8_nt block4x8
-#endif
-
-/* Interleaves the [n] elements of [w] bytes at [a] and at [b] into [d]:
-   a's i-th element at d's 2i-th, b's at the 2i+1-th, as a window two
-   elements wide reads its rows. 4- and 8-byte elements zip in registers,
-   four or two pairs at a time. */
-static inline __attribute__((always_inline)) void zip2(uint8_t *d,
-                                                       const uint8_t *a,
-                                                       const uint8_t *b,
-                                                       int64_t n, size_t w) {
-  int64_t i = 0;
-#if defined(__aarch64__)
-  if (w == 4)
-    for (; i + 4 <= n; i += 4) {
-      uint32x4x2_t x = {{vld1q_u32((const uint32_t *)(a + 4 * i)),
-                         vld1q_u32((const uint32_t *)(b + 4 * i))}};
-      vst2q_u32((uint32_t *)(d + 8 * i), x);
-    }
-  if (w == 8)
-    for (; i + 2 <= n; i += 2) {
-      uint64x2x2_t x = {{vld1q_u64((const uint64_t *)(a + 8 * i)),
-                         vld1q_u64((const uint64_t *)(b + 8 * i))}};
-      vst2q_u64((uint64_t *)(d + 16 * i), x);
-    }
-#elif defined(__x86_64__)
-  if (w == 4)
-    for (; i + 4 <= n; i += 4) {
-      __m128 x = _mm_loadu_ps((const float *)(a + 4 * i));
-      __m128 y = _mm_loadu_ps((const float *)(b + 4 * i));
-      _mm_storeu_ps((float *)(d + 8 * i), _mm_unpacklo_ps(x, y));
-      _mm_storeu_ps((float *)(d + 8 * i + 16), _mm_unpackhi_ps(x, y));
-    }
-  if (w == 8)
-    for (; i + 2 <= n; i += 2) {
-      __m128d x = _mm_loadu_pd((const double *)(a + 8 * i));
-      __m128d y = _mm_loadu_pd((const double *)(b + 8 * i));
-      _mm_storeu_pd((double *)(d + 16 * i), _mm_unpacklo_pd(x, y));
-      _mm_storeu_pd((double *)(d + 16 * i + 16), _mm_unpackhi_pd(x, y));
-    }
-#endif
-  for (; i < n; i++) {
-    memcpy(d + 2 * i * w, a + i * w, w);
-    memcpy(d + (2 * i + 1) * w, b + i * w, w);
-  }
-}
-
-/* Sub-byte runs
-
-   A run of sub-byte elements written one after another covers whole bytes,
-   except at most one partial byte at each end, which it shares with
-   elements outside it. The whole bytes are plain stores: no other write
-   reaches them. The partial ones are one compare-and-swap each, which keeps
-   the other elements' bits against stores from other threads. */
-
 /* The [k] elements of [bits] bits from position [p] of [s], [step] apart,
    packed LSB first. */
 static inline uint8_t pack(const uint8_t *s, int bits, int64_t p, int64_t step,
@@ -1145,16 +1254,10 @@ static inline uint8_t pack(const uint8_t *s, int bits, int64_t p, int64_t step,
   return x;
 }
 
-/* Copies [len] elements of [bits] bits from positions [ps], [ps + ss], …
-   of [s] to positions [pd], [pd + 1], … of [d]. The whole bytes of [d] come
-   from [memcpy] when both runs start at the same bit of a byte, from two
-   bytes of [s] shifted when they start at different bits, and packed from
-   loads otherwise. Out of line, the gather's runs, inlined into its walk,
-   stay small. */
-static __attribute__((noinline)) void sub_run(uint8_t *d, int64_t pd,
-                                              const uint8_t *s, int64_t ps,
-                                              int64_t ss, int64_t len,
-                                              int bits) {
+__attribute__((noinline)) void nx_sub_copy_run(uint8_t *d, int64_t pd,
+                                               const uint8_t *s, int64_t ps,
+                                               int64_t ss, int64_t len,
+                                               int bits) {
   int per = 8 / bits;
   int head = (int)((per - pd % per) % per);
   if (head > len) head = (int)len;
@@ -1215,130 +1318,6 @@ static __attribute__((noinline)) void sub_run(uint8_t *d, int64_t pd,
              pack(s, bits, ps, ss, (int)len));
 }
 
-/* A block of elements of [w] bytes, steps in bytes: rows of adjacent
-   elements are memcpy, a source that steps one element across rows into
-   adjacent elements moves in square blocks, 8x8 of 4-byte elements and 4x4
-   of the others, two adjacent runs of the source into adjacent elements
-   zip, other steps element by element. The square blocks of 4- and 8-byte
-   elements store past the caches where [nt]. */
-static inline __attribute__((always_inline)) void bytes(
-    uint8_t *d, int64_t dr, int64_t dc, const uint8_t *s, int64_t sr,
-    int64_t sc, int64_t rows, int64_t cols, size_t w, int nt) {
-  int64_t i = 0, sw = (int64_t)w, side = w == 4 ? 8 : 4;
-  if (rows == 2 && dr == sw && dc == 2 * sw && sc == sw) {
-    zip2(d, s, s + sr, cols, w);
-    return;
-  }
-  if (cols == 2 && dc == sw && dr == 2 * sw && sr == sw) {
-    zip2(d, s, s + sc, rows, w);
-    return;
-  }
-  if (dc == sw && sr == sw)
-    for (; i + side <= rows; i += side) {
-      int64_t j = 0;
-      for (; j + side <= cols; j += side)
-        if (w == 4 && nt)
-          block8_nt(d + i * dr + j * sw, dr, s + i * sr + j * sc, sc);
-        else if (w == 4)
-          block8(d + i * dr + j * sw, dr, s + i * sr + j * sc, sc);
-        else if (w == 8 && nt)
-          block4x8_nt(d + i * dr + j * sw, dr, s + i * sr + j * sc, sc);
-        else if (w == 8)
-          block4x8(d + i * dr + j * sw, dr, s + i * sr + j * sc, sc);
-        else
-          block(d + i * dr + j * sw, dr, s + i * sr + j * sc, sc, w);
-      for (int p = 0; p < side; p++)
-        strided(d + (i + p) * dr + j * sw, sw, s + (i + p) * sr + j * sc, sc,
-                cols - j, w);
-    }
-  for (; i < rows; i++)
-    if (dc == sw && sc == sw) {
-      if (sr != cols * sw && i + READ_AHEAD_ROWS < rows)
-        read_ahead(s, (i + READ_AHEAD_ROWS) * sr, cols * sw);
-      memcpy(d + i * dr, s + i * sr, (size_t)(cols * sw));
-    } else
-      strided(d + i * dr, dc, s + i * sr, sc, cols, w);
-}
-
-/* A plane of nx_copy_box, inlined into its planes loop and into the
-   gather's runs, where [rows] is 1; of nx_stream_box where [nt]. */
-static inline __attribute__((always_inline)) void copy_block(
-    uint8_t *dst, int64_t pd, int64_t dst_row, int64_t dst_col,
-    const uint8_t *src, int64_t ps, int64_t src_row, int64_t src_col,
-    int64_t rows, int64_t cols, int bits, int nt) {
-  if (bits < 8) {
-    for (int64_t i = 0; i < rows; i++) {
-      int64_t d = pd + i * dst_row, s = ps + i * src_row;
-      if (dst_col == 1) {
-        sub_run(dst, d, src, s, src_col, cols, bits);
-        continue;
-      }
-      for (int64_t j = 0; j < cols; j++, d += dst_col, s += src_col)
-        nx_sub_store(dst, bits, d, nx_sub_load(src, bits, s));
-    }
-    return;
-  }
-  int64_t w = bits / 8;
-  uint8_t *d = dst + pd * w;
-  const uint8_t *s = src + ps * w;
-  if (dst_col == 1 && src_col == 1 && dst_row == cols && src_row == cols) {
-    memcpy(d, s, (size_t)(rows * cols * w));
-    return;
-  }
-  int64_t dr = dst_row * w, dc = dst_col * w;
-  int64_t sr = src_row * w, sc = src_col * w;
-  /* A plane streams where its pieces of rows are whole lines. */
-  nt = nt && ((uintptr_t)d | (uint64_t)dr | (uint64_t)(cols * w)) % 64 == 0;
-  switch (w) {
-    case 1: bytes(d, dr, dc, s, sr, sc, rows, cols, 1, 0); return;
-    case 2: bytes(d, dr, dc, s, sr, sc, rows, cols, 2, 0); return;
-    case 4: bytes(d, dr, dc, s, sr, sc, rows, cols, 4, nt); return;
-    case 8: bytes(d, dr, dc, s, sr, sc, rows, cols, 8, nt); return;
-    default: bytes(d, dr, dc, s, sr, sc, rows, cols, 16, 0); return;
-  }
-}
-
-/* The planes loop below copy_block's dispatch, inlined into it, so a box of
-   small planes chooses its case once. A destination that steps one element
-   across rows, its source one along them, swaps the two axes on both sides:
-   the same copy, as a transposed source, which the square blocks take. */
-static inline __attribute__((always_inline)) void copy_box(
-    uint8_t *dst, const uint8_t *src, const nx_box *b, int bits, int nt) {
-  int64_t pd = b->first[0], ps = b->first[1];
-  int64_t dp = b->step[0][0], dr = b->step[0][1], dc = b->step[0][2];
-  int64_t sp = b->step[1][0], sr = b->step[1][1], sc = b->step[1][2];
-  int64_t rows = b->extent[1], cols = b->extent[2];
-  if (dr == 1 && sc == 1 && !(dc == 1 && sr == 1)) {
-    int64_t x = dr;
-    dr = dc;
-    dc = x;
-    x = sr;
-    sr = sc;
-    sc = x;
-    x = rows;
-    rows = cols;
-    cols = x;
-  }
-  /* One plane, the walk's common block, takes no loop. */
-  if (b->extent[0] == 1) {
-    copy_block(dst, pd, dr, dc, src, ps, sr, sc, rows, cols, bits, nt);
-    return;
-  }
-  for (int64_t p = 0; p < b->extent[0]; p++, pd += dp, ps += sp)
-    copy_block(dst, pd, dr, dc, src, ps, sr, sc, rows, cols, bits, nt);
-}
-
-void nx_copy_box(uint8_t *dst, const uint8_t *src, const nx_box *b,
-                 int bits) {
-  copy_box(dst, src, b, bits, 0);
-}
-
-void nx_stream_box(uint8_t *dst, const uint8_t *src, const nx_box *b,
-                   int bits) {
-  copy_box(dst, src, b, bits, NX_STREAMS);
-  nx_stream_drain();
-}
-
 /* A run of the gather, the source's run [READ_AHEAD_ROWS] steps along the
    next axis out read ahead where its elements are adjacent and the runs lie
    apart: the walk's next runs are most often those. */
@@ -1350,8 +1329,33 @@ static void copy_run(void *ctx, const int64_t *at, int64_t len) {
     int64_t ahead = at[1] + READ_AHEAD_ROWS * c->l->step[1][r - 2];
     read_ahead(s->base, ahead * s->bits / 8, (len * s->bits + 7) / 8);
   }
-  copy_block(c->a[0].base, at[0], 0, c->l->step[0][r - 1], c->a[1].base,
-             at[1], 0, c->l->step[1][r - 1], 1, len, c->a[0].bits, 0);
+  int bits = s->bits;
+  int64_t dc = c->l->step[0][r - 1], sc = c->l->step[1][r - 1];
+  uint8_t *d = c->a[0].base;
+  if (bits < 8) {
+    if (dc == 1) {
+      nx_sub_copy_run(d, at[0], s->base, at[1], sc, len, bits);
+      return;
+    }
+    int64_t pd = at[0], ps = at[1];
+    for (int64_t j = 0; j < len; j++, pd += dc, ps += sc)
+      nx_sub_store(d, bits, pd, nx_sub_load(s->base, bits, ps));
+    return;
+  }
+  int64_t w = bits / 8;
+  d += at[0] * w;
+  const uint8_t *src = s->base + at[1] * w;
+  if (dc == 1 && sc == 1) {
+    memcpy(d, src, (size_t)(len * w));
+    return;
+  }
+  switch (w) {
+    case 1: strided(d, dc, src, sc, len, 1); return;
+    case 2: strided(d, 2 * dc, src, 2 * sc, len, 2); return;
+    case 4: strided(d, 4 * dc, src, 4 * sc, len, 4); return;
+    case 8: strided(d, 8 * dc, src, 8 * sc, len, 8); return;
+    default: strided(d, 16 * dc, src, 16 * sc, len, 16); return;
+  }
 }
 
 /* The gather: copies the elements of a[1] into a[0], operands of one dtype

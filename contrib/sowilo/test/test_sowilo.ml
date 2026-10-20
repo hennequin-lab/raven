@@ -176,6 +176,35 @@ let test_to_grayscale () =
   check_pixel_f "blue to gray" 0.114 gray [ 1; 0; 0 ];
   check_pixel_f "white to gray" 1.0 gray [ 1; 1; 0 ]
 
+(* Channels past the third, such as alpha, do not change the gray value. *)
+let grayscale_extra_channels c =
+  let pixels = [| [| 1.0; 0.0; 0.0 |]; [| 0.2; 0.4; 0.6 |] |] in
+  let data =
+    Array.concat
+      (Array.to_list
+         (Array.map
+            (fun rgb -> Array.init c (fun i -> if i < 3 then rgb.(i) else 0.5))
+            pixels))
+  in
+  let gray = to_grayscale (Nx.create Nx.float32 [| 1; 2; c |] data) in
+  check_shape "one channel" [| 1; 2; 1 |] gray;
+  let luma rgb =
+    (0.299 *. rgb.(0)) +. (0.587 *. rgb.(1)) +. (0.114 *. rgb.(2))
+  in
+  equal (array (float 1e-6)) (Array.map luma pixels) (Nx.to_array gray)
+
+(* Fewer than 3 channels, an image already gray among them, has no R, G and B
+   to weigh. *)
+let grayscale_few_channels c =
+  let img = Nx.zeros Nx.float32 [| 2; 2; c |] in
+  raises_match (Exn.invalid_arg ~substring:"channels") (fun () ->
+      to_grayscale img)
+
+(* A rank-2 array has no channel axis, whatever its last dimension. *)
+let test_grayscale_rank_2 () =
+  let img = Nx.zeros Nx.float32 [| 2; 3 |] in
+  raises_match (Exn.invalid_arg ~substring:"rank") (fun () -> to_grayscale img)
+
 (* ───── Data Type Conversion Tests ───── *)
 
 let test_float_conversions () =
@@ -243,6 +272,79 @@ let test_unsharp_mask_kernel_larger_than_image () =
     (gaussian_blur ~sigma:3.0 img);
   check_shape "unsharp_mask keeps the shape" (Nx.shape img)
     (unsharp_mask ~sigma:3.0 img)
+
+(* A blurred impulse is nonzero exactly on the kernel's [ksize * ksize]
+   footprint, so its support shows the default [2 * ceil(3 * sigma) + 1]. *)
+let gaussian_default_ksize (sigma, ksize) =
+  let n = 21 in
+  let img =
+    Nx.create Nx.float32 [| n; n; 1 |]
+      (Array.init (n * n) (fun i -> if i = n * n / 2 then 1.0 else 0.0))
+  in
+  let blurred = Nx.to_array (gaussian_blur ~sigma img) in
+  let support = Array.fold_left (fun c v -> if v <> 0.0 then c + 1 else c) 0 in
+  equal ~msg:"nonzero pixels" int (ksize * ksize) (support blurred)
+
+let gaussian_bad_ksize ksize =
+  let img = create_gray_f 5 5 0.5 in
+  raises_match (Exn.invalid_arg ~substring:"ksize") (fun () ->
+      gaussian_blur ~sigma:1.0 ~ksize img)
+
+(* A sigma of 0 or less takes a fixed kernel for a ksize of 1 to 9, the
+   tables OpenCV's getGaussianKernel uses: a blurred impulse is the outer
+   product of the table with itself. *)
+let gaussian_tables =
+  [
+    (0.0, [| 1. |], 1.);
+    (0.0, [| 1.; 2.; 1. |], 4.);
+    (-0.0, [| 1.; 4.; 6.; 4.; 1. |], 16.);
+    (-1.0, [| 2.; 7.; 14.; 18.; 14.; 7.; 2. |], 64.);
+    (0.0, [| 4.; 13.; 30.; 51.; 60.; 51.; 30.; 13.; 4. |], 256.);
+  ]
+
+let gaussian_table (sigma, taps, denominator) =
+  let n = 11 and c = 5 in
+  let k = Array.length taps in
+  let h = k / 2 in
+  let img =
+    Nx.create Nx.float32 [| n; n; 1 |]
+      (Array.init (n * n) (fun i -> if i = n * n / 2 then 1.0 else 0.0))
+  in
+  let tap d = if abs d > h then 0.0 else taps.(d + h) /. denominator in
+  let expected =
+    Array.init (n * n) (fun i -> tap ((i / n) - c) *. tap ((i mod n) - c))
+  in
+  equal (array (float 1e-7)) expected
+    (Nx.to_array (gaussian_blur ~sigma ~ksize:k img))
+
+(* Beyond the tables, a sigma of 0 or less is derived from ksize as
+   [0.3 * ((ksize - 1) * 0.5 - 1) + 0.8], so the blur equals the one with that
+   sigma. *)
+let gaussian_derived_sigma (sigma, ksize) =
+  let img = create_centered_square 9 9 3 in
+  let derived = (0.3 *. ((Float.of_int (ksize - 1) *. 0.5) -. 1.0)) +. 0.8 in
+  equal (array (float 1e-6))
+    (Nx.to_array (gaussian_blur ~sigma:derived ~ksize img))
+    (Nx.to_array (gaussian_blur ~sigma ~ksize img))
+
+let gaussian_no_sigma sigma =
+  let img = create_gray_f 5 5 0.5 in
+  raises_match (Exn.invalid_arg ~substring:"sigma") (fun () ->
+      gaussian_blur ~sigma img)
+
+(* A NaN sigma is neither positive nor 0 or less: nothing derives a kernel
+   from it. *)
+let gaussian_nan_sigma ksize =
+  let img = create_gray_f 5 5 0.5 in
+  raises_match (Exn.invalid_arg ~substring:"sigma") (fun () ->
+      gaussian_blur ~sigma:Float.nan ~ksize img)
+
+(* A sigma whose default ksize [2 * ceil(3 * sigma) + 1] exceeds [max_int]
+   has no kernel to blur with. *)
+let gaussian_huge_sigma sigma =
+  let img = create_gray_f 5 5 0.5 in
+  raises_match (Exn.invalid_arg ~substring:"sigma") (fun () ->
+      gaussian_blur ~sigma img)
 
 let test_median_blur () =
   let img = create_gray_f 5 5 0.5 in
@@ -353,6 +455,93 @@ let test_sobel () =
   if edge_response_y < 0.1 then
     failf "Sobel Y edge response too weak: %.3f" edge_response_y
 
+(* Correlating an impulse gives the kernel reversed along both axes: for a
+   3x3 kernel, its row-major array reversed. *)
+let impulse_response f =
+  let n = 7 and c = 3 in
+  let img =
+    Nx.create Nx.float32 [| n; n; 1 |]
+      (Array.init (n * n) (fun i -> if i = n * n / 2 then 1.0 else 0.0))
+  in
+  let around = [ Nx.R (c - 1, c + 2); Nx.R (c - 1, c + 2); Nx.I 0 ] in
+  let r = Nx.to_array (Nx.slice around (f img)) in
+  Array.init 9 (fun i -> r.(8 - i))
+
+(* Kernels stated by OpenCV's Sobel and Laplacian documentation, which define
+   ksize: the 3x3 Sobel kernels, ksize 1's unsmoothed [-1 0 1], and
+   Laplacian ksize 1's aperture. *)
+let edge_kernels =
+  let gx k img = fst (sobel ~ksize:k img) in
+  let gy k img = snd (sobel ~ksize:k img) in
+  [
+    ("sobel 3 gx", gx 3, [| -1.; 0.; 1.; -2.; 0.; 2.; -1.; 0.; 1. |]);
+    ("sobel 3 gy", gy 3, [| -1.; -2.; -1.; 0.; 0.; 0.; 1.; 2.; 1. |]);
+    ("sobel 1 gx", gx 1, [| 0.; 0.; 0.; -1.; 0.; 1.; 0.; 0.; 0. |]);
+    ("sobel 1 gy", gy 1, [| 0.; -1.; 0.; 0.; 0.; 0.; 0.; 1.; 0. |]);
+    ( "laplacian 1",
+      laplacian ~ksize:1,
+      [| 0.; 1.; 0.; 1.; -4.; 1.; 0.; 1.; 0. |] );
+    ( "laplacian 3",
+      laplacian ~ksize:3,
+      [| 2.; 0.; 2.; 0.; -8.; 0.; 2.; 0.; 2. |] );
+    ( "laplacian default",
+      (fun img -> laplacian img),
+      [| 0.; 1.; 0.; 1.; -4.; 1.; 0.; 1.; 0. |] );
+  ]
+
+let edge_kernel (_, f, kernel) =
+  equal (array (float 1e-6)) kernel (impulse_response f)
+
+(* A Sobel kernel of aperture [k >= 3] for derivative orders [dx], [dy] sums
+   to the derivative times [2 ^ (2k - dx - dy - 2)], the denominator OpenCV's
+   getDerivKernels states. Aperture 1 only differentiates: [-1 0 1] gives
+   twice a first derivative and [1 -2 1] a second one. So on [a x + b y],
+   interior gradients are [a] and [b] times [ramp_gain k], and on
+   [x^2 + y^2] the interior Laplacian is [4 * square_gain k]. *)
+let ramp_gain k = if k = 1 then 2.0 else Float.ldexp 1.0 ((2 * k) - 3)
+let square_gain k = if k = 1 then 1.0 else Float.ldexp 1.0 ((2 * k) - 4)
+
+(* The pixels of an [n x n] image far enough from the border that zero
+   padding does not reach the window of aperture [k], which spans 3 pixels
+   for [k = 1]. *)
+let interior n k a =
+  let r = max 1 (k / 2) in
+  let a = Nx.reshape [| n; n |] a in
+  Nx.to_array (Nx.slice [ Nx.R (r, n - r); Nx.R (r, n - r) ] a)
+
+let constant a v = Array.make (Array.length a) v
+
+let polynomial n f =
+  let c = n / 2 in
+  Nx.create Nx.float32 [| n; n; 1 |]
+    (Array.init (n * n) (fun i ->
+         f (Float.of_int ((i mod n) - c)) (Float.of_int ((i / n) - c))))
+
+let sobel_ramp k =
+  let n = 15 and a = 0.5 and b = -0.25 in
+  let ramp = polynomial n (fun x y -> (a *. x) +. (b *. y)) in
+  let gx, gy = sobel ~ksize:k ramp in
+  let gx = interior n k gx and gy = interior n k gy in
+  let g = ramp_gain k in
+  equal ~msg:"gx" (array (float 1e-3)) (constant gx (a *. g)) gx;
+  equal ~msg:"gy" (array (float 1e-3)) (constant gy (b *. g)) gy
+
+let laplacian_square k =
+  let n = 15 in
+  let square = polynomial n (fun x y -> (x *. x) +. (y *. y)) in
+  let lap = interior n k (laplacian ~ksize:k square) in
+  let v = 4.0 *. square_gain k in
+  equal (array (float (1e-4 *. v))) (constant lap v) lap
+
+let sobel_bad_ksize ksize =
+  let img = create_gray_f 5 5 0.5 in
+  raises_match (Exn.invalid_arg ~substring:"ksize") (fun () -> sobel ~ksize img)
+
+let laplacian_bad_ksize ksize =
+  let img = create_gray_f 5 5 0.5 in
+  raises_match (Exn.invalid_arg ~substring:"ksize") (fun () ->
+      laplacian ~ksize img)
+
 let test_canny () =
   let img = create_centered_square 20 20 10 in
   let edges = canny ~low:0.2 ~high:0.6 img in
@@ -402,7 +591,17 @@ let () =
           test "resize_batch" test_resize_batch;
           test "resize_color_bilinear" test_resize_color_bilinear;
         ];
-      group "color" [ test "to_grayscale" test_to_grayscale ];
+      group "color"
+        [
+          test "to_grayscale" test_to_grayscale;
+          cases "to_grayscale_channels"
+            ~name:(Printf.sprintf "C = %d")
+            [ 3; 4; 5 ] grayscale_extra_channels;
+          cases "to_grayscale_few_channels"
+            ~name:(Printf.sprintf "C = %d")
+            [ 1; 2 ] grayscale_few_channels;
+          test "to_grayscale_rank_2" test_grayscale_rank_2;
+        ];
       group "type_conversion"
         [ test "float_conversions" test_float_conversions ];
       group "filtering"
@@ -413,6 +612,28 @@ let () =
           test "box_blur_larger_than_image" test_box_blur_larger_than_image;
           test "unsharp_mask_larger_kernel"
             test_unsharp_mask_kernel_larger_than_image;
+          cases "gaussian_blur_default_ksize"
+            ~name:(fun (sigma, k) -> Printf.sprintf "sigma %g: %d taps" sigma k)
+            [ (0.4, 5); (1.0, 7); (1.1, 9); (2.0, 13) ]
+            gaussian_default_ksize;
+          cases "gaussian_blur_bad_ksize" ~name:string_of_int [ 0; -3; 2; 4 ]
+            gaussian_bad_ksize;
+          cases "gaussian_blur_table"
+            ~name:(fun (sigma, taps, _) ->
+              Printf.sprintf "sigma %g, ksize %d" sigma (Array.length taps))
+            gaussian_tables gaussian_table;
+          cases "gaussian_blur_derived_sigma"
+            ~name:(fun (sigma, k) ->
+              Printf.sprintf "sigma %g, ksize %d" sigma k)
+            [ (0.0, 11); (-1.0, 13); (-0.0, 15) ]
+            gaussian_derived_sigma;
+          cases "gaussian_blur_no_sigma" ~name:string_of_float
+            [ 0.0; -0.0; -2.5; Float.nan ] gaussian_no_sigma;
+          cases "gaussian_blur_nan_sigma" ~name:string_of_int [ 1; 3; 11 ]
+            gaussian_nan_sigma;
+          cases "gaussian_blur_huge_sigma" ~name:string_of_float
+            [ infinity; 1e300; Float.of_int max_int ]
+            gaussian_huge_sigma;
           test "median_blur" test_median_blur;
           test "median_blur_median" test_median_blur_preserves_median;
         ];
@@ -425,6 +646,18 @@ let () =
           test "dilation_kernel_shape" test_dilation_kernel_shape;
         ];
       group "edge_detection"
-        [ test "sobel" test_sobel; slow "canny" test_canny ];
+        [
+          test "sobel" test_sobel;
+          cases "kernels" ~name:(fun (n, _, _) -> n) edge_kernels edge_kernel;
+          cases "sobel_ramp" ~name:(Printf.sprintf "ksize %d") [ 1; 3; 5; 7 ]
+            sobel_ramp;
+          cases "laplacian_square" ~name:(Printf.sprintf "ksize %d")
+            [ 1; 3; 5; 7; 9; 11 ] laplacian_square;
+          cases "sobel_bad_ksize" ~name:string_of_int [ -1; 0; 2; 9 ]
+            sobel_bad_ksize;
+          cases "laplacian_bad_ksize" ~name:string_of_int [ -1; 0; 2; 10 ]
+            laplacian_bad_ksize;
+          slow "canny" test_canny;
+        ];
       group "integration" [ test "pipeline" test_pipeline ];
     ])

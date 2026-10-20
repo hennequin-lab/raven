@@ -109,7 +109,6 @@ type device = {
   arch : string;  (** Its architecture, as its driver names it. *)
   maps_host : bool;  (** Whether it maps host memory. *)
   alignment : int;  (** {!Rig.alignment}. *)
-  most_parts : int;  (** {!Rig.most_parts}. *)
   host_addresses : bool;  (** Whether the host addresses all its regions. *)
   key : int;
       (** The uid of its driver's key or its io library's region key, [-1]
@@ -167,8 +166,9 @@ and live = {
   mutable used : int; [@atomic]
       (** Its own bytes in live buffers, code and the cache. *)
   mutable cached : int; [@atomic]  (** The bytes in its cache. *)
-  cache : entry list Tbl.Make(Int).t;
-      (** Its cache, by [bytes * 4 + kind]. *)
+  cache : cached Tbl.Make(Int).t;
+      (** Its cache, by [bytes * 4 + kind]. A key stays bound once
+          allocations took its entries, until a release of the cache. *)
   mutable retiring : entry array;
       (** Collected entries that wait for their points or their bigarrays:
           its first [nretiring], in no order. Grown by replacement. *)
@@ -205,6 +205,10 @@ and live = {
           lock: the mapping goes back with the entry, or once it is Stopped,
           whichever comes first. Emptied, it goes back to its smallest
           size. *)
+  mutable slots : slot array;
+      (** Its staging memory ({!Copy}): every slot made, held or not, under
+          the lock. The host's serves every device that maps host memory. *)
+  mutable claims : int;  (** The claims of its slots so far, under the lock. *)
 }
 
 (** The type for how a device's queues wait for the values of a producer
@@ -242,6 +246,12 @@ and entry = {
       (** The C proxy of the bigarrays over it, [0] before the first. *)
   id : int;  (** Unique for the life of the process. *)
 }
+
+(** The type for the entries of one key of a device's cache: the first [n]
+    of [entries], the latest cached last, and {!Memory.no_entry} past them.
+    The array grows by replacement and keeps its length until the key is
+    unbound. Guarded by the device's lock. *)
+and cached = { mutable entries : entry array; mutable n : int }
 
 (** The type for an io allocation's pages: not asked yet, a bigarray over
     them, or none. *)
@@ -285,7 +295,7 @@ and linked = { code : code; functions : (string * int) list }
     collected. *)
 and code
 
-type alloc = {
+and alloc = {
   owner : device;  (** The device whose memory it is. *)
   host : int;
       (** [owner]'s host address, [-1] if the host does not address it. *)
@@ -313,7 +323,7 @@ type alloc = {
     over it shares: its claim, and the token that releases its entry. A
     cache hit wraps a reused entry in a new one. *)
 
-type memory = {
+and memory = {
   dev : device;  (** The device that reaches the allocation through it. *)
   host : int;  (** Host address, [-1] if the host does not address it. *)
   address : int;  (** As [dev]'s work addresses it, [-1] if none. *)
@@ -323,9 +333,19 @@ type memory = {
 (** The type for a device's reach of an allocation: the owner's, whose [dev]
     is [alloc]'s [owner], or a borrow's. *)
 
-type buffer = { mem : memory; offset : int; length : int; generation : int }
+and buffer = { mem : memory; offset : int; length : int; generation : int }
 (** {!Rig.Buffer.t}: live while [generation] is its allocation's, whose low
     bit says what it admits ({!Memory.admits}). *)
+
+(** The type for a slot of a device's staging memory ({!Copy}): two halves,
+    each made at the first piece that needs it, which change only while a
+    copy holds the slot and as a give or a release drops them. *)
+and slot = {
+  halves : buffer option array;
+  mutable held : bool;  (** Whether a copy holds it. *)
+  mutable last : int;  (** Its device's [claims] at its last claim. *)
+  owner : device;  (** The device whose [live] holds it. *)
+}
 
 type holds = { allocs : alloc Weak.t; taken : Bytes.t }
 (** The type for the allocations a {!Rig.Claim.hold} holds, by the index of

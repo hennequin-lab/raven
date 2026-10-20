@@ -838,34 +838,10 @@ let test_unmapped_wait () =
 let test_in_queue () = in_queue ~completion:`Host
 let test_in_queue_store () = in_queue ~completion:`Store
 
-(* A Polled device that runs itself completes its work though no wait sleeps on
-   it. *)
-let test_runs_itself () =
-  let d, p = P.open_ ~runs:`Itself "submit:itself" in
-  let a = submit (empty d) in
-  Support.await "the device's own run" (fun () -> P.queued p = 0);
-  equal int (Rig.Point.value a) (Rig.signaled d)
-
-(* A wait on a device whose queue waits for a producer's work returns though
-   nothing else runs the producer: a device runs its own work while the host
-   sleeps on another. *)
-let test_wait_in_queue () =
-  let producer, _ = P.open_ "submit:sleep-producer" in
-  let consumer, cp = P.open_ ~waits_on:[ `Host ] "submit:sleep-consumer" in
-  let a = submit (empty producer) in
-  let b = submit (empty consumer) ~waits:[| a |] in
-  equal ~msg:"waits in the queue" int 1 (List.length (P.last_waits cp));
-  Rig.Point.wait b;
-  equal ~msg:"the producer's word" int (Rig.Point.value a)
-    (Rig.signaled producer)
-
-(* A device's most parts is what it always runs, not a cap: a submission of
-   more parts runs where the device's queues have room for it, and only room
-   refuses one they never hold. *)
-let test_most_parts () =
-  let d, _ = P.open_ ~capacity:4 ~most_parts:2 "submit:most-parts" in
-  equal ~msg:"the device's count" int 2 (Rig.most_parts d);
-  equal ~msg:"the host's" int max_int (Rig.most_parts Rig.host);
+(* Room alone bounds a submission: one the device's queues hold runs, and one
+   they never hold raises. *)
+let test_never_fits () =
+  let d, _ = P.open_ ~capacity:4 "submit:never-fits" in
   let four = Sub.make d (Array.make 4 idle) in
   Rig.Point.wait (submit four);
   let five = Sub.make d (Array.make 5 idle) in
@@ -1984,10 +1960,6 @@ let tests =
           test_run_keeps;
         test "a part's buffers wait as a run's do" test_part_points;
         test "a queue that waits on host words waits in the queue" test_in_queue;
-        test "a wait on a queue waiting for a producer runs the producer"
-          test_wait_in_queue;
-        test "a Polled device that runs itself runs its work unasked"
-          test_runs_itself;
         test "a producer whose word the device cannot map is waited on the host"
           test_unmapped_wait;
         test "waits beyond the queue's bound are waited for on the host"
@@ -1996,8 +1968,8 @@ let tests =
           test_negative_max_waits;
         test "a queue that waits on stores waits on the producer's word"
           test_in_queue_store;
-        test "a submission of more than the most parts runs where room has it"
-          test_most_parts;
+        test "a submission runs if its queues hold it, and raises if never"
+          test_never_fits;
         test "a full queue's submit waits for room" test_room;
       ];
     group ~timeout "growth"

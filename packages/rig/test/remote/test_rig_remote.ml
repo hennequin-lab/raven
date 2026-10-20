@@ -440,6 +440,7 @@ let devices () =
   let d0 = List.nth ds 0 and d1 = List.nth ds 1 in
   equal ~msg:"arch" string (Rig.arch l0) (Rig.arch d0);
   equal ~msg:"budget" int (Rig.budget l0) (Rig.budget d0);
+  equal ~msg:"computes" bool true (Rig.computes d0);
   equal ~msg:"reaches" bool (Rig.reaches l0 l1) (Rig.reaches d0 d1);
   List.iter (fun d -> equal bool true (Rig.equal h (Rig.host_of d))) ds;
   let id d =
@@ -451,22 +452,12 @@ let devices () =
   let why = require_error (Rig.Image.load d0 "code") in
   contains ~msg:"says it loads no code" ~sub:"loads no code" why
 
-(* A device of another machine runs as many parts in a submission as the
-   agent's device: TIGHT's 3. *)
-let most_parts () =
-  with_job @@ fun j _ ->
-  let h = List.hd (Rig_remote.hosts j) in
-  let d = List.hd (Result.get_ok (Rig_remote.devices h "TIGHT")) in
-  equal ~msg:"the agent's device's count" int 3 (Rig.most_parts d)
-
-(* An io device of another machine holds any number of parts, as
-   Rig.most_parts says: its agent runs each part handed over as a copy of its
-   own. Its buffers start where the agent's device's do. *)
-let io_parts () =
+(* An io device of another machine's buffers start where the agent's device's
+   do. *)
+let io_alignment () =
   with_job @@ fun j _ ->
   let h = List.hd (Rig_remote.hosts j) in
   let d = List.hd (Result.get_ok (Rig_remote.devices h "DISK")) in
-  equal ~msg:"no limit" int max_int (Rig.most_parts d);
   equal ~msg:"the io device's alignment" int 1 (Rig.alignment d)
 
 let reaches kinds =
@@ -519,10 +510,8 @@ let machines =
   group "machine"
     [
       test "a machine's host is the agent's, of this machine's arch" hosts;
-      test "a device runs the parts in a submission its agent's does"
-        most_parts;
-      test "an io device of another machine holds any number of parts"
-        io_parts;
+      test "an io device of another machine aligns as the agent's does"
+        io_alignment;
       test "devices are the agent's, named after it, the same at each call"
         devices;
       cases
@@ -643,6 +632,8 @@ let copies_law (init, ops) =
         | Some d, _ | None, Some d -> d
         | None, None -> assert false
       in
+      cover "a copy into this process"
+        (match o.dst with Here _ -> true | There _ -> false);
       let after_into same =
         match o.src with
         | Here _ ->
@@ -842,8 +833,9 @@ let forks =
 let answer_pp = Format.pp_print_string
 
 (* Requests an agent cannot apply are refused, and the job goes on: an id the
-   job holds already, a rail of no transfer, of an empty one, of one past its
-   areas' bound, or of areas larger than the agent's memory. *)
+   job holds already, a map of memory the job does not hold, a rail of no
+   transfer, of an empty one, of one past its areas' bound, or of areas larger
+   than the agent's memory. *)
 let refused_requests () =
   with_agents @@ fun agents ->
   let a = List.hd agents in
@@ -852,6 +844,7 @@ let refused_requests () =
   is_ok ~msg:"the join" ~pp:answer_pp (join_alone fd a);
   is_ok ~msg:"memory 1" ~pp:answer_pp (ask fd (alloc_host 1 16));
   is_error ~msg:"memory 1 again" (ask fd (alloc_host 1 16));
+  is_error ~msg:"a map of no memory" (ask fd (u8 4 ^ u64 5 ^ u64 0 ^ u64 999));
   is_ok ~msg:"rail 2" ~pp:answer_pp (ask fd (rail_out 2 [ (0, 0, 5) ]));
   is_error ~msg:"rail 2 again" (ask fd (rail_out 2 [ (0, 0, 5) ]));
   is_error ~msg:"a rail as memory 1" (ask fd (rail_out 1 [ (0, 0, 5) ]));
@@ -877,8 +870,31 @@ let outside_memory () =
   is_ok ~msg:"the join" ~pp:answer_pp (join_alone fd a);
   is_ok ~msg:"memory 1" ~pp:answer_pp (ask fd (alloc_host 1 16));
   send fd (frame k_handover (copy_on_host ~value:1 ~bytes:8 (1, 12) (1, 0)));
+  let why =
+    match next_frame fd with
+    | Some (k, p) when k = k_abort -> String.sub p 4 (String.length p - 4)
+    | Some (k, _) -> failf "a frame of kind %d in place of the abort" k
+    | None -> fail "the agent ended the connection in place of the abort"
+  in
+  equal ~msg:"the abort's reason, the agent's rig's refusal of the view" string
+    "Rig.Buffer.view: 8 bytes from byte 12 lie outside the buffer's 16" why;
+  Unix.shutdown fd Unix.SHUTDOWN_SEND;
+  equal exit_w (2, [ "failed: " ^ why ]) (finish a)
+
+(* A drop naming no object of the job fails it: a drop has no answer to refuse
+   it with. *)
+let unknown_drop () =
+  with_agents @@ fun agents ->
+  let a = List.hd agents in
+  let fd = raw_controller a in
+  Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
+  is_ok ~msg:"the join" ~pp:answer_pp (join_alone fd a);
+  send fd (frame k_drop (u64 999));
+  equal ~msg:"the abort" (option int) (Some k_abort)
+    (Option.map fst (next_frame fd));
+  Unix.shutdown fd Unix.SHUTDOWN_SEND;
   match finish a with
-  | 2, [ why ] -> starts_with ~affix:"failed: " why
+  | 2, [ why ] -> contains ~sub:"malformed" why
   | code, lines ->
       failf "the agent exited %d, printing [%s]" code (String.concat "; " lines)
 
@@ -897,6 +913,7 @@ let opener_raises () =
     (option (pair int string))
     (Some (k_abort, str why))
     (next_frame fd);
+  Unix.shutdown fd Unix.SHUTDOWN_SEND;
   equal exit_w (2, [ "failed: " ^ why ]) (finish a)
 
 (* Each upload has its bytes, an empty one included: a hand-over uploads
@@ -933,6 +950,7 @@ let frames =
         refused_requests;
       test "a hand-over outside its memory fails the job at the agent"
         outside_memory;
+      test "a drop naming no object fails the job at the agent" unknown_drop;
       test "an empty upload leaves the next upload its bytes" empty_upload;
       test "an exception the agent does not expect fails the job"
         opener_raises;

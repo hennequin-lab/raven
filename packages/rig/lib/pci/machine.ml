@@ -32,7 +32,7 @@ type fn = Ops.fn = {
 type ops = Ops.ops = {
   transport : Window.transport;
   page : int;
-  functions : unit -> id list;
+  functions : unit -> (id list, string) result;
   take : string -> (fn, string) result;
   reserve : base:int -> int -> (unit, string) result;
 }
@@ -73,7 +73,9 @@ let window m a n =
   | None -> Window.through m.ops.transport a n
 
 let functions m =
-  List.sort (fun a b -> Bus_address.compare a.bus b.bus) (m.ops.functions ())
+  Result.map
+    (List.sort (fun a b -> Bus_address.compare a.bus b.bus))
+    (m.ops.functions ())
 
 let rec record m range =
   let ranges = Atomic.get m.reserved in
@@ -92,7 +94,11 @@ let rec within a n = function
   | (base, len) :: l -> (a >= base && a <= base + len - n) || within a n l
 
 let reserved m a n = within a n (Atomic.get m.reserved)
-let take m bus = m.ops.take bus
+(* A bus is parsed before it names a file of the machine's. *)
+let take m bus =
+  if Option.is_none (Bus_address.numbers bus) then
+    Error (Printf.sprintf "%S is no PCI bus address, expected DDDD:BB:DD.F" bus)
+  else m.ops.take bus
 
 let take_locked m l =
   match m.files with

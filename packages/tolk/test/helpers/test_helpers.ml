@@ -591,11 +591,13 @@ let rec files dir =
 
 (* The entries of the cache: the files of its directories. *)
 let entries_on_disk () =
-  List.concat_map
-    (fun name ->
-      let dir = Filename.concat cachedb name in
-      if Sys.is_directory dir then files dir else [])
-    (Array.to_list (Sys.readdir cachedb))
+  if not (Sys.file_exists cachedb) then []
+  else
+    List.concat_map
+      (fun name ->
+        let dir = Filename.concat cachedb name in
+        if Sys.is_directory dir then files dir else [])
+      (Array.to_list (Sys.readdir cachedb))
 
 (* Runs [damage] on every entry of the cache when it holds one, then reads the
    entry back. *)
@@ -715,20 +717,136 @@ let keeps_recently_used () =
       equal (pair bool bool) (false, true) (kept "unread", kept "read"));
   Diskcache.clear ()
 
-(* A write a killed process left: a file named like an entry being written, last
-   written a minute ago. *)
+(* [write_aside table bytes s] is a file named like an entry of [table] being
+   written, of [bytes] bytes, last written [s] seconds ago. *)
+let write_aside table bytes s =
+  let write =
+    Filename.concat (table_directory table) (String.make 32 'a' ^ ".1.tmp")
+  in
+  Out_channel.with_open_bin write (fun oc ->
+      output_string oc (String.make bytes 'v'));
+  ago write s;
+  write
+
+(* A write a killed process left, last written two hours ago. *)
 let removes_stale_writes () =
   Diskcache.clear ();
   let table = fresh_table () and limit = 1 lsl 16 in
-  let stale =
-    Filename.concat (table_directory table) (String.make 32 'a' ^ ".1.tmp")
-  in
-  Out_channel.with_open_bin stale (fun oc ->
-      output_string oc (String.make (limit / 2) 'v'));
-  ago stale 60.;
+  ignore (write_aside table (limit / 2) 7200.);
   sized limit (fun () -> fill_until_trimmed table);
   at_most int ~than:limit (cache_bytes ());
   Diskcache.clear ()
+
+(* A write another process has in progress, last written a minute ago. *)
+let keeps_writes_in_progress () =
+  Diskcache.clear ();
+  let table = fresh_table () in
+  let write = write_aside table 4096 60. in
+  sized (1 lsl 16) (fun () -> fill_until_trimmed table);
+  equal bool true (Sys.file_exists write);
+  Sys.remove write;
+  Diskcache.clear ()
+
+(* The file in which the puts of all processes count the cache's size. *)
+let size_file = Filename.concat cachedb "f7bd60b75b29d79b660a2859395c1a24_size"
+
+(* No put can count while a directory stands at the size's file. *)
+let stores_uncounted () =
+  Diskcache.clear ();
+  if not (Sys.file_exists cachedb) then Sys.mkdir cachedb 0o755;
+  Sys.mkdir size_file 0o755;
+  let table = fresh_table () in
+  let stored =
+    Fun.protect
+      ~finally:(fun () -> Sys.rmdir size_file)
+      (fun () ->
+        sized (1 lsl 16) (fun () -> Diskcache.put ~table "k" "v");
+        Diskcache.get ~table "k")
+  in
+  equal (option string) (Some "v") stored;
+  Diskcache.clear ()
+
+(* A put into a table whose directory the process may not write fails, as a put
+   on a full disk does. Entries used up to 16 minutes ago fill the cache past a
+   bound of 64 KiB, the oldest under the key "0". *)
+let trims_before_writing () =
+  if Sys.win32 || Unix.geteuid () = 0 then
+    skip ~reason:"every directory is writable" ()
+  else begin
+    Diskcache.clear ();
+    let full = fresh_table () and locked = fresh_table () in
+    let v = String.make 4096 'v' and dir = table_directory locked in
+    for i = 0 to 15 do
+      ago
+        (put_entry ~table:full (string_of_int i) v)
+        (float_of_int ((16 - i) * 60))
+    done;
+    Unix.chmod dir 0o555;
+    Fun.protect
+      ~finally:(fun () -> Unix.chmod dir 0o755)
+      (fun () ->
+        raises_match
+          (function Sys_error _ -> true | _ -> false)
+          (fun () ->
+            sized (1 lsl 16) (fun () -> Diskcache.put ~table:locked "k2" v)));
+    equal (option string) None (Diskcache.get ~table:full "0");
+    Diskcache.clear ()
+  end
+
+(* A write in progress a minute old stays through a clear, one two hours old
+   does not. *)
+let clear_keeps_writes_in_progress () =
+  let kept = Sys.file_exists in
+  let young = write_aside (fresh_table ()) 4096 60. in
+  let stale = write_aside (fresh_table ()) 4096 7200. in
+  Diskcache.clear ();
+  equal (pair bool bool) (true, false) (kept young, kept stale);
+  Sys.remove young;
+  Diskcache.clear ()
+
+(* An entry that cannot be removed: on Windows one held open without sharing
+   deletion, elsewhere one in a table directory the process may not write. *)
+let clear_leaves_held_entries () =
+  if (not Sys.win32) && Unix.geteuid () = 0 then
+    skip ~reason:"every directory is writable" ()
+  else begin
+    let held = fresh_table () and free = fresh_table () in
+    let entry = put_entry ~table:held "k" "v" in
+    Diskcache.put ~table:free "k" "v";
+    let hold, release =
+      if Sys.win32 then
+        (* Opened without sharing deletion, as a program other than the cache
+           may. *)
+        let fd = Unix.openfile entry [ O_RDONLY ] 0 in
+        ((fun () -> ()), fun () -> Unix.close fd)
+      else
+        let dir = Filename.dirname entry in
+        ((fun () -> Unix.chmod dir 0o555), fun () -> Unix.chmod dir 0o755)
+    in
+    hold ();
+    Fun.protect ~finally:release Diskcache.clear;
+    equal (option string) None (Diskcache.get ~table:free "k");
+    Diskcache.clear ()
+  end
+
+(* The directory of a table stays through a clear, so that a put in another
+   process that has made it can still write there. *)
+let clear_keeps_tables () =
+  let dir = table_directory (fresh_table ()) in
+  Diskcache.clear ();
+  equal bool true (Sys.file_exists dir && Sys.is_directory dir)
+
+(* A read and a mark hold an entry open, shared for deletion, while a put
+   renames a new entry over it: on Windows a handle that does not share deletion
+   makes that rename fail. *)
+let put_over_a_held_entry () =
+  let table = fresh_table () in
+  let entry = put_entry ~table "k" "old" in
+  let fd = Unix.openfile entry [ O_RDONLY; O_SHARE_DELETE ] 0 in
+  Fun.protect
+    ~finally:(fun () -> Unix.close fd)
+    (fun () -> Diskcache.put ~table "k" "new");
+  equal (option string) (Some "new") (Diskcache.get ~table "k")
 
 let unbounded () =
   Diskcache.clear ();
@@ -901,6 +1019,13 @@ let diskcache =
                 (Diskcache.get ~table:a "k", Diskcache.get ~table:b "k"));
           test "put and clear keep the files that are not entries"
             keeps_foreign_files;
+          test "clear leaves the entries it cannot remove"
+            clear_leaves_held_entries;
+          test "clear keeps the directories of the tables" clear_keeps_tables;
+          test "a put replaces an entry that a read holds open"
+            put_over_a_held_entry;
+          test "clear keeps another process's write in progress"
+            clear_keeps_writes_in_progress;
           cases ~name:(Printf.sprintf "cachelevel=%d")
             "a disabled cache neither reads nor writes" [ 0; -1 ] (fun level ->
               let table = fresh_table () in
@@ -932,6 +1057,12 @@ let diskcache =
             keeps_recently_used;
           test "a put past cachesize removes the writes a killed process left"
             removes_stale_writes;
+          test "a put past cachesize keeps another process's write in progress"
+            keeps_writes_in_progress;
+          test "a put that cannot write removes entries past cachesize first"
+            trims_before_writing;
+          test "a put that cannot count the cache's size stores its entry"
+            stores_uncounted;
           test "a cachesize of 0 keeps every entry" unbounded;
           test "a negative cachesize is refused" refuses_negative_size;
           test "processes putting in turn keep the cache within cachesize"
@@ -939,6 +1070,19 @@ let diskcache =
           test "get fails on a truncated entry" (fun () -> damaged truncate);
           test "get fails on an entry that is no entry" (fun () ->
               damaged overwrite);
+        ]
+
+(* Calls on two domains, each branch on its own: an entry is put, read and
+   cleared while another domain puts, reads and clears. *)
+let diskcache_domains =
+  match Sys.getenv_opt "CACHEDB" with
+  | None -> group "Diskcache on two domains" []
+  | Some _ ->
+      group "Diskcache on two domains"
+        [
+          stateful ~count:4 ~domains:2
+            "behaves as a table of entries, whatever the order of the calls"
+            model;
         ]
 
 (* Programs *)
@@ -1032,4 +1176,5 @@ let () =
              terminal_text;
              diskcache;
              programs;
+             diskcache_domains;
            ])

@@ -69,9 +69,10 @@ let poll f =
 (* This machine's GPUs *)
 
 let this_gpus () =
-  List.filter
-    (fun (id : Rig_pci.Machine.id) -> id.class_ lsr 16 = 0x03)
-    (Rig_pci.Machine.functions Rig_pci.Machine.this)
+  match Rig_pci.Machine.functions Rig_pci.Machine.this with
+  | Error why -> failwith why
+  | Ok ids ->
+      List.filter (fun (id : Rig_pci.Machine.id) -> id.class_ lsr 16 = 0x03) ids
 
 (* Process memory and far machines *)
 
@@ -83,6 +84,21 @@ external hold : int -> unit = "rig_pci_test_far_hold"
 external waiting : int -> bool = "rig_pci_test_far_waiting"
 external let_go : int -> unit = "rig_pci_test_far_let_go"
 external log : int -> (bool * int * int) list = "rig_pci_test_far_log"
+
+let unlisted_why = "far: the link broke"
+
+let unlisted () =
+  let page = 4096 in
+  let tr = far 0 page in
+  break tr;
+  Rig_pci.Machine.make ~name:"unlisted"
+    {
+      transport = Rig_pci.Window.unsafe_transport tr;
+      page;
+      functions = (fun () -> Error unlisted_why);
+      take = (fun _ -> Windtrap.fail "unlisted: a take");
+      reserve = (fun ~base:_ _ -> Windtrap.fail "unlisted: a reservation");
+    }
 
 (* Page tables in a fake format *)
 
@@ -279,6 +295,7 @@ external device_number : string -> string = "rig_pci_test_device_number"
 external stored : string -> int = "rig_pci_test_stored"
 external flocked : string -> bool = "rig_pci_test_flocked"
 external flocked_fd : Unix.file_descr -> bool = "rig_pci_test_flocked_fd"
+external flock_hold : string -> Unix.file_descr = "rig_pci_test_flock"
 
 module Tree = struct
   type bar = Mem32 of int * int | Mem64 of int * int | Io of int * int
@@ -548,6 +565,7 @@ module Tree = struct
   let stored = stored
   let flocked = flocked
   let flocked_fd = flocked_fd
+  let hold = flock_hold
   let add root file s = write (root / file) s
 
   (* An entry of a page map: bit 63 says the page is present, bits 0-54 hold its

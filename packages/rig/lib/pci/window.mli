@@ -58,17 +58,17 @@ val sub : t -> int -> int -> t
     accesses. Stores may merge and reach the function in another order, and
     loads may be served early, until a {!barrier} orders them. A driver puts a
     barrier between a load of a word the function wrote and the loads that
-    word guards. It flushes the window ({!flush}) before the store that has the
-    function read what it wrote.
+    word guards.
+
+    A driver flushes each window it wrote ({!flush}) before the store that has
+    the function read what it wrote, such as a doorbell.
 
     {!read}, {!blit_string}, {!write} and {!fill} copy memory, at widths they
     choose. On a mapped window they move a 32-bit word at a time, which memory
     behind any BAR accepts, or 16 bytes at a time through a window that
-    combines. The copies are for device memory and windows through a transport;
-    bulk copies of this process's memory go through {!bigarray}. A long copy
-    lets the domain's other threads and other domains' collections run
-    meanwhile, and a long read or write pays for that with a copy through a
-    buffer.
+    combines. A long copy lets the domain's other threads and other domains'
+    collections run meanwhile, and a long read or write pays for that with a
+    copy through a buffer.
 
     Each access raises [Invalid_argument] if the bytes it accesses do not lie
     in the window, a count below zero included, or if a 32- or 64-bit access is
@@ -121,13 +121,6 @@ val flush : t -> unit
 
     Raises [Invalid_argument] if [w] is shorter than 4 bytes or its first byte
     is not on a 4-byte boundary. *)
-
-val bigarray :
-  t -> (char, Bigarray.int8_unsigned_elt, Bigarray.c_layout) Bigarray.Array1.t
-(** [bigarray w] is [w]'s bytes as a bigarray, without a copy. The mapping
-    must stay alive while the bigarray is reachable.
-
-    Raises [Invalid_argument] if [w] is not {!mapped}. *)
 
 (** {1:transports Transports}
 

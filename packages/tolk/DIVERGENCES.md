@@ -241,7 +241,7 @@ stamps nothing (D146).
 
 - **tinygrad:** `helpers.py:398-447` (an SQLite database of pickled values,
   keyed by strings, integers or dictionaries of columns).
-- **tolk:** `lib/helpers.ml:406-652` (`Diskcache`).
+- **tolk:** `lib/helpers.ml:406-685` (`Diskcache`).
 - **Differs:** keys and values are strings, which callers encode. Each entry
   is a file under `CACHEDB`, a directory, written aside and renamed into
   place; tables are versioned by tolk's own version.
@@ -915,15 +915,18 @@ stamps nothing (D146).
   `uop/symbolic.py:23-26` (`fold_bitcast` converts the constant with
   `truncate` before reading its bits).
 - **tolk:** `lib/dtype.ml:17` (`equal_const`), `:27` (`hash_const`) and
-  `:647` (`const`); `lib/uop/shape.ml:1835` (`fold_bitcast`);
+  `:647` (`const`); `lib/uop/ops.ml` (`arg_key`, which `key` reads);
+  `lib/uop/shape.ml:1835` (`fold_bitcast`);
   `test/gen/tinygrad.patch`, which applies the same rules to tinygrad before
   the goldens are generated.
 - **Differs:** a float constant is its bits. `Dtype.const` keeps a NaN's sign
   and the payload its type holds, a signalling NaN staying one, and constants
   compare and hash by their bits, so NaNs of different bits are different
-  nodes. `fold_bitcast` reads a float constant as its type stores it, where
-  tinygrad's conversion quiets a signalling NaN and makes an 8-bit NaN
-  canonical. So folding `bitcast(bitcast(0x7d01, half), uint16)` gives
+  nodes, with different keys: a schedule cached under one NaN's key is never
+  the schedule of another's. No golden reads a key, so the patch leaves
+  tinygrad's, which writes every NaN `nan`. `fold_bitcast` reads a float
+  constant as its type stores it, where tinygrad's conversion quiets a
+  signalling NaN and makes an 8-bit NaN canonical. So folding `bitcast(bitcast(0x7d01, half), uint16)` gives
   `0x7d01`, where tinygrad gives `0x7e00`, and a negative float32 NaN's bits
   survive a fold, where tinygrad makes them `0x7fc00000`. A NaN an operation
   makes from other values is `Dtype.nan`, tinygrad's `math.nan`, whatever the
@@ -935,7 +938,8 @@ stamps nothing (D146).
   reinterpretations, so a bitcast that rune folds must keep the bits as they
   do, and a rewrite must keep a graph's value.
 - **Pinned by:** `Tolk.Ops › identity › NaN constants of different bits
-  are different nodes`; `Tolk.Ops › exec_alu › an invalid operation's
+  are different nodes`; `Tolk.Ops › key › tells apart NaN constants of
+  different bits`; `Tolk.Ops › exec_alu › an invalid operation's
   NaN is the canonical positive quiet NaN, whatever the host gives`,
   which compares bits and fails on an x86 host without the canonical NaN; `Tolk.Symbolic › symbolic_simple › casts › a
   bitcast round trip of every 8- and 16-bit word folds to its value`, which evaluates each graph
@@ -1511,8 +1515,8 @@ driver sizes local memory as it loads a function (D146).
   `schedule/__init__.py:127-137` (`lower_sink_to_linear`'s schedule cache,
   on disk only from `SCACHE=2`), `helpers.py:286` (`SCACHE`, `1` by
   default), and `codegen/opt/postrange.py:45-46` (a kernel's name, coloured).
-- **tolk:** `lib/codegen/codegen.ml:1157` (`program_key`), `:1167`
-  (`kept`) and `:1182` (`made_program`); `lib/schedule/schedule.ml:356`
+- **tolk:** `lib/codegen/codegen.ml:1540` (`program_key`), `:1556`
+  (`kept`) and `:1565` (`made_program`); `lib/schedule/schedule.ml:356`
   (`in_order`), `:388` (`schedule_key`) and `:393`
   (`lower_sink_to_linear`); `lib/uop/graph.ml:957`
   (`cached`); `lib/codegen/opt/postrange.ml:663` (`get_optimized_ast`'s
@@ -1520,11 +1524,13 @@ driver sizes local memory as it loads a function (D146).
   (`shaping`); `lib/setting.ml:294` (`cc`); and
   `lib/dune`'s rule for `source_digest.ml`, written by
   `tools/source_digest.ml`.
-- **Differs:** the program `to_program` makes of a kernel, and by default
-  the schedule `lower_sink_to_linear` makes of a function, are also put in
-  the disk cache (tables `to_program` and `schedule_cache`) as their graphs'
-  text (`Graph`), and a later process reads them back instead of making
-  them. tinygrad keeps programs for its process only, and schedules on disk
+- **Differs:** the program `to_program` makes of a kernel, up to its
+  source, and by default the schedule `lower_sink_to_linear` makes of a
+  function, are also put in the disk cache (tables `to_program` and
+  `schedule_cache`) as their graphs' text (`Graph`), and a later process
+  reads them back instead of making them. A program read back takes its
+  binary from its compiler's table, under its source, so each binary is
+  stored once. tinygrad keeps programs for its process only, and schedules on disk
   only when asked. Each key is the kernel or function, a function with its
   ranges and its storage replaced by placeholders numbered in order (whoever
   makes a loop numbers its range, and whoever makes a staged loop's carry or
@@ -2796,7 +2802,7 @@ encodes its barriers (D146).
   `lib/runtime/support/compiler_cpu.ml:38` (`statement`)
   and `:110`, `compiler_metal.ml:98`, `compiler_cuda.ml:94` and
   `compiler_amd.ml:86` (the tables); `lib/runtime/support/c.ml:108`
-  (`C.identity`); `lib/codegen/codegen.ml:1181-1198` (`program_key`, `kept`);
+  (`C.identity`); `lib/codegen/codegen.ml:1540-1559` (`program_key`, `kept`);
   `lib/setting.ml:285-290` (the search's settings) and
   `lib/codegen/opt/search.ml:300` (the beam search's key).
 - **Differs:** a table also names everything besides the source that
@@ -3673,6 +3679,7 @@ submission, and a range a loop of rig's program (D146).
 - **tolk:** `lib/schedule/indexing.ml:572` (`reaches`), `:583`
   (`reduce_loops`) and `:709` (its use in `assign_ranges`);
   `lib/codegen/simplify.ml:106` (`merge_reductions`);
+  `lib/codegen/codegen.ml:613` (`merge_reduce_ends`);
   `test/gen/tinygrad.patch`, which gives tinygrad the same before the goldens
   are recorded.
 - **Differs:** a reduction whose output is indexed by the same ranges as an
@@ -3688,7 +3695,15 @@ submission, and a range a loop of rig's program (D146).
   reduction that closes them, when that leaves all of them no more floor
   divisions and remainders: merged in one alone, they would leave its
   siblings' loops apart from its own, a range that runs again after the loop
-  that ends it, which the linearizer refuses.
+  that ends it, which the linearizer refuses. A reduction can stop closing
+  its group's ranges: a sum over a range its source does not read drops it
+  (`pm_reduce_unparented`), so a sum over `i` and `k` of a source that reads
+  `k` alone closes `k` alone, where a maximum beside it closes `k` within
+  `i`'s loop. tinygrad gives a reduction's end fresh ranges only when it
+  closes the same ranges as another at a different depth; tolk gives them to
+  every end that closes a range an earlier end closes, so each range has one
+  end. No recorded kernel has such ends, so the patch leaves tinygrad's
+  `merge_reduce_ends` as it is.
 - **Reason:** (b): rune's reverse mode. The cotangent of a value that
   operations broadcast sums one reduction per operation, each over the same
   cotangent computation: the gradient of an aperture's weights over a 104 x
@@ -3704,7 +3719,9 @@ submission, and a range a loop of rig's program (D146).
   `sum_and_max_grouped`, `ten_shared_sums_group` and
   `ten_shared_sums_group_unfit` cases, and the Codegen suite's
   `two_grouped_stores_local`, whose upstream axes count one loop for the two
-  maximums; all from the equally patched tinygrad. The Simplify suite's
+  maximums; all from the equally patched tinygrad. The Codegen suite's
+  `reductions that share a range › a range two reductions close at two
+  depths runs as two loops`. The Simplify suite's
   `pm_simplify_ranges › merging › reductions that share ranges merge them in
   all of them` and `… keep them when one would divide`. Rune's Packed suite:
   the bit example of `a compiled call computes eager's values`, two views a
@@ -3929,15 +3946,26 @@ submission, and a range a loop of rig's program (D146).
 - **tinygrad:** `helpers.py:416-447` (`diskcache_clear`, `diskcache_get`,
   `diskcache_put`): a put inserts or replaces a row and nothing removes one
   but `diskcache_clear`.
-- **tolk:** `lib/helpers.ml:469` (`mark`), `:492` (`size_file`), `:507`
-  (`count`), `:569` (`trim`) and `:601` (`put`); `lib/setting.ml:247`
-  (`cachesize`, 5 GiB by default, `0` for no bound).
-- **Differs:** a put that takes the cache's files past `CACHESIZE` bytes
-  removes entries of every table and version, the least recently used by
-  file time first, until they hold four fifths of it, and removes the writes
-  that killed processes left. A hit sets its entry's time. Processes count
-  each other's puts in the length of one file, to which each put appends a
-  byte per KiB.
+- **tolk:** `lib/helpers.ml:478` (`mark`), `:511` (`size_file`), `:526`
+  (`count`), `:592` (`trim`), `:624` (`make_room`), `:657` (`put`) and
+  `:678` (`clear`); `lib/setting.ml:247` (`cachesize`, 5 GiB by default, `0`
+  for no bound).
+- **Differs:** a put that would take the cache's files past `CACHESIZE`
+  bytes first removes entries of every table and version, the least recently
+  used by file time first, until they would hold four fifths of it with its
+  entry; it removes them before it writes, so that on a full disk the write
+  finds their space. A put of an entry larger than the bound writes nothing.
+  It also removes the writes that killed processes left: those last written
+  an hour or more before, the age at which ccache removes its temporary
+  files, so that another process's write in progress stays. A hit sets its
+  entry's time through a descriptor shared for deletion
+  (`lib/helpers_stubs.c`, `futimens` or `SetFileTime`), so that on Windows a
+  put renaming a new entry over it meanwhile still wins. Processes count each other's puts in the length of
+  one file, to which each put appends a byte per KiB. `diskcache_clear`
+  removes every entry; `clear` keeps a write in progress, an entry or size
+  it cannot remove, as on Windows one another program holds open without
+  sharing deletion, and the tables' directories, which a put meanwhile
+  writes in.
 - **Reason:** (b). Programs, schedules and beam results are keyed by the
   digest of tolk's sources (D63), so each change of the sources leaves the
   previous build's entries unread, about 0.6 GB for the tests of tolk and
@@ -3948,6 +3976,97 @@ submission, and a range a loop of rig's program (D146).
 - **Pinned by:** `Tolk.Helpers › Diskcache › the files of the cache never
   hold more than cachesize`, `› a put past cachesize removes entries used
   least recently first`, `› a put past cachesize removes the writes a killed
-  process left`, `› processes putting in turn keep the cache within
-  cachesize`, `› a cachesize of 0 keeps every entry` and `› a negative
-  cachesize is refused`.
+  process left`, `› a put past cachesize keeps another process's write in
+  progress`, `› a put that cannot write removes entries past cachesize
+  first`, `› a put that cannot count the cache's size stores its entry`,
+  `› clear leaves the entries it cannot remove`, `› clear keeps the
+  directories of the tables`, `› a put replaces an entry that a read holds
+  open`, `› clear keeps another
+  process's write in progress`, `› processes putting in turn keep the cache
+  within cachesize`, `› a cachesize of 0 keeps every entry` and `› a
+  negative cachesize is refused`; `Tolk.Helpers › Diskcache on two domains ›
+  behaves as a table of entries, whatever the order of the calls`.
+
+## D154. A range whose size may be 0 runs no time
+
+- **tinygrad:** `codegen/late/linearizer.py:20` (`run_count`, the product of
+  `vmax + 1` over a node's ranges), `codegen/simplify.py:81-91`
+  (`reduce_unparented`, a sum times the size, a product to its power, a
+  maximum the value) and `uop/symbolic.py:390-398` (`reduce_mul_chain`, an
+  integer maximum of a product times the factor that ignores its ranges).
+- **tolk:** `lib/codegen/late/linearizer.ml:16` (`runs`),
+  `lib/codegen/simplify.ml:242` (`reduce_unparented`) and
+  `lib/uop/symbolic.ml:165` (`reduce_mul_chain`); `gen/tinygrad.patch` makes
+  the three changes in tinygrad, so the goldens state tolk's order.
+- **Differs:** the linearizer counts a range as at least two runs, so a
+  loop's body always sorts after the nodes around the loop. tinygrad counts a
+  range over a variable of size 0 or 1 as one run, its body ties with what
+  precedes the loop, and a sum's first store of its accumulator was placed
+  inside the loop: at size 0 the sum read its accumulator unwritten. A
+  reduction over a range its value ignores, whose size may be 0, is its
+  identity where the size is 0: tinygrad's sum of an infinity over it is NaN
+  there, and its maximum the value. Where the size's bounds make each use of
+  the range fold, as `r // 2` for a size of at most 1, the value ignores the
+  range and the reduction took that form. An integer maximum of a product by
+  a factor that ignores its ranges, over a range whose size may be 0, is its
+  identity there too: tinygrad's is the identity times the factor, which
+  wraps. The order of the goldens'
+  `empty_range_runs_none` changes: the nodes outside its range of size 0 come
+  before it.
+- **Reason:** (c). `Tolk_engine.run` binds a variable to any value of its
+  range, its lower bound included, and runs each range's trips; a size of 0
+  is a binding the schedule must compute. With concrete shapes the scheduler
+  folds an empty value first (`Prepare`), so only a variable reaches it.
+- **Pinned by:** `Tolk.Codegen › reductions over a variable size`, which runs
+  sums and maxima over sizes of at most 1 and 3 on the host at every size,
+  and an int32 maximum of `2 k` among them;
+  `Tolk.Linearizer › laws › after splitting and chaining, the rest runs
+  outside each loop`, whose kernels hold ranges of constant sizes from 0 and
+  of variable sizes; `Tolk.Simplify › pm_reduce_unparented › a reduction
+  keeps its value over a range that may run no time`; the linearizer's
+  `orders_output` goldens.
+
+## D155. A pad by -0. fills its padding with -0.
+
+- **tinygrad:** `mixin/op.py:289` (`_pad_constant`) and `:295` (`pad_to`),
+  which return the plain pad when `value == 0`, true of `-0.`.
+- **tolk:** `lib/uop/shape.ml:654` (`is_zero`), used by `:668` (`pad`) and
+  `:694` (`pad_to`).
+- **Differs:** a fill is left to the pad's own zeros only when its bits are
+  all zero. A `-0.` fill takes the selection off the padded mask, so the
+  padding holds `-0.` where tinygrad's holds `+0.`.
+- **Reason:** (b). nx's `pad` fills with the value given, `-0.` included, and
+  rune lowers a padded load (`dev/nx2/rune/lib/lower.ml`, `padded`) through
+  `Shape.pad` with that fill, so its compiled pad must compute eager nx's
+  bits.
+- **Pinned by:** the `Codegen` suite (`test/codegen/codegen`): `signed zeros ›
+  Shape.pad by -0. computes -0. on the padding`.
+
+## D156. A NaN constant is written from its bits
+
+- **tinygrad:** `renderer/cstyle.py:25-26` (`base_rewrite` writes every NaN
+  constant as the language's `nan` cast to its type), `:138` (`NAN`), `:271`
+  (Clang's `__builtin_nanf("")`), `:445` (CUDA's
+  `#define NAN (__int_as_float(0x7fffffff))`) and `:504-506` (HIP's 8-bit
+  floats, `f32_to_fp8(NAN, …)`).
+- **tolk:** `lib/renderer/cstyle.ml:197` (`nan_const`), the `bitcast` of each
+  language (`:674`, `:1251`, `:1417`) and `cdna_rewrite` (`:1611`);
+  `test/gen/tinygrad.patch`, which renders tinygrad's NaN constants the same
+  way before the goldens are generated.
+- **Differs:** a NaN constant (D27) is written as the language's bitcast of
+  its bits, an unsigned literal of its width:
+  `__builtin_bit_cast(float, (unsigned int)(0xffc00005u))` in C and HIP,
+  `as_type<float>(…)` in Metal, `tg_bitcast<float>(…)` in CUDA. So a program
+  stores the constant's sign and payload, a signalling NaN staying one, where
+  tinygrad's stores the conversion of one NaN of the language: a float64 NaN
+  with bits `0x7ff0000020000000` is stored as `0x7ff8000000000000` by Clang,
+  and every float32 NaN as `0x7fffffff` by CUDA. An infinity is written as
+  before.
+- **Reason:** (b). nx's values are their bits, and rune lowers every float
+  constant from those bits (`dev/nx2/rune/lib/lower.ml`, `padded`, fills a
+  padded load with its fill's bits through `Shape.pad`), so a compiled kernel
+  must store the bits eager nx stores.
+- **Pinned by:** the `Codegen` suite (`test/codegen/codegen`): `a NaN constant
+  is stored with its sign and payload › *`, which runs a store of NaNs of both
+  signs, quiet and signalling, of half, float and double on the host; and the
+  `*_inf_nan_*` goldens of the `Cstyle` suite, for every renderer.

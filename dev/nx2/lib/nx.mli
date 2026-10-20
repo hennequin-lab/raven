@@ -14,7 +14,11 @@
 
 (** {1:values Values}
 
-    A value is a shape, a dtype and the devices its elements lie on. *)
+    A value is a shape, a dtype and the devices its elements lie on. A shape
+    has at most {!Nx_array.Layout.max_rank} axes, no negative extent, and
+    extents other than [0] that multiply to at most
+    {!Nx_array.Layout.max_numel}. A function given or making another shape
+    raises [Invalid_argument] naming itself. *)
 
 type (!'v, !'s, +!'d) t
 (** The type for arrays of ['s]-format elements read as ['v], on the device set
@@ -40,6 +44,31 @@ val dtype : ('v, 's, 'd) t -> ('v, 's) dtype
 
 module Dtype = Nx_array.Dtype
 (** Dtypes: their constructors, element types and properties. *)
+
+(** {!Dtype}'s element types, under the same names: [float32_elt] is
+    [Dtype.float32_elt]. *)
+
+type float64_elt = Dtype.float64_elt
+type float32_elt = Dtype.float32_elt
+type float16_elt = Dtype.float16_elt
+type bfloat16_elt = Dtype.bfloat16_elt
+type float8_e4m3fn_elt = Dtype.float8_e4m3fn_elt
+type float8_e5m2_elt = Dtype.float8_e5m2_elt
+type float4_e2m1fn_elt = Dtype.float4_e2m1fn_elt
+type int64_elt = Dtype.int64_elt
+type uint64_elt = Dtype.uint64_elt
+type int32_elt = Dtype.int32_elt
+type uint32_elt = Dtype.uint32_elt
+type int16_signed_elt = Dtype.int16_signed_elt
+type int16_unsigned_elt = Dtype.int16_unsigned_elt
+type int8_signed_elt = Dtype.int8_signed_elt
+type int8_unsigned_elt = Dtype.int8_unsigned_elt
+type int4_elt = Dtype.int4_elt
+type uint4_elt = Dtype.uint4_elt
+type complex64_elt = Dtype.complex64_elt
+type complex32_elt = Dtype.complex32_elt
+type bool_elt = Dtype.bool_elt
+type bit_elt = Dtype.bit_elt
 
 val float64 : (float, Dtype.float64_elt) dtype
 val float32 : (float, Dtype.float32_elt) dtype
@@ -216,27 +245,39 @@ val donate : ('v, 's, 'd) t -> ('v, 's, 'd) t
     A movement, which rearranges elements without computing them ({!reshape},
     {!transpose}, {!flip}, {!broadcast_to}, slicing by ranges,
     {!sliding_window}), spends its handle and passes a new one to its result,
-    whether it makes a view or a copy; the deaths wait for the final consumer. A spent
-    handle raises naming the movement that spent it. Any other operation
-    consumes its handles. Two handles of one donor or over one memory reaching
-    one operation raise naming [Nx.donate]: the same handle twice, two donations
-    of one value, or a handle and one a movement passed on.
+    whether it makes a view or a copy; the deaths wait for the final
+    consumer. A spent handle raises naming the movement that spent it. Any
+    other operation consumes its handles. A function that computes through
+    others, as {!trace} sums a diagonal, is the consumer the deaths name. One
+    that makes several operations, as {!lstsq}, reads its handles as they
+    were when called and consumes them when it returns; it reuses none of
+    their memory. Two handles of one donor or over one memory reaching one
+    operation raise naming [Nx.donate]: the same handle twice, two donations
+    of one value, or a handle and one a movement passed on. The donor itself
+    beside one of its handles is not a second handle: the consumer reads it as
+    it was when called, so [add (donate x) x] is [x + x].
 
     An operation checks every operand before it consumes any, so in sequence a
     refused operation kills nothing. On any number of domains, no operation
-    reads a value after its donor died, and no value is consumed twice. When
-    operations on several domains race to consume the same handles, at least
-    one succeeds. A loser raises naming an operation that claimed one of its
-    operands, which may itself have lost, and the loser's other donated operands
-    may be dead. No operation reads elements a consumer has overwritten.
+    starts reading a value after its donor died, a call already reading a
+    donor's elements keeps reading them after the donor dies, and no value is
+    consumed twice. When operations on several domains race to consume the
+    same handles, at least one succeeds. A loser raises naming an operation
+    that claimed one of its operands, which may itself have lost, and the
+    loser's other donated operands may be dead. No consumer overwrites
+    elements another call is reading: one that claims a handle while a
+    function of several operations reads it computes into fresh memory, and
+    that function then raises as a loser.
 
-    The consumer may write its result into the donated memory when it reads the
-    operand only at the result's own index (an elementwise operand), the memory
-    is C-contiguous with the result's shape and dtype, and the memory is not
-    shared. Memory is shared once a value outside the donor's handles has been
-    made over it (a view, a borrow by {!place}, a {!Repr} crossing), and stays
-    shared. Otherwise the consumer computes into fresh memory, and a value that
-    shares the memory keeps it. Its result is the same either way.
+    The consumer may write its result into the donated memory when it reads
+    that memory only at the result's own index, through the handle or through
+    [x] itself (an elementwise operand, the target of {!set} or {!scatter},
+    {!contract}'s [init]), the memory is C-contiguous with the result's shape
+    and dtype, and the memory is not shared. Memory is shared once a value
+    outside the donor's handles has been made over it (a view, a borrow by
+    {!place}, a {!Repr} crossing), and stays shared. Otherwise the consumer
+    computes into fresh memory, and a value that shares the memory keeps it.
+    Its result is the same either way.
 
     A traced value and a value of every set are returned unchanged: nothing
     dies, and passing such a value twice raises nothing.
@@ -282,15 +323,21 @@ val of_bigarray :
     shape and the dtype that stores its kind. Later writes to [b] do not reach
     it.
 
+    The copy is one pass over [b]. To read [b]'s bytes in place instead,
+    [Repr.of_array Host.v (Nx_array.of_bigarray dt b)] is the value over them
+    ({!Nx_array.of_bigarray}, {!Repr.of_array}): a write to [b] from then on
+    leaves what that value reads unspecified.
+
     Raises [Invalid_argument] if [b]'s kind is [char], [int] or [nativeint],
     which no dtype stores. *)
 
 (** {1:reads Reads}
 
-    A read gives a value's elements to OCaml. It works at every brand: it waits
-    for the work the value depends on, copies its elements to the host and
-    leaves every placement as it was. A value of every set is computed on the
-    host. A read is not an operation: no interpretation receives it.
+    A read gives a value's elements to OCaml. It works at every brand: it is a
+    {{!section-waiting}wait} on the value's set, which may raise a failed
+    check, then copies the value's elements to the host and leaves every
+    placement as it was. A value of every set is computed on the host. A read
+    is not an operation: no interpretation receives it.
 
     Each raises [Invalid_argument] naming itself for a dead value, and for a
     traced one: [Nx.item: the value is traced by Rune.jit]. *)
@@ -313,6 +360,43 @@ val to_bigarray :
     A dtype Bigarray has no kind for is a type error.
 
     Raises [Invalid_argument] if [x] has more than 16 axes, Bigarray's most. *)
+
+(** {1:waiting Waiting and checks}
+
+    A set's devices may compute while the caller goes on: an operation returns
+    once its work is asked for. The host waits for a set only at a wait:
+    {!sync}, a {{!section-reads}read}, or {!place} onto {!Host}.
+
+    A check is a condition on data whose failure raises the caller's exception:
+    one stated with {!check}, a sampler's parameter outside its domain
+    ({!Rng}), or a {!Prim.Check}. On
+    the host it raises at the call. On another set it is computed where its data
+    lies, and its failure raises at the next wait on that set on the domain that
+    issued it, so that no check makes the host wait, except on a device of
+    another machine, where reading whether a check passed waits for the work
+    submitted there. The systhreads of a domain
+    share its checks. A wait drains the checks its domain issued on the set
+    before it and raises the earliest failure among them; the later ones are
+    dropped. A wait on one set raises nothing of another's checks; a check no
+    wait follows never raises. A check keeps its data's memory until a wait
+    drains it, or until a later check on its set is issued once its devices
+    report its flags computed, so a donation of that data meanwhile computes
+    into fresh memory. A device reports its work at most a fixed number of
+    submissions late while work is submitted on it ({!Rig.section-timeline}),
+    and a check on a device that gets no more work is found computed when the
+    next check is issued, so the checks of a loop that never waits keep the
+    data of a bounded window of steps. A failing check's data is read when its failure is found, at a
+    wait or at a later check's issue, and that read may wait for the set.
+    Once a check is known to fail, the checks after it release their data,
+    and a check issued later on its set is not kept. *)
+
+val sync : ('v, 's, 'd) t -> unit
+(** [sync x] waits for the work [x] depends on, then drains the checks pending
+    on [x]'s set, raising the earliest failure, as stated above. A value of
+    every set has no work to wait for: [sync] returns.
+
+    Raises [Invalid_argument] naming [Nx.sync] for a dead value, and for a
+    traced one: [Nx.sync: the value is traced by Rune.jit]. *)
 
 (** {1:shapes Shapes, broadcasting and movements}
 
@@ -636,7 +720,7 @@ val set : 'd index list -> ('v, 's, 'd) t -> ('v, 's, 'd) t -> ('v, 's, 'd) t
     from the end. *)
 
 (** The type for how {!scatter} combines a target with its updates. *)
-type combine =
+type combine = Nx_kernel.combine =
   | Set  (** The last update. *)
   | Add  (** [+0] plus the target plus its updates. *)
   | Max  (** The largest of the target and its updates, or the first NaN. *)
@@ -658,7 +742,10 @@ val scatter :
     first NaN among them quieted: its quiet bit, the top bit of its fraction,
     set, its sign and payload kept. Where no update lands, the element keeps
     its bits, a signalling NaN's included. A position outside [\[0, d)]
-    writes nothing. A float [Add] gives the same bits on every run.
+    writes nothing. A float [Add] gives the same bits on every run. Without
+    {!donate} it costs a copy of [x]; [scatter ~axis p u (donate x)] writes
+    only the updates, into [x]'s memory, where {!donate} lets the consumer
+    write there.
 
     Raises [Invalid_argument] if [axis] is not an axis of [x], [p] and [u]
     differ in shape, their shape differs from [x]'s off [axis], or [combine]
@@ -698,7 +785,11 @@ val mod_ : ('v, 's, 'd) t -> ('v, 's, 'd) t -> ('v, 's, 'd) t
     [a = add (mul b (div a b)) (mod_ a b)] on integers. Floats and integers. *)
 
 val pow : ('v, 's, 'd) t -> ('v, 's, 'd) t -> ('v, 's, 'd) t
-(** [pow a b] is [a] to the power [b]. Floats and integers. *)
+(** [pow a b] is [a] to the power [b]. On complex numbers it is the principal
+    value [exp (b * log a)]: [1] where [b] is [0], [0] at [a = 0] where
+    [b]'s real part is positive, with [log]'s branch cut
+    ({!section-transcendental}); its error grows with [|b log a|], within
+    [(3 + 3|b log a|) u |a{^b}|]. Every dtype but booleans. *)
 
 val fma : ('v, 's, 'd) t -> ('v, 's, 'd) t -> ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [fma a b c] is [a * b + c] rounded once. Floats and integers. *)
@@ -722,11 +813,15 @@ val recip : ('v, 's, 'd) t -> ('v, 's, 'd) t
     Every dtype but booleans. *)
 
 val abs : ('v, 's, 'd) t -> ('v, 's, 'd) t
-(** [abs x] is [x]'s magnitude. Floats and integers. *)
+(** [abs x] is [x]'s absolute value. Floats and integers: a complex number's
+    modulus is a float, {!magnitude}. *)
 
 val sign : ('v, 's, 'd) t -> ('v, 's, 'd) t
-(** [sign x] is [-1], [0] or [1] by [x]'s sign, and NaN for a NaN. Floats and
-    integers. *)
+(** [sign x] is [-1], [0] or [1] by [x]'s sign, and NaN for a NaN. On complex
+    numbers it is [x / |x|], of modulus [1], and [x] itself at [0]; at an
+    infinite part, the direction its parts point to:
+    [sign (inf + 2i) = 1 + 0i]; within [3 u] as {!section-transcendental}
+    measures it. Every dtype but booleans. *)
 
 (** {2:scalars Scalar forms}
 
@@ -871,22 +966,40 @@ end
 
 (** {2:transcendental Powers, exponentials and trigonometry}
 
-    Floats only. Each is its mathematical value rounded to the dtype;
-    a stated range is the mathematical one, which rounding can leave
-    at an end: in [float8_e4m3fn], [π] rounds to [3.25]. *)
+    Floats and complex numbers, where a function does not say floats. On floats
+    each is its mathematical value rounded to the dtype; a stated range is the
+    mathematical one, which rounding can leave at an end: in [float8_e4m3fn],
+    [π] rounds to [3.25].
+
+    On complex numbers each is the principal value C99 defines (ISO/IEC 9899,
+    7.3), with its special values at infinities, NaNs and signed zeros (Annex
+    G). A function whose inverse is many-valued has branch cuts on an axis,
+    and the sign of a zero part names the side it continues from:
+    [sqrt (-4 + 0i)] is [2i] and [sqrt (-4 - 0i)] is [-2i]. A result [f'] is
+    within [k u |f|] of the value [f], where [|f|] is a normal float: [u] is
+    the parts' unit roundoff, [2{^-24}] for complex64 and [2{^-53}] for
+    complex128, and [k] is [3] for {!sqrt}, [4] for {!exp}, {!exp2}, {!log}
+    and {!log2}, [5] for {!asin}, {!acos}, {!atan}, {!asinh}, {!acosh} and
+    {!atanh}, and [6] for {!sin}, {!cos}, {!tan}, {!sinh}, {!cosh} and
+    {!tanh}. On the real axis, at a non-zero real part where the
+    float function is defined, a function of one operand but {!asinh},
+    {!acosh} and {!atanh} gives the float function's result as its real
+    part; {!pow} does at a positive base and a real exponent. A NaN part of
+    a result is the quiet NaN of a clear sign bit. *)
 
 val sqrt : ('v, 's, 'd) t -> ('v, 's, 'd) t
-(** [sqrt x] is the square root, NaN below [-0.]. *)
+(** [sqrt x] is the square root, NaN below [-0.]. On complex numbers its real
+    part is never negative, and its branch cut is the negative real axis. *)
 
 val rsqrt : ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [rsqrt x] is [recip (sqrt x)]: [inf] at [+0.], [-inf] at [-0.], NaN below.
-*)
+    On complex numbers it is {!recip} of {!sqrt}, NaN at [0]. *)
 
 val hypot : ('v, 's, 'd) t -> ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [hypot x y] is [sqrt (x{^2} + y{^2})] with no intermediate overflow: finite
     wherever the result is. It is [inf] where [x] or [y] is an infinity, a NaN
     beside it included, and NaN where either is a NaN otherwise. Within
-    3 ulps at float32 and float64. *)
+    3 ulps at float32 and float64. Floats. *)
 
 val exp : ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [exp x] is [e{^x}]. *)
@@ -895,16 +1008,18 @@ val exp2 : ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [exp2 x] is [2{^x}], exact at integers whose power the dtype holds. *)
 
 val expm1 : ('v, 's, 'd) t -> ('v, 's, 'd) t
-(** [expm1 x] is [e{^x} - 1], accurate near [0]. *)
+(** [expm1 x] is [e{^x} - 1], accurate near [0]. Floats. *)
 
 val log : ('v, 's, 'd) t -> ('v, 's, 'd) t
-(** [log x] is the natural logarithm: [-inf] at [0.], NaN below. *)
+(** [log x] is the natural logarithm: [-inf] at [0.], NaN below. On complex
+    numbers it is [log |x| + i angle x], its imaginary part in
+    \[[-π], [π]\] and its branch cut the negative real axis. *)
 
 val log2 : ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [log2 x] is the base-2 logarithm, exact at powers of two. *)
 
 val log1p : ('v, 's, 'd) t -> ('v, 's, 'd) t
-(** [log1p x] is [log (1 + x)], accurate near [0]. *)
+(** [log1p x] is [log (1 + x)], accurate near [0]. Floats. *)
 
 val sin : ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [sin x] is the sine of [x] radians. *)
@@ -916,17 +1031,20 @@ val tan : ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [tan x] is the tangent of [x] radians. *)
 
 val asin : ('v, 's, 'd) t -> ('v, 's, 'd) t
-(** [asin x] is the arcsine, in \[[-π/2], [π/2]\]. *)
+(** [asin x] is the arcsine, in \[[-π/2], [π/2]\]: on complex numbers its real
+    part, with branch cuts on the real axis beyond [-1] and [1]. *)
 
 val acos : ('v, 's, 'd) t -> ('v, 's, 'd) t
-(** [acos x] is the arccosine, in \[[0], [π]\]. *)
+(** [acos x] is the arccosine, in \[[0], [π]\]: on complex numbers its real
+    part, with {!asin}'s branch cuts. *)
 
 val atan : ('v, 's, 'd) t -> ('v, 's, 'd) t
-(** [atan x] is the arctangent, in \[[-π/2], [π/2]\]. *)
+(** [atan x] is the arctangent, in \[[-π/2], [π/2]\]: on complex numbers its
+    real part, with branch cuts on the imaginary axis beyond [-i] and [i]. *)
 
 val atan2 : ('v, 's, 'd) t -> ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [atan2 y x] is the angle of the point [(x, y)], in \[[-π], [π]\]:
-    [-π] for [y = -0.] and [x < 0]. *)
+    [-π] for [y = -0.] and [x < 0]. Floats. *)
 
 val sinh : ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [sinh x] is the hyperbolic sine. *)
@@ -939,16 +1057,22 @@ val tanh : ('v, 's, 'd) t -> ('v, 's, 'd) t
 
 val asinh : ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [asinh x] is the inverse hyperbolic sine, odd, [x] itself near [0.]: within
-    3 ulps at float32 and float64. *)
+    3 ulps at float32 and float64. On complex numbers its imaginary part is in
+    \[[-π/2], [π/2]\], with branch cuts on the imaginary axis beyond [-i]
+    and [i]. *)
 
 val acosh : ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [acosh x] is the inverse hyperbolic cosine: [0.] at [1.], NaN below [1.],
-    within 3 ulps at float32 and float64. *)
+    within 3 ulps at float32 and float64. On complex numbers its real part is
+    not negative and its imaginary part is in \[[-π], [π]\], with a branch
+    cut on the real axis below [1]. *)
 
 val atanh : ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [atanh x] is the inverse hyperbolic tangent: [inf] at [1.], [-inf] at
     [-1.], NaN beyond them, odd, [x] itself near [0.]; within 3 ulps at
-    float32 and float64. *)
+    float32 and float64. On complex numbers its imaginary part is in
+    \[[-π/2], [π/2]\], with branch cuts on the real axis beyond [-1] and
+    [1]. *)
 
 val erf : (float, 's, 'd) t -> (float, 's, 'd) t
 (** [erf x] is the error function [2/√π ∫₀ˣ e{^-t²} dt]. *)
@@ -1340,14 +1464,23 @@ val max : ?axes:int list -> ?keepdims:bool -> ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [max ~axes x] is the greatest element, as {!maximum} orders them: [-0.]
     below [+0.], any on booleans. Every dtype.
 
-    Raises [Invalid_argument] where an axis it reduces is empty. *)
+    Raises [Invalid_argument] where an axis it reduces is empty and the result
+    has an element, which has then nothing to choose from. *)
 
 val min : ?axes:int list -> ?keepdims:bool -> ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [min ~axes x] is the least element, as {!max}; all on booleans. *)
 
 val mean : ?axes:int list -> ?keepdims:bool -> ('v, 's, 'd) t -> ('v, 's, 'd) t
-(** [mean ~axes x] is the {!sum} divided by the number of elements, rounded
-    once: NaN for none. Floats and complex numbers. *)
+(** [mean ~axes x] is the {!sum} divided by the number of elements. Over floats
+    and complex numbers it rounds once: NaN for none. Over integers it is the
+    exact mean truncated toward zero, as {!div} rounds: it lies between the
+    least and greatest element, so it never wraps. Every dtype but booleans.
+
+    Raises [Invalid_argument] over integers where an axis it reduces is empty
+    and the result has an element, since the mean of nothing has no integer
+    value, or where the axes hold more elements than an integer mean computes
+    exactly: [2{^31}] or more at 64 bits, [2{^(64 - b)}] or more at [b]
+    bits. *)
 
 val all : ?axes:int list -> ?keepdims:bool -> ('v, 's, 'd) t -> 'd bool_t
 (** [all ~axes x] is [true] where every element is non-zero, as {!cast} into
@@ -1370,7 +1503,8 @@ val argmax : ?axis:int -> ?keepdims:bool -> ('v, 's, 'd) t -> 'd int64_t
     [keepdims]. Every dtype.
 
     Raises [Invalid_argument] naming itself for an axis outside [x]'s rank,
-    or where there is no element to choose from. *)
+    or where the result has an element with no element to choose from: [x]
+    is empty without [axis], or [axis] is empty and the result is not. *)
 
 val argmin : ?axis:int -> ?keepdims:bool -> ('v, 's, 'd) t -> 'd int64_t
 (** [argmin ~axis x] is the position of the first element least as {!min}
@@ -1564,17 +1698,21 @@ val contract :
     sum of its [K] products, where [γ(n, v) = n v / (1 - n v)] and [u] is
     [acc]'s unit roundoff.
 
-    A donated [init] is consumed as {!donate} states.
+    A donated [init] receives the result in its memory where {!donate} lets
+    the consumer write there and the result's names are the batch names, then
+    [a]'s others, then [b]'s, each in its operand's order, as in
+    ["n i, n o -> i o | n"]; otherwise the result is fresh.
 
     Raises [Invalid_argument] if [dt] is a boolean; [p] has other than two
-    operands; an operand's rank is not the number of axes [p] gives it; [...]
-    covers different numbers of axes in the two operands; paired extents
+    operands; an operand's rank is not the number of axes [p] gives it, or
+    fewer with [...]; [...] covers different numbers of axes in the two
+    operands; paired extents
     differ; a group's extents do not multiply to its axis, or it leaves
     two extents unknown; a unit axis's extent is not [1]; a name in [sizes] is
-    not in [p], or its size is negative; [acc] is omitted for an integer and a
-    float operand, or is a boolean, a float narrower than [float32] or than a
-    float operand, or of another kind than [dt]; or [init]'s shape is not the
-    result's. *)
+    not in [p] or is there twice, or its size is negative; [acc] is omitted for
+    an integer and a float operand, or is a boolean, a float narrower than
+    [float32] or than a float operand, or of another kind than [dt]; or
+    [init]'s shape is not the result's. *)
 
 val einsum :
   ?sizes:(string * int) list ->
@@ -1615,13 +1753,13 @@ val einsum :
 
     Raises [Invalid_argument] if [p] has one operand, more than 11, or other
     than [n]; the dtype is a boolean; an operand's rank is not the number of
-    axes [p] gives it; [...] covers different numbers of axes in two operands;
-    a name's extents differ between operands; every tree holds a value of
-    more than {!Nx_array.Layout.max_rank} axes; a group's extents do not
-    multiply to its axis, or it leaves two extents unknown; a unit axis's
-    extent is not [1]; a name in [sizes] is not in [p], or its size is
-    negative; or [acc] is a boolean, a float narrower than [float32] or than
-    the operands, or of another kind than theirs. *)
+    axes [p] gives it, or fewer with [...]; [...] covers different numbers of
+    axes in two operands; a name's extents differ between operands; every tree
+    holds a value of more than {!Nx_array.Layout.max_rank} axes; a group's
+    extents do not multiply to its axis, or it leaves two extents unknown; a
+    unit axis's extent is not [1]; a name in [sizes] is not in [p] or is there
+    twice, or its size is negative; or [acc] is a boolean, a float narrower
+    than [float32] or than the operands, or of another kind than theirs. *)
 
 val matmul : ('v, 's, 'd) t -> ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [matmul a b] is the matrix product over the last two axes, leading axes
@@ -1663,8 +1801,10 @@ val conv :
     [w[j, q…, i]], an element outside [x] reading zero. The kernel is not
     flipped. [x] is padded along each spatial axis by [padding]'s [(lo, hi)]
     (default none), a negative one cutting; [stride] and [dilation] default
-    to ones; and [t = (s + lo + hi - dilation (k - 1) - 1) / stride + 1], none
-    where the padded axis is shorter than the dilated kernel. Under [groups]
+    to ones; and [t = (s + lo + hi - e) / stride + 1], none where the padded
+    axis is shorter than [e], the dilated kernel's extent
+    [dilation (k - 1) + 1]. A kernel extent of [0] sums no term: [e] is [0]
+    and each element is [+0]. Under [groups]
     (default [1]) the channels split into [groups] runs, output channels
     [g · o / groups] to [(g + 1) · o / groups - 1] reading input run [g]
     alone.
@@ -1675,9 +1815,9 @@ val conv :
 
     Raises [Invalid_argument] if [x] has fewer than three axes; [w] has
     another rank; [stride], [padding] or [dilation] do not have [K] entries;
-    a stride or a dilation is below [1]; a kernel extent is [0]; [groups] is
-    below [1] or does not divide [o]; [x]'s channels are not [groups] times
-    [w]'s last extent; or the dtype is a boolean. *)
+    a stride or a dilation is below [1]; [groups] is below [1] or does not
+    divide [o]; [x]'s channels are not [groups] times [w]'s last extent; or
+    the dtype is a boolean. *)
 
 val conv_transpose :
   ?stride:int array ->
@@ -1691,13 +1831,99 @@ val conv_transpose :
     for the [z] of the least spatial extents whose [conv z w], under the same
     arguments, has [x]'s shape [[n; t…; o]], it is the [[n; s…; c]] value
     with [sum (mul (conv z w) x) = sum (mul z (conv_transpose x w))] for
-    every such [z]: [s = (t - 1) stride + dilation (k - 1) + 1 - lo - hi], or
-    [0] where that is negative or [t = 0]. It is one reduction over [x] with
+    every such [z]: [s = (t - 1) stride + e - lo - hi], [e] as {!conv}
+    states, or [0] where that is negative or [t = 0]. It is one reduction over [x] with
     [stride - 1] zeros between its elements, windowed by [w] reversed along
     its spatial axes, never stored.
 
     Raises [Invalid_argument] as {!conv}, reading [o] from [x]'s last axis, or
     if no input has a [conv] of [x]'s shape. *)
+
+(** {2:attention Attention}
+
+    Attention weighs values by how well their keys match a query: for each
+    query row, a softmax over the row's scores against the keys, times the
+    values. Masks and score rewrites are plain Nx code over the coordinates
+    of one query-key pair. *)
+
+(** Keys and values, by key head [hk] and key [tk]. *)
+type ('v, 's, 'd) kv =
+  | Dense of { k : ('v, 's, 'd) t; v : ('v, 's, 'd) t }
+      (** [k] [[lead…; hk; tk; dk]], [v] [[lead…; hk; tk; dv]]. *)
+  | Paged of { k : ('v, 's, 'd) t; v : ('v, 's, 'd) t; table : 'd int64_t }
+      (** Pools [k] [[pages; hk; page; dk]] and [v] [[pages; hk; page; dv]]
+          read through [table] [[lead…; max_pages]]: key [t] of lead index
+          [b] is the pools' entry [table[b; t / page]] at [t mod page], and
+          [tk = max_pages · page]. *)
+
+type 'd pair = { q : 'd int64_t; k : 'd int64_t; len : 'd int64_t; tq : int }
+(** The 0-d coordinates of one query-key pair: the query row, the key column,
+    the row's visible length, and the number of query rows. *)
+
+val causal : 'd pair -> 'd bool_t
+(** [causal p] holds where [p.k <= p.q + (p.len - p.tq)]: the last query row
+    sees every key before the row's length, and each row before it one key
+    fewer. *)
+
+val attention :
+  ?scale:float ->
+  ?lengths:'d int64_t ->
+  ?mask:('d pair -> 'd bool_t) ->
+  ?score:('d pair -> 'd float32_t -> 'd float32_t) ->
+  kv:('v, 's, 'd) kv ->
+  ('v, 's, 'd) t ->
+  ('v, 's, 'd) t * 'd float32_t
+(** [attention ~kv q] is [(o, lse)] for [q] [[lead…; hq; tq; dk]], [hk]
+    dividing [hq] (zero heads divide zero), query head [h] reading key head
+    [h / (hq / hk)]. [o], [[lead…; hq; tq; dv]], is the softmax over each
+    row's visible keys of [scale · q kᵀ] (default [1 / √dk]), rewritten by
+    [score], times [v], in [q]'s dtype; [lse], [[lead…; hq; tq]], is the
+    row's log-sum-exp in float32. A pair is visible where [mask] holds, its
+    key is before its lead index's entry of [lengths] ([[lead…]], default
+    [tk]), and a paged key's table entry is in [[0, pages)]. A row with no
+    visible key, or only [-∞] scores, gives [o = 0] and [lse = -∞].
+
+    A hidden pair's score never changes [o] or [lse], and a table entry
+    outside [[0, pages)] reads no page. A finite value at a hidden key never
+    changes [o]: its weight is exactly zero. Values past a row's length are
+    zeroed, so they never change [o]. A NaN or an infinity at a key hidden
+    from a row but within its length makes that row's [o] NaN, since [o]
+    reads it at weight zero; a kernel library that skips hidden blocks may
+    give a finite [o] instead, and says so in its own documentation. The
+    weights are float32, and a visible key whose weight underflows to zero
+    still counts: a NaN in its value makes the row's [o] NaN. A sum of zeros
+    is [+0].
+
+    [mask] and [score] are plain [Nx] code over 0-d values, applied once to
+    stand-ins and kept as programs that run at each pair. Their results, and
+    the arrays they capture, broadcast to [[lead…; hq; tq; tk]]; a captured
+    array is read at each pair. On the pair's values they apply elementwise
+    functions and broadcasts; another operation on them, or a read of one,
+    raises naming [Nx.attention].
+
+    {[
+    let window p = Nx.(logical_and (causal p) (less p.q (add_s p.k 128L)))
+    let alibi slopes p s = Nx.(s - cast float32 (p.q - p.k) * slopes)
+    (* slopes [hq; 1; 1] *)
+    let o, lse = Nx.attention ~mask:window ~score:(alibi slopes) ~kv q
+    ]}
+
+    [q]'s dtype is float16, bfloat16 or float32. Scores, their maxima and
+    sums, and [lse] compute in float32, and [o] rounds once to [q]'s dtype.
+
+    It computes as a contraction for the scores, a map and a reduction for
+    the visible scores' log-sum-exp, a map for the weights and a contraction
+    for [o]. Each call stores three float32 arrays of
+    [[lead…; hq; tq; tk]]: the scores, the visible scores and the weights.
+    With [lengths], it copies [v] with its keys past each row's length
+    zeroed; with [Paged], it copies the keys and values the table reads into
+    dense [[lead…; hk; tk; dk]] and [[lead…; hk; tk; dv]] arrays. An
+    interpretation receives these operations; none is attention's own.
+
+    Raises [Invalid_argument] if [q]'s dtype is another, [q] has fewer than
+    three axes, extents disagree, [hk] does not divide [hq], [lengths] is not
+    of shape [[lead…]], [dk] is [0] without [scale], or a result or capture
+    of [mask] or [score] does not broadcast to [[lead…; hq; tq; tk]]. *)
 
 (** {2:matrices Matrices}
 
@@ -1748,8 +1974,10 @@ val diag : ?k:int -> ('v, 's, 'd) t -> ('v, 's, 'd) t
     Factorisations, solves and norms of the matrices of a batch, laid out as
     {!section-matrices} says, [m] rows, [n] columns and [k = min m n]. They
     compute [float32], [float64], [complex64] and [complex128]: another dtype
-    raises [Invalid_argument]. [aᴴ] is the conjugate transpose, the transpose
-    of a real [a].
+    raises [Invalid_argument]. {!vector_norm} and {!matrix_norm} also take the
+    float formats narrower than 32 bits, which they compute at [float32] and
+    round once. [aᴴ] is the conjugate transpose, the transpose of a real
+    [a].
 
     Every result has its operand's dtype. A real result of a complex operand
     (a singular value, an eigenvalue of {!eigh}, {!slogdet}'s logarithm, a
@@ -1770,12 +1998,12 @@ val diag : ?k:int -> ('v, 's, 'd) t -> ('v, 's, 'd) t
 
 (** The type for a square matrix's triangles, each with its diagonal: the
     elements on and below it, or on and above it. *)
-type triangle = Lower | Upper
+type triangle = Nx_kernel.triangle = Lower | Upper
 
 (** The type for how much of a matrix's unitary factors a factorisation gives:
     [k] columns of the left one and [k] rows of the right one, or the whole
     squares, of [m] and of [n]. *)
-type factors = Reduced | Complete
+type factors = Nx_kernel.factors = Reduced | Complete
 
 val cholesky : ?triangle:triangle -> ('v, 's, 'd) t -> ('v, 's, 'd) t
 (** [cholesky a] is the factor of the Hermitian positive definite matrix that
@@ -1966,7 +2194,7 @@ val vector_norm :
 
     Raises [Invalid_argument] for [x]'s dtype, if an axis is outside [x]'s
     rank or repeats, if [ord] is NaN, or if [ord] is [infinity] or
-    [neg_infinity] and [axes] hold no element. *)
+    [neg_infinity] and a vector has no element. *)
 
 val matrix_norm :
   ?ord:[ `Fro | `Nuc | `One | `Two | `Inf | `NegOne | `NegTwo | `NegInf ] ->
@@ -2571,7 +2799,9 @@ val map_segments :
     Raises [Invalid_argument] if [segments] is negative, [x] has fewer axes
     than [ids] or its leading axes do not broadcast to [ids]', [ids] or [x] is
     split along another axis or in another number of windows, or [f]'s result
-    does not have shape [[| g; c; … |]]. *)
+    does not have shape [[| g; c; … |]]. What [f] raises reaches the caller
+    as raised, and the operations [f] makes are named by the functions it
+    calls. *)
 
 (** {1:devices Device sets and placement}
 
@@ -2683,14 +2913,576 @@ val place : 'e Placement.t -> ('v, 's, 'd) t -> ('v, 's, 'e) t
     addresses both [x]'s memory and that device's ({!Rig.reaches});
     otherwise it holds a copy of its window, allocating at most the window's
     bytes. A value of every set is computed at [p]. Across sets it changes the
-    brand; within one, the arrangement.
+    brand; within one, the arrangement. Placing onto {!Host} from another set
+    is a {{!section-waiting}wait} on [x]'s set.
 
-    Raises [Invalid_argument] if [p] cuts an axis [x] does not have, and
-    {!Rig.Lost} for a lost device. *)
+    Raises [Invalid_argument] if [p] cuts an axis [x] does not have,
+    {!Rig.Lost} for a lost device, and a failed check as a wait does. *)
 
 val placement : ('v, 's, 'd) t -> 'd Placement.t option
 (** [placement x] is where [x]'s bytes are, or [None] for a value of every set,
     which has none. *)
+
+(** {1:structures Structures}
+
+    A structure is an OCaml type whose values hold arrays: a model's parameters,
+    an optimiser's state, a cache. {!Ptree} describes one by the function that
+    walks it, and {!check} and {!associative_scan} take its description. *)
+
+type ('v, 's, 'd) tensor = ('v, 's, 'd) t
+(** [tensor] is {!t}, named for {!Ptree}'s signatures, in which [t] is a
+    description. *)
+
+(** Structures of arrays.
+
+    A structure is a type [('a, 'd) t] with one function, [walk], that walks the
+    parts of a value with a {!Walk.cursor}: the positions of its parameter ['a],
+    its arrays of a fixed type, its {e fixed arrays}, on the set ['d], and the
+    data a program depends on (a window, a list's length, a variant's case).
+    Every operation here runs that function, so all of them visit the parts in
+    one order: maps and folds, casts, placement, the names under which arrays
+    are saved and the lists of arrays that interpreters trace.
+
+    A {e description}, [('s, 'd) t], is a structure at one type ['s] whose
+    arrays are all on ['d]. A map's function may then close over an array of
+    ['d]. Changing the set of a value, as changing a dtype, goes through the
+    structure's module: {!place} and {!cast} take one.
+
+    A description is made where it is used. Every description but {!tensor} and
+    {!unit} is a function's result, so OCaml fixes its dtype and its set at its
+    first use, and a set minted in a local scope has no description outside it.
+    A library therefore exports a structure's module, or a walk such as
+    {!Rng.walk}, and its users describe the structure at their dtype and set.
+
+    {[
+    type 'a linear = { w : 'a; b : 'a option }
+
+    module Linear = struct
+      type ('a, _) t = 'a linear
+
+      let walk c { w; b } =
+        let open Nx.Ptree.Walk in
+        let w = field c "w" leaf w in
+        let b = field c "b" (option leaf) b in
+        { w; b }
+    end
+
+    let params = { w = Nx.ones Nx.float32 [| 4; 2 |]; b = None }
+    let linear = Nx.Ptree.instantiate (module Linear)
+    let zeros = Nx.Ptree.map linear (fun _ x -> Nx.zeros_like x) params
+    let on_gpu = Nx.Ptree.place (module Linear) Gpu.on params
+    ]} *)
+module Ptree : sig
+  (** {1:paths Paths} *)
+
+  (** Paths from a value's root to one of its parts. *)
+  module Path : sig
+    (** The type for a path's steps. *)
+    type seg =
+      | Field of string  (** A named part, such as a record's field. *)
+      | Index of int
+          (** A numbered part: a list's or array's element, a tuple's component,
+              a pair's side. *)
+
+    type t
+    (** The type for paths. [Some] and a variant's case add no step. *)
+
+    val root : t
+    (** [root] is the path of no step. *)
+
+    val v : seg list -> t
+    (** [v segs] is the path of [segs], from the root. *)
+
+    val add : seg -> t -> t
+    (** [add seg p] is [p] then [seg], in constant time, sharing [p]. *)
+
+    val segments : t -> seg list
+    (** [segments p] is [p]'s steps, from the root. *)
+
+    val equal : t -> t -> bool
+    (** [equal p q] is [true] iff [p] and [q] have equal steps: the one field
+        ["a.b"] and the field [a] then [b] differ, though they print alike. *)
+
+    val to_string : t -> string
+    (** [to_string p] is [p]'s steps joined by ["."], as ["blocks.3.fc.b"]: the
+        name of the part at [p] in a saved value. The root is [""]. *)
+
+    val pp : Format.formatter -> t -> unit
+    (** [pp] formats a path as {!to_string}. *)
+  end
+
+  (** {1:walk Writing a structure} *)
+
+  type ('s, 'd) t
+  (** The type for descriptions of structures ['s] whose arrays are on ['d]. *)
+
+  (** The functions a [walk] is written with, one per kind of part.
+
+      Each walks one part at the cursor's path. A sub-structure is walked by its
+      own [walk], and a variant names its case before its other parts:
+
+      {[
+      type ('a, 'd) weight =
+        | Float of 'a
+        | Mxfp4 of { blocks : 'd uint8_t; scales : 'd uint8_t }
+
+      let walk_weight c =
+        let open Nx.Ptree.Walk in
+        function
+        | Float w ->
+            case c "float";
+            Float (leaf c w)
+        | Mxfp4 { blocks; scales } ->
+            case c "mxfp4";
+            let blocks = field c "blocks" tensor blocks in
+            let scales = field c "scales" tensor scales in
+            Mxfp4 { blocks; scales }
+      ]} *)
+  module Walk : sig
+    type ('a, 'b, 'd, 'e) cursor
+    (** The type for cursors of a walk that turns the parameter's positions from
+        ['a] into ['b] and the fixed arrays from the set ['d] to ['e]. A cursor
+        stands at a path of the value walked. *)
+
+    val field :
+      ('a, 'b, 'd, 'e) cursor ->
+      string ->
+      (('a, 'b, 'd, 'e) cursor -> 'u -> 'w) ->
+      'u ->
+      'w
+    (** [field c name walk x] is [walk c' x], [c'] at [c]'s path then
+        [Field name]. *)
+
+    val index :
+      ('a, 'b, 'd, 'e) cursor ->
+      int ->
+      (('a, 'b, 'd, 'e) cursor -> 'u -> 'w) ->
+      'u ->
+      'w
+    (** [index c i walk x] is [walk c' x], [c'] at [c]'s path then [Index i].
+        Tuples and arrays number their parts with it; an array also reports its
+        length with {!int}. *)
+
+    val leaf : ('a, 'b, 'd, 'e) cursor -> 'a -> 'b
+    (** [leaf c x] walks [x], a position of the parameter, at [c]'s path. *)
+
+    val tensor :
+      ('a, 'b, 'd, 'e) cursor -> ('v, 's, 'd) tensor -> ('v, 's, 'e) tensor
+    (** [tensor c x] walks [x], a fixed array, at [c]'s path. A description
+        treats it as any other array; {!Payload}'s maps and {!cast} keep it, and
+        {!place} places it. *)
+
+    val int : ('a, 'b, 'd, 'e) cursor -> int -> int
+    (** [int c n] reports [n] at [c]'s path and is [n]. A bool is reported as
+        [0] or [1]. *)
+
+    val case : ('a, 'b, 'd, 'e) cursor -> string -> unit
+    (** [case c tag] reports the variant case [tag] at [c]'s path. *)
+
+    val option :
+      (('a, 'b, 'd, 'e) cursor -> 'u -> 'w) ->
+      ('a, 'b, 'd, 'e) cursor ->
+      'u option ->
+      'w option
+    (** [option walk c x] reports whether [x] is present at [c]'s path and, if
+        it is, walks its content with [walk] at the same path. *)
+
+    val list :
+      (('a, 'b, 'd, 'e) cursor -> 'u -> 'w) ->
+      ('a, 'b, 'd, 'e) cursor ->
+      'u list ->
+      'w list
+    (** [list walk c l] reports [l]'s length at [c]'s path, then walks its
+        [i]-th element with [walk] at [c]'s path then [Index i], from the first.
+    *)
+
+    val structure : ('s, 'd) t -> ('a, 'b, 'd, 'd) cursor -> 's -> 's
+    (** [structure s c x] walks [x], a value of the description [s], at [c]'s
+        path: each of its arrays as {!tensor} walks one, each of its reports as
+        [s] makes it, at [s]'s paths after [c]'s. [tensor c x] is
+        [structure Nx.Ptree.tensor c x].
+
+        A description is at one set, so a walk that calls [structure] is too: it
+        makes a description with {!v}, never a structure's module, and {!place}
+        cannot move what it walks. A part of a fixed type that moves between
+        sets is walked by its own walk, as {!Rng.walk} walks a key:
+
+        {[
+        type ('a, 'd) state = {
+          params : 'a linear;
+          key : 'd Nx.Rng.key;
+          step : 'd Nx.int32_t;
+        }
+
+        module State = struct
+          type ('a, 'd) t = ('a, 'd) state
+
+          let walk c s =
+            let open Nx.Ptree.Walk in
+            let params = field c "params" Linear.walk s.params in
+            let key = field c "key" Nx.Rng.walk s.key in
+            let step = field c "step" tensor s.step in
+            { params; key; step }
+        end
+        ]}
+
+        [Nx.Ptree.place (module State) Gpu.on s] places the parameters, the key
+        and the step. *)
+  end
+
+  (** Structures.
+
+      [walk c x] walks every part of [x] once and rebuilds [x] from what each
+      walk returns:
+      - each position of the parameter with {!Walk.leaf}, each fixed array with
+        {!Walk.tensor}, and each sub-structure with its own [walk];
+      - each integer that changes what a program computes (a window, a block
+        shape, a layer kind) is reported with {!Walk.int}; other scalar data a
+        program depends on belongs in an array;
+      - a variant reports its case with {!Walk.case} before its case's other
+        parts, with a tag no other case of the type uses;
+      - options and lists are walked with {!Walk.option} and {!Walk.list}, which
+        report presence and length, so a part with no array still counts;
+      - a dictionary reports its size with {!Walk.int} and each key with
+        {!Walk.case} before walking the key's value with {!Walk.field};
+      - a walk that returns each part unchanged rebuilds an equal value.
+
+      The type checker ensures no position of the parameter is forgotten, since
+      {!Walk.leaf} changes its type. A forgotten fixed array, integer or case
+      compiles; a test of the structure's {!val-visits} catches it.
+
+      A record literal evaluates its fields in an order OCaml leaves
+      unspecified, and every operation runs the same [walk]: write the fields as
+      a sequence of [let]s where the order must show.
+
+      ['d] is the set of the fixed arrays: a structure whose every array is at
+      its parameter ignores it, as [type ('a, _) t = 'a linear]. *)
+  module type S = sig
+    type ('a, 'd) t
+    (** The type for values with parameter ['a] and fixed arrays on ['d]. *)
+
+    val walk : ('a, 'b, 'd, 'e) Walk.cursor -> ('a, 'd) t -> ('b, 'e) t
+    (** [walk c x] walks every part of [x] with [c] and is [x] rebuilt from what
+        the walks return. *)
+  end
+
+  (** {1:descriptions Descriptions} *)
+
+  val instantiate : (module U : S) -> ((('v, 's, 'd) tensor, 'd) U.t, 'd) t
+  (** [instantiate (module U)] is [U] with arrays at its parameter's positions:
+      [nest (module U) tensor]. A binding is at one dtype and one set, as every
+      description ({!Ptree}), annotated only where nothing else in its
+      compilation unit fixes them. *)
+
+  val nest : (module U : S) -> ('s, 'd) t -> (('s, 'd) U.t, 'd) t
+  (** [nest (module U) s] is [U] whose parameter's positions are values of [s],
+      walked by [s] with their paths after the position's. An optimiser's state
+      over a model is nested. *)
+
+  val v : ('a 'b. ('a, 'b, 'd, 'd) Walk.cursor -> 's -> 's) -> ('s, 'd) t
+  (** [v walk] is the description whose values [walk] walks: a structure without
+      a parameter, on one set, such as a record of parts walked with
+      {!Walk.structure}. [walk] keeps the contract of {!S}'s [walk], with no
+      position of a parameter. {!place} cannot move its values: a structure that
+      moves between sets has a module. *)
+
+  val tensor : (('v, 's, 'd) tensor, 'd) t
+  (** [tensor] is one array, at the root. *)
+
+  val unit : (unit, 'd) t
+  (** [unit] is [()], which has no part. *)
+
+  val pair : ('a, 'd) t -> ('b, 'd) t -> ('a * 'b, 'd) t
+  (** [pair a b] walks a pair's first component with [a] at [Index 0], then its
+      second with [b] at [Index 1]. *)
+
+  val option : ('a, 'd) t -> ('a option, 'd) t
+  (** [option a] reports presence as {!Walk.option} does and walks the content
+      with [a] at the same path. *)
+
+  val list : ('a, 'd) t -> ('a list, 'd) t
+  (** [list a] reports the length as {!Walk.list} does and walks the [i]-th
+      element with [a] at [Index i]. *)
+
+  (** {1:derived Maps and folds}
+
+      These pass every array its path, in walk order. Each array has its own
+      dtype, so their functions are polymorphic; fixed arrays are arrays like
+      the others.
+
+      Two values that differ raise [Invalid_argument] with the message
+      [fn: p: a in the first value, b in the second], [p] the path of the first
+      visit at which they differ and [a] and [b] what each holds there, as
+      {!pp_visit} words it, or [nothing] for a value with no more visits. Where
+      the two visits are at different paths, [b] reads [b at q], [q] the
+      second's path; paths that print alike print as their steps. *)
+
+  val map :
+    ('s, 'd) t ->
+    ('v 'r. Path.t -> ('v, 'r, 'd) tensor -> ('v, 'r, 'd) tensor) ->
+    's ->
+    's
+  (** [map s f x] is [x] with each array [a] at path [p] replaced by [f p a]. *)
+
+  val map2 :
+    ('s, 'd) t ->
+    ('v 'r.
+     Path.t -> ('v, 'r, 'd) tensor -> ('v, 'r, 'd) tensor -> ('v, 'r, 'd) tensor) ->
+    's ->
+    's ->
+    's
+  (** [map2 s f x y] is [x] with each array [a] at path [p] replaced by
+      [f p a b], [b] [y]'s array at [p].
+
+      Raises [Invalid_argument] before applying [f] if [x] and [y] have
+      different {!val-visits}, with the message of {!section-derived} prefixed
+      by ["Nx.Ptree.map2"]; and, after applying [f] to the arrays before [p], if
+      the arrays at [p] differ in dtype, as in
+      ["Nx.Ptree.map2: w: float32 in the first value, int32 in the second"], or
+      if [s] walks one value two ways, which breaks {!S}'s contract. *)
+
+  val fold :
+    ('s, 'd) t ->
+    ('v 'r. Path.t -> ('v, 'r, 'd) tensor -> 'acc -> 'acc) ->
+    's ->
+    'acc ->
+    'acc
+  (** [fold s f x acc] is [f pn an (… (f p1 a1 acc))], [a1], …, [an] [x]'s
+      arrays and [p1], …, [pn] their paths. *)
+
+  (** {1:payloads Sets, dtypes and payloads}
+
+      A structure's [walk] also changes the type of its parameter's positions
+      and the set of its fixed arrays. These take the structure's module, since
+      only a module names its type constructor. *)
+
+  val place :
+    (module U : S) ->
+    'e Placement.t ->
+    (('v, 's, 'd) tensor, 'd) U.t ->
+    (('v, 's, 'e) tensor, 'e) U.t
+  (** [place (module U) p x] is [x] with each array, fixed ones included, at
+      [p], as {!Nx.place}. *)
+
+  val cast :
+    (module U : S) ->
+    ('w, 'r) dtype ->
+    (('v, 's, 'd) tensor, 'd) U.t ->
+    (('w, 'r, 'd) tensor, 'd) U.t
+  (** [cast (module U) dt x] is [x] with each array at a position of [U]'s
+      parameter cast to [dt], as {!Nx.cast}. Fixed arrays are kept. *)
+
+  (** Maps and folds at any payload: a mask, a learning rate per array, a plan,
+      dimensions. The positions of the parameter hold the payloads; fixed
+      arrays, and those of parts walked with {!Walk.structure}, are kept from
+      the first value, and neither passed nor compared. *)
+  module Payload : sig
+    val map :
+      (module U : S) -> (Path.t -> 'a -> 'b) -> ('a, 'd) U.t -> ('b, 'd) U.t
+    (** [map (module U) f x] is [x] with each payload [a] at path [p] replaced
+        by [f p a], in walk order. *)
+
+    val map2 :
+      (module U : S) ->
+      (Path.t -> 'a -> 'b -> 'c) -> ('a, 'd) U.t -> ('b, 'd) U.t -> ('c, 'd) U.t
+    (** [map2 (module U) f x y] is [x] with each payload [a] at path [p]
+        replaced by [f p a b], [b] [y]'s payload at [p].
+
+        Raises [Invalid_argument] before applying [f] if [x] and [y] differ in
+        their payloads' paths or in their reports, with the message of
+        {!section-derived} prefixed by ["Nx.Ptree.Payload.map2"], and if
+        [U.walk] walks one value two ways. *)
+  end
+
+  (** {1:arithmetic Arithmetic}
+
+      A value's float and complex arrays are one real vector, each complex
+      element two of its coordinates, its real and imaginary parts: the inner
+      product of two complex arrays is [Re (conj a · b)]. These functions are
+      the vector's linear algebra, the steps of optimisers, integrators and
+      samplers written over a structure. An array of another dtype, a counter or
+      a key, is not part of the vector: {!dot} and {!norm} skip it, {!scale} and
+      {!axpy} keep it.
+
+      The functions of two values raise [Invalid_argument] as {!map2} does, with
+      their own name, and where the arrays at one path differ in shape, as in
+      ["Nx.Ptree.dot: w: [2; 3] in the first value, [3; 2] in the second"]. *)
+
+  val dot :
+    ('s, 'd) t -> (float, 'c) dtype -> 's -> 's -> (float, 'c, 'd) tensor
+  (** [dot s dt x y] is the 0-d inner product of [x] and [y] at [dt]: from [0],
+      the sum in walk order, over each array [a] of the vector and [y]'s array
+      [b] at its path, of [vdot (cast dt a) (cast dt b)] for floats and of the
+      same over the real parts, then the imaginary parts, stored in [dt], for
+      complex arrays. *)
+
+  val norm : ('s, 'd) t -> (float, 'c) dtype -> 's -> (float, 'c, 'd) tensor
+  (** [norm s dt x] is [x]'s Euclidean norm, [sqrt (dot s dt x x)] in exact
+      arithmetic, computed so that no square overflows: each coordinate is
+      divided by their greatest magnitude [m], and [m] multiplies the root of
+      the quotients' sum of squares. It computes in [dt]'s carrier, float32 for
+      a narrower float, and rounds once to [dt], so it is finite wherever the
+      norm is: [+∞] where a coordinate is infinite and none is NaN, NaN where
+      one is NaN, [0] of no coordinate. *)
+
+  val scale : ('s, 'd) t -> (float, 'c, 'd) tensor -> 's -> 's
+  (** [scale s k x] is [x] with each array [a] of the vector replaced by
+      [k' * a], [k'] [k] cast to [a]'s format, part by part for a complex [a].
+
+      Raises [Invalid_argument] naming [Nx.Ptree.scale] unless [k] is 0-d. *)
+
+  val axpy : ('s, 'd) t -> (float, 'c, 'd) tensor -> 's -> 's -> 's
+  (** [axpy s k x y] is [x] with each array [a] replaced by [k' * a + b], [b]
+      [y]'s array at its path and [k'] [k] cast to [a]'s format, the product and
+      the sum each rounded to it, a complex [a] part by part; and by [b] where
+      [a] is not in the vector.
+
+      Raises [Invalid_argument] naming [Nx.Ptree.axpy] unless [k] is 0-d. *)
+
+  (** {1:visits Visits} *)
+
+  (** The type for what a walk reports. *)
+  type report =
+    | Int of int  (** From {!Walk.int}. *)
+    | Case of string  (** From {!Walk.case}. *)
+    | Present of bool  (** From {!Walk.option} and {!option}. *)
+    | Length of int  (** From {!Walk.list} and {!list}. *)
+
+  (** The type for the steps of a walk. *)
+  type visit =
+    | Leaf of Path.t  (** An array, at its path. *)
+    | Report of Path.t * report  (** A report, at the path it is made at. *)
+
+  val visits : ('s, 'd) t -> 's -> visit list
+  (** [visits s x] is the steps of [s]'s walk of [x], in walk order. A
+      structure's test compares them with the arrays, integers and cases its
+      [walk] must visit. *)
+
+  val pp_visit : Format.formatter -> visit -> unit
+  (** [pp_visit ppf v] formats [v] as its path and what is there:
+      ["blocks.3.moe: case \"mxfp4\""], ["0.keys: a leaf"],
+      ["layers: length 4"], ["bias: Some"], ["window: int 8"]. The root is
+      formatted ["the root"]. *)
+
+  (** {1:signatures Signatures of compiled functions}
+
+      A signature has the shape of the function an interpreter compiles:
+      [tensor @-> index @-> consumes caches @@ returns (pair tensor caches)]. An
+      argument built with {!( @-> )} is read; one built with {!consumes} is
+      given up by each call. Each argument has its own type, so
+      [tensor @-> tensor @-> …] takes arrays of two dtypes. *)
+
+  (** The type for how a call treats an argument. *)
+  type role =
+    | Read  (** The call reads the argument. *)
+    | Consumed  (** The call consumes the argument. *)
+
+  (** The type for signatures of functions of type ['f] on the set ['d]. *)
+  type (_, 'd) fn = private
+    | Returns : ('a, 'd) t -> ('a, 'd) fn  (** A result. *)
+    | Arg : role * ('a, 'd) t * ('b, 'd) fn -> ('a -> 'b, 'd) fn
+        (** An argument, then the rest of the signature. *)
+
+  val ( @-> ) : ('a, 'd) t -> ('b, 'd) fn -> ('a -> 'b, 'd) fn
+  (** [a @-> f] reads an argument of [a], then is [f]. *)
+
+  val consumes : ('a, 'd) t -> ('b, 'd) fn -> ('a -> 'b, 'd) fn
+  (** [consumes a f] consumes an argument of [a], then is [f]. It is written
+      [consumes a @@ f]. *)
+
+  val returns : ('a, 'd) t -> ('a, 'd) fn
+  (** [returns a] is a result of [a]. *)
+
+  (** {1:flattening Flattening}
+
+      {b Low level.} A value as its arrays and its skeleton: what interpreters
+      key compiled programs on and put results back with. *)
+
+  (** Skeletons of values. *)
+  module Skeleton : sig
+    type t
+    (** The type for a value's skeleton: its {!val-visits}. *)
+
+    val equal : t -> t -> bool
+    (** [equal k k'] is [true] iff [k] and [k'] have equal visits, their paths
+        compared by {!Path.equal}. *)
+
+    val hash : t -> int
+    (** [hash k] hashes [k]: equal skeletons hash equal. *)
+
+    val diff : this:string -> t -> that:string -> t -> string option
+    (** [diff ~this k ~that k'] is [None] iff [equal k k'], and otherwise the
+        message of {!section-derived} for their first differing visit, [this]
+        and [that] placing each side: with [~this:"here"] and
+        [~that:"in the previous key"],
+        ["window: int 8 here, int 4 in the previous key"]. *)
+  end
+
+  val flatten : ('s, 'd) t -> 's -> 'd packed list * Skeleton.t
+  (** [flatten s x] is [x]'s arrays in walk order and [x]'s skeleton. *)
+
+  val rebuild : ('s, 'd) t -> like:'s -> 'd packed list -> 's
+  (** [rebuild s ~like xs] is [like] with its arrays replaced by [xs], in walk
+      order. [rebuild s ~like (fst (flatten s like))] is [like].
+
+      Raises [Invalid_argument] naming [Nx.Ptree.rebuild] if [xs] has fewer
+      arrays than [like], naming the path of the first left without one; if it
+      has more, naming both counts; or if an array has another dtype than
+      [like]'s at its position, naming the path and both dtypes. *)
+end
+
+val check :
+  ('a, 'd) Ptree.t -> 'd bool_t -> 'a -> (int array -> 'a -> exn) -> unit
+(** [check s ok data fail] raises [fail i d] if an element of [ok] is [false],
+    [i] the index of the first in C order and [d] the structure [data] with each
+    array replaced by its element at [i], a 0-d value of every set. Each array
+    of [data] broadcasts to [ok]'s shape; an empty [ok] passes. A check with no
+    data passes {!Ptree.unit} and [()].
+
+    It is a {{!section-waiting}check}: on the host it raises at the call, and on
+    another set at the next wait on that set. It computes on [ok]'s set, or, for
+    an [ok] of every set, on the set of the first array of [data] in walk order
+    that has bytes, or on the host where none has.
+
+    [s]'s walk must rebuild [data] with each array replaced by a 0-d one, as
+    [fail]'s [d] is built; a walk that checks its arrays' shapes, as {!Rng.walk}
+    does, may refuse. [check] tries that rebuild at the call.
+
+    Raises [Invalid_argument] naming [Nx.check] at the call if an array of
+    [data] does not broadcast to [ok]'s shape, or if [s]'s walk refuses 0-d
+    arrays. *)
+
+val associative_scan :
+  ?axis:int -> ('s, 'd) Ptree.t -> ('s -> 's -> 's) -> 's -> 's
+(** [associative_scan s f x] is the inclusive scan of [f] along [axis] over the
+    structure [x]: its element [i] combines [x]'s elements [0] to [i] by [f],
+    each earlier run as [f]'s first operand, an element being the structure of
+    every array's slice at one index of its [axis]. [axis] defaults to [0] and
+    counts from each array's last axis when negative.
+
+    [f] must be associative and elementwise: [f (f a b) c] equals [f a (f b c)],
+    and an element of [f a b] depends on [a]'s and [b]'s elements at its own
+    index alone. The combinations follow Brent and Kung's circuit: of the
+    elements [x₀], …, [xₙ₋₁], the pairs [pₖ = f x₂ₖ x₂ₖ₊₁] are scanned so into
+    [q], then [y₀ = x₀], [y₂ₖ₊₁ = qₖ] and [y₂ₖ = f qₖ₋₁ x₂ₖ]. Element [i] is
+    thus a tree of [f] whose shape depends on [i] alone, of depth at most
+    [max(0, 2⌈log₂(i+1)⌉ - 1)]: the scan of a prefix of [x] is the prefix of the
+    scan of [x], bit for bit, where [f] computes each element from its operands'
+    elements at its index alone, whatever their slices' extents. For a float [f]
+    these are not the left fold's bits. [f] is called at most [2⌈log₂ n⌉] times
+    for [n] elements, each time over slices of every array, and combines fewer
+    than [2n] pairs of elements in all; [f] needs no identity.
+
+    Other scans are lifts of [f]: an exclusive scan is the inclusive one shifted
+    by one along [axis], [f]'s identity first; a reversed scan is the scan of
+    [x] flipped along [axis], flipped back; a segmented scan is the scan of
+    pairs [(start, v)], [start] [true] at each segment's first element, by
+    [fun (s1, v1) (s2, v2) -> (logical_or s1 s2, where s2 v2 (f v1 v2))].
+
+    Raises [Invalid_argument] naming [Nx.associative_scan] if [axis] is not an
+    axis of an array of [x], if two arrays of [x] have different extents along
+    it, or if [f] returns a structure whose visits, dtypes or shapes differ from
+    its operands'. *)
 
 (** {1:random Random numbers} *)
 
@@ -2732,6 +3524,13 @@ module Rng : sig
   (** [place p k] is [k] at [p], as {!Nx.place}; a draw from it computes at [p].
   *)
 
+  val walk : ('a, 'b, 'd, 'e) Ptree.Walk.cursor -> 'd key -> 'e key
+  (** [walk c k] walks [k], a key or a batch of keys, at [c]'s path as one
+      fixed array ({!Ptree.Walk.tensor}), and rebuilds it as {!of_tensor}
+      does. A structure holding a key walks it with
+      [field c "key" Nx.Rng.walk k]; [Nx.Ptree.v Nx.Rng.walk] describes a key
+      alone. *)
+
   val split : ?n:int -> 'd key -> 'd key array
   (** [split ~n k] is [n] keys derived from [k] ([n] defaults to [2]),
       independent of each other. They are [k]'s blocks [0] to [n - 1], so a key
@@ -2768,10 +3567,12 @@ module Rng : sig
       shape. Each parameter is checked against its domain: an element outside
       raises [Invalid_argument] naming the sampler, the parameter, the element's
       index and its value, as in
-      [Nx.Rng.bernoulli: p at [3] is 1.5, not in [0, 1]]. The check runs as the
-      sampler is called, computing the parameter if it is a formula; under an
-      interpretation it is a [Check] operation, which raises
-      where the interpretation computes it. *)
+      [Nx.Rng.bernoulli: p at [3] is 1.5, not in [0, 1]]. The check is a
+      {{!Nx.section-waiting}check}: it raises at the call for a parameter on the
+      host or of every set, and for one on another set at the next wait on that
+      set, so that a draw never waits for its parameters. Under an
+      interpretation it is a [Check] operation, which raises where the
+      interpretation computes it. *)
 
   val bits : ?key:'d key -> int array -> 'd int32_t
   (** [bits shape] is uniformly random 32-bit words: word [j] in C order is word
@@ -2898,6 +3699,65 @@ module Rng : sig
       Raises [Invalid_argument] if the shapes do not broadcast, an element of
       [n] is negative, or one of [p] is outside [[0, 1]]. *)
 
+  val truncated_normal :
+    ?key:'d key -> (float, 's, 'd) t -> (float, 's, 'd) t -> (float, 's, 'd) t
+  (** [truncated_normal lower upper] is standard normal draws conditioned on
+      [[lower, upper]], elementwise over their broadcast shape. The bounds may
+      come in either order, an infinite one leaves its side open, and equal
+      ones give the bound. Draw [j] in C order is the [x] with
+      [Φ(x) = (1 - u) Φ(lower) + u Φ(upper)], [Φ] the normal distribution
+      function ({!ndtr}), and [u] {!uniform}'s draw [j] from the same key at
+      float64 for float64 and at float32 otherwise, floored at its least
+      positive value. It inverts the smaller of the masses below and above
+      [x], held as logarithms in the tails, so that bounds far out on one side
+      keep their digits, and its cost does not depend on the interval's mass.
+      A draw lies in the interval, and at float32 within [6·2{^-23}] plus 3
+      units in the last place of the exact solution. The masses at each bound
+      are computed once per element of the bound as given, so a scalar bound
+      costs one.
+
+      Raises [Invalid_argument] if the shapes do not broadcast or an element of
+      [lower] or [upper] is NaN. *)
+
+  val dirichlet : ?key:'d key -> (float, 's, 'd) t -> (float, 's, 'd) t
+  (** [dirichlet a] is Dirichlet draws of concentrations [a] along its last
+      axis, one draw per row: the {!gamma} draws of [a] from the same key, each
+      row divided by its sum. The quotient is formed from the draws'
+      logarithms, so that a row of concentrations so small that its gamma draws
+      underflow keeps their ratios: each row sums to 1 and has an element of at
+      least [1 / n], [n] its length, up to rounding. It inherits {!gamma}'s
+      rounds.
+
+      Raises [Invalid_argument] if [a] has no axis, or an element of [a] is
+      outside [(0, inf)]. *)
+
+  val categorical : ?key:'d key -> ?axis:int -> (float, 's, 'd) t -> 'd int64_t
+  (** [categorical logits] is a position along [axis] of each row of [logits],
+      drawn with probability proportional to the exponential of its logit:
+      [axis] is the last by default, a negative one counted from the end. A
+      logit of [-inf] is never drawn. The result has [logits]' shape without
+      [axis]; broadcast [logits] for several draws of one row.
+
+      It is the {!argmax} of the logits plus Gumbel noise [-log e], computed at
+      float64 for float64 and float32 for the other floats, [e] an exponential
+      draw formed from [b] random bits, 53 at float64 and 32 otherwise, that
+      keeps its relative precision near 0. The noise is bounded, so a category
+      whose logit lies more than [(b + 1) ln 2 + ln ((b + 1) ln 2)] below its
+      row's largest, about 26 at float32 and 41 at float64, is never drawn:
+      its probability is below [e{^-26}] or [e{^-41}].
+
+      Raises [Invalid_argument] if [axis] is not an axis of [logits] or has no
+      element, or if a row's largest logit is not finite: [+inf], NaN, or a row
+      of [-inf]. *)
+
+  val permutation : ?key:'d key -> int -> 'd int64_t
+  (** [permutation n] is a uniformly random ordering of [0], …, [n - 1]: the
+      positions that sort [n] random 64-bit words. Two words collide, and
+      their positions keep their order, with probability below
+      [n{^2} / 2{^65}].
+
+      Raises [Invalid_argument] if [n] is negative. *)
+
   (** {1:scope Scope} *)
 
   val with_key : 'd key -> (unit -> 'a) -> 'a
@@ -2924,7 +3784,8 @@ val pp : Format.formatter -> ('v, 's, 'd) t -> unit
     Elements print as {!Dtype.pp_value} does: a float in the shortest form that
     reads back to it in its format, an unsigned integer unsigned. Past 1000
     elements an axis longer than 6 shows its first and last 3 around [...]. A
-    value with elements is read as {!to_array} reads it.
+    value with elements is read as {!to_array} reads it, so it raises a failed
+    check pending on its set ({!section-waiting}).
 
     A value of every set prints [of every set] and the operation that makes it;
     a traced one [traced by] its interpretation; a dead one the function it was
@@ -2947,7 +3808,10 @@ val pp_dtype : Format.formatter -> ('v, 's) dtype -> unit
     Every misuse raises [Invalid_argument] whose message is the function the
     user called, a colon, the reason and, where they matter, the operands as
     [dtype shape on set], as in
-    [Nx.add: shapes [2; 3] and [4] do not broadcast]. A lost device
+    [Nx.add: shapes [2; 3] and [4] do not broadcast]. The function is the one
+    the user called whatever functions it computes through. A function the
+    user gives, as {!init}'s [f] or an interpretation's rule, keeps its own
+    errors: what it raises reaches the caller as raised. A lost device
     raises {!Rig.Lost}, and a device's memory that runs out
     {!Rig.Out_of_memory}. Host memory that runs out raises OCaml's
     [Out_of_memory]. *)
@@ -2974,6 +3838,26 @@ module Repr : sig
   (** [array x] is [Some a] iff [x] has bytes on one device, [a] its array, and
       [None] for a value on several devices or of every set. [a] may be strided
       or offset. It is for reading: writing through it changes [x]. *)
+
+  val read : ('v, 's, 'd) t -> (('v, 's) Nx_array.t -> 'a) -> 'a
+  (** [read x f] is [f a], [a] an array on the host of [x]'s elements for the
+      extent of [f]: over [x]'s own memory where [x] lies on one device whose
+      memory the host addresses (the host, a memory device, Metal), and
+      otherwise a copy on the host, made for any placement, including a value
+      cut across devices; a value of every set is computed on the host. It is
+      a {{!section-reads}read}: it waits for [x]'s set and raises a failed
+      check pending on it. [a] may be strided or offset.
+
+      Unlike {!array}, it leaves [x]'s memory unshared, so a donation of [x]
+      after [f] returns may write its result there ({!donate}). [a]'s memory
+      is claimed for the extent of [f]: a donation of [x] meanwhile computes
+      into fresh memory. [f] must not write through [a], and must not keep
+      [a], or a bigarray over it, after it returns. [x] stays reachable until
+      [f] returns.
+
+      Raises [Invalid_argument] naming [Nx.Repr.read] for a dead or a traced
+      [x], or if [x]'s memory is held exclusive, and a failed check as a wait
+      does. *)
 
   val of_shards :
     'd Placement.t -> ('v, 's) Nx_array.t iarray -> ('v, 's, 'd) t
@@ -3005,11 +3889,15 @@ end
     it, a fiber forked by a scheduler installed outside the interpretation, and
     a fiber that a scheduler installed in the extent resumes on another domain:
     there, an operation on a traced value raises, and an [Extent]
-    interpretation reaches none of the other operations. Every interpretation
-    reaches the operations on its traced values; an [Extent] interpretation
-    reaches every operation of its extent. An operation no interpretation
-    reaches computes now on its operands' set's kernels, and raises if the set
-    has none.
+    interpretation reaches none of the other operations. An [Adopting]
+    interpretation is around its extent on the domain it started on, and on
+    another only where the interpretation it adopts is around too.
+    Every interpretation reaches the operations on its traced values; an
+    [Extent] interpretation reaches every operation of its extent, and an
+    [Adopting] one those on the values of the interpretations it adopts. An
+    operation no interpretation reaches computes now on its operands' set's
+    kernels, and raises if the set has none, but a check of one flag that has
+    bytes ([Check]).
 
     A rule runs outside its own interpretation and outside every handler
     installed in its extent, with the extent suspended until it returns: its
@@ -3017,7 +3905,10 @@ end
     except through {!expand}, and an effect it performs reaches the handlers
     around the interpretation. So a rule is never entered while it runs,
     except by the operations of an {!expand} it calls, which reach it again,
-    and its state needs no lock.
+    and its state needs no lock. A rule that two interpretations share, as an
+    adopting one may share its parent's, is entered for one while it runs for
+    the other: by an operation it applies, or while its fiber is suspended,
+    never on two domains at once.
 
     An operation on a traced value raises [Invalid_argument] naming [by] and
     the interpretation where the interpretation is not around it: after it
@@ -3034,7 +3925,7 @@ module Prim : sig
   type ('v, 's, 'd) form = {
     dtype : ('v, 's) dtype;
     layout : Nx_array.Layout.t;
-    placement : 'd Placement.t option;
+    placement : 'd Placement.t option;  (** [None] for a value of every set. *)
   }
   (** A value without its bytes. A value cut over devices has the C-contiguous
       layout of the whole. *)
@@ -3059,13 +3950,14 @@ module Prim : sig
         (** A check's data: values whose elements at one index its failure
             receives, in order. *)
 
-  (** What a loop's reduction makes of one output of its program. *)
+  (** What a loop's reduction makes of one output of its program. It computes
+      in the output's carrier ({!Nx_kernel.carrier}). *)
   type ('d, _) reduction =
     | Monoid :
         Nx_kernel.monoid * int * ('v, 's) dtype
         -> ('d, ('v, 's, 'd) nx) reduction
-        (** [Monoid (m, k, dt)] folds output [k] by [m] in that output's dtype
-            and rounds once to [dt]. *)
+        (** [Monoid (m, k, dt)] folds output [k] by [m] in its carrier and
+            rounds once to [dt]. *)
     | Moments :
         int * ('v, 's) dtype
         -> ('d, ('v, 's, 'd) nx * ('v, 's, 'd) nx) reduction
@@ -3194,7 +4086,9 @@ module Prim : sig
         (** [prog] at every index of [layout]'s shape, as a map's, each
             reduction folding its output along [axes], strictly increasing, as
             {!Nx_kernel.S.reduce} says. Results drop [axes] and are
-            C-contiguous. [Max], [Min] and [Arg] of no term are refused. *)
+            C-contiguous. A [Max], [Min] or [Arg] is refused where a result
+            has an element and [axes] hold no term, as
+            {!Nx_kernel.Shape.reduce} says. *)
     | Scan : {
         layout : Nx_array.Layout.t;
         axis : int;
@@ -3205,15 +4099,14 @@ module Prim : sig
       }
         -> 'r t
         (** The reduction of [prog]'s output over the indices along [axis] up to
-            each index's, inclusive, of [layout]'s shape, as
-            {!Nx_kernel.S.scan} says: a running [Moments] is the running mean
-            and variance. The scan of a prefix of the axis is the prefix of
-            the scan, bit for bit. [prog] reads coordinates as a map's. With
-            [Some c], of a [Sum], [Prod], [Max] or [Min], each slice continues
-            from its element of [c], [S.scan]'s carry: of the results' shape
-            but extent [1] along [axis], in the carrier of the output's dtype,
-            [float32] for a narrower float, [int8] and [uint8] for [int4] and
-            [uint4], [bool] for [bit]. *)
+            each index's, inclusive, as {!Nx_kernel.S.scan} says: a running
+            [Moments] is the running mean and variance. Its results have
+            [layout]'s shape and are C-contiguous. The scan of a prefix of the
+            axis is the prefix of the scan, bit for bit. [prog] reads
+            coordinates as a map's. With [Some c], of a [Sum], [Prod], [Max]
+            or [Min], each slice continues from its element of [c], [S.scan]'s
+            carry, of the results' shape but extent [1] along [axis] and of
+            the output's carrier ({!Nx_kernel.carrier}). *)
     | Gather : {
         axis : int;
         idx : (int64, Dtype.int64_elt, 'd) nx;
@@ -3305,7 +4198,14 @@ module Prim : sig
         -> unit t
         (** Raises [fail i e] at the first index [i], in C order, where [ok]
             is [false], [e] each of [data]'s elements at [i], in order: OCaml
-            values, which belong to no device set. *)
+            values, which belong to no device set. Each value of [data] has
+            [ok]'s shape. An empty [ok] passes. It is computed on [ok]'s set,
+            or the first datum's where [ok] is of every set, or the host where
+            every operand is: at the call on the host, and otherwise at the
+            next {{!section-waiting}wait} on that set. A check of one element
+            reduces nothing: its flag is that element, read on the device
+            that holds it, and its first index is [0], so it needs no
+            kernels where [ok] has bytes. A formula [ok] is computed first. *)
 
   type operands = Operands : 'd any list -> operands
 
@@ -3319,9 +4219,11 @@ module Prim : sig
       outputs, and as [nK] where it is read. *)
 
   val operands : 'r t -> operands
-  (** [operands op] is [op]'s operands in order: a map's loads, a contraction's
-      [a], [b] then [init], [Check]'s [ok] then its data, the one operand of the
-      others. *)
+  (** [operands op] is [op]'s operands in order: a loop's loads, then a scan's
+      carry; a gather's [idx] then [x]; a scatter's [idx], [updates] then
+      [into]; an assembly's pieces; a contraction's [a], [b] then [init]; a
+      triangular solve's [a] then [b]; [Check]'s [ok] then its data; the one
+      operand of the others. *)
 
   val map : ('v 's 'd. ('v, 's, 'd) nx -> ('v, 's, 'd) nx) -> 'r t -> 'r t
   (** [map m op] is [op] with each operand [x] replaced by [m x]. *)
@@ -3362,6 +4264,9 @@ module Prim : sig
   type reach =
     | Values  (** Reaches the operations on its traced values. *)
     | Extent  (** Also reaches every operation of its extent. *)
+    | Adopting of interpretation
+        (** [Adopting p] also reaches the operations on the traced values of
+            [p] and of what [p] adopts, before [p]. *)
 
   type ('v, 's, +'d) payload = ..
   (** What an interpretation keeps in its traced values. A payload holds values,
@@ -3376,11 +4281,33 @@ module Prim : sig
   (** [interpret ~name reach rule f] is [f i], [i] a new interpretation that
       gives the operations it reaches the meaning [rule i ~by op], live until
       [f] returns or raises. [name] names it in messages, as ["Rune.grad"].
+      [by] is the function the user called, whatever functions that one
+      computes through: each operation of {!trace} reaches [rule] as
+      ["Nx.trace"]. [rule] is the user's function: the operations it makes are
+      named by the functions it calls, and what it raises reaches the caller
+      as raised.
+
 
       An operation [rule] receives is the final consumer of the donated
       handles among its operands ({!Nx.donate}), a movement too, since its
       results hold no handle to pass on: their donors die when it is
-      received, and [rule] reads the handles' arrays. *)
+      received. [rule] reads the operation as it was called: the handles'
+      arrays, and a donor beside its handle as a live value.
+
+      With [Adopting p], [i] receives the operations on [p]'s values as on its
+      own, without asking whether [p] is around them: [p] is around [i]'s
+      extent, since [interpret] checks it is around the caller, so an
+      operation on [p]'s values costs [i] what one on its own does. Since
+      [rule] may share [p]'s state, [i] answers on another domain than the one
+      [interpret] was called on only where [p] is around there too, its
+      extent resumed there with [i]'s; elsewhere an operation of [i]'s extent
+      on a value of [i] or of what it adopts raises as one outside their
+      extents. {!payload}[ i] is [None] for [p]'s values: [rule] reads them
+      through {!owner}.
+
+      Raises [Invalid_argument] naming [name] and [p], with [Adopting p], if
+      [p] is an [Extent], returned, or is not around the caller, as from its
+      own rule or on another domain. *)
 
   val traced :
     interpretation ->
@@ -3392,24 +4319,81 @@ module Prim : sig
       raises. *)
 
   val payload : interpretation -> ('v, 's, 'd) nx -> ('v, 's, 'd) payload option
-  (** [payload i x] is [Some p] iff [i] owns [x], [p] what it keeps. *)
+  (** [payload i x] is [Some p] iff [i] owns [x], [p] what it keeps: [None]
+      for a value [i] adopts ([Adopting]), whose owner keeps its payload. *)
+
+  val quiet : unit -> bool
+  (** [quiet ()] is [true] only if no [Extent] interpretation is live, on any
+      domain: an operation that no [Values] or [Adopting] interpretation
+      reaches then computes now. It may be [false] with none live: a
+      continuation dropped inside an extent keeps it [false] for the life of
+      the process. It reads one atomic. *)
 
   val owner : ('v, 's, 'd) nx -> interpretation option
   (** [owner x] is the interpretation that owns [x], if [x] is traced. *)
 
-  val later : interpretation -> interpretation -> bool
-  (** [later a b] is [true] iff [a] started after [b], on any domains. Of two
-      interpretations around one operation, the later is inside the other. *)
+  val donated : ('v, 's, 'd) nx -> bool
+  (** [donated x] is [true] iff [x] is a handle {!Nx.donate} made, live or
+      not. It allocates nothing. *)
+
+  val consume : by:string -> 'd any list -> 'd any list
+  (** [consume ~by xs] is [xs] read by one consumer named [by] that is no
+      operation, as a compiled call: as an operation reads its operands
+      ({!Nx.donate}), each handle as a live value over its arrays, a donor
+      beside its handle as it was, and any other value as it is. Each
+      handle's donor is then dead, naming [by]. It checks every value before
+      it kills any, and orders its claims with every operation's and every
+      other consumer's, on any domain. The handles' memory is not consumed:
+      a consumer that writes into it takes it from rig, which says whether
+      it is exclusive ({!Rig.Claim.with_}).
+
+      Raises [Invalid_argument] as an operation's operands do: naming
+      [Nx.donate] for two handles of one donor or over one memory, then
+      naming [by] for a value that died. In sequence it then kills
+      nothing. *)
 
   val eval : by:string -> 'r t -> 'r
   (** [eval ~by op] is [op]'s meaning under the rule, as the vocabulary's
       functions apply it. *)
 
-  val expand : interpretation -> by:string -> 'r t -> 'r option
-  (** [expand i ~by op] is [Some r], [r] [op] as core operations applied by
-      {!eval} around [i] again, so that they reach [i]; [None] for an
-      operation that has no expansion. A map of several nodes expands into one
-      map per node.
+  val expand :
+    interpretation ->
+    by:string ->
+    repeat:
+      ('d.
+      int ->
+      ((int64, Dtype.int64_elt, 'd) nx -> 'd any list -> 'd any list) ->
+      'd any list ->
+      'd any list) ->
+    'r t ->
+    'r option
+  (** [expand i ~by ~repeat op] is [Some r], [r] [op] as core operations
+      applied by {!eval} around [i] again, so that they reach [i]; [None] for
+      an operation that has no expansion. A map of several nodes expands into
+      one map per node.
+
+      A loop of [n] trips runs as [repeat n step init]. It means the fold
+      [step (n - 1) (… (step 0 init))], [step k] taking the carry of trip [k]
+      to the next, [k] a 0-d int64 value, from [0]: an interpretation whose
+      loop counts in another dtype casts its index to int64 for [step]. A
+      [repeat] gives the fold's values within the expansion's stated
+      tolerance, and need not give its bits: one that stages [step] once may
+      fuse and reorder its operations. [step] gives each carry its form back
+      and applies the same operations at every trip, so it may be traced once
+      at a stand-in index; besides its index and its carry, it reads only
+      values made before the loop: [op]'s operands, constants, and what the
+      expansion computed from them, as a cast of an operand. A [repeat] that
+      folds is always one:
+      {[
+        let repeat n step init =
+          let rec go k c =
+            if k = n then c
+            else go (k + 1) (step (Nx.scalar Nx.int64 (Int64.of_int k)) c)
+          in
+          go 0 init
+      ]}
+      A scatter whose targets may repeat loops once per position along its
+      axis.
 
       Raises [Invalid_argument] naming [by] and [i] if [i] returned. *)
 end

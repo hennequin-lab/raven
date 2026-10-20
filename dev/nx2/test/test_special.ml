@@ -3,8 +3,8 @@
   SPDX-License-Identifier: ISC
   ---------------------------------------------------------------------------*)
 
-(* nx's special functions against correctly rounded references (nx's
-   golden/special/, written by its gen/special.py), at the bounds nx.mli
+(* nx's special functions against correctly rounded references
+   (golden/special/, written by gen/special.py), at the bounds nx.mli
    states per function and dtype; the narrow floats at the rule nx.mli states
    for them; the laws the functions keep; their edges. *)
 
@@ -25,7 +25,7 @@ let values = Nx.to_array
    the dtype's range. *)
 type row = { args : float array; value : float; overflow : bool; scale : float }
 
-let goldens = "../../../packages/nx/test/golden/special"
+let goldens = "golden/special"
 
 (* The rows of the golden of [name] at the dtype named [short] ("f32",
    "f64"). *)
@@ -1131,6 +1131,39 @@ let beta_edges =
         (tail (fun (_, _, _, lc) -> lc));
     ]
 
+(* Platforms
+
+   A result reaching one of the functions' logarithm constants has the same
+   bits on every system: the constants are written out, never computed by the
+   C library. The bits are a baseline recorded on one system. *)
+
+let platforms =
+  test "results through a logarithm constant keep their bits" (fun () ->
+      let lgamma = { f = (fun a -> Nx.lgamma a.(0)) } in
+      let log_ndtr = { f = (fun a -> Nx.log_ndtr a.(0)) } in
+      let betainc = { f = (fun a -> Nx.betainc a.(0) a.(1) a.(2)) } in
+      let show (type s) (dt : (float, s) Nx.dtype) name f points =
+        let print = Printf.printf "%s %s %h\n" (D.name dt) name in
+        Array.iter print (at dt f points)
+      in
+      let all dt =
+        show dt "lgamma" lgamma [ [| -2.5 |]; [| -0.5 |] ];
+        show dt "log_ndtr" log_ndtr [ [| -40. |] ];
+        show dt "betainc" betainc [ [| 0.5; 0.5; 0.95 |] ]
+      in
+      all Nx.float64;
+      all Nx.float32;
+      expect (output ()) @@ __POS_OF__ {|
+        float64 lgamma -0x1.ccbf9f5ed0f2p-5
+        float64 lgamma 0x1.43f89a3f0edd6p+0
+        float64 log_ndtr -0x1.924de16d8b4aep+9
+        float64 betainc 0x1.b67e7a9468945p-1
+        float32 lgamma -0x1.ccbfcp-5
+        float32 lgamma 0x1.43f89ap+0
+        float32 log_ndtr -0x1.924de2p+9
+        float32 betainc 0x1.b67e7ap-1
+        |})
+
 (* Shapes *)
 
 let shapes =
@@ -1171,5 +1204,5 @@ let () =
        [
          error_function; normal; gamma; bessel; incomplete_gamma;
          incomplete_beta; laws; gamma_laws; beta_laws; ones; gamma_edges;
-         beta_edges; shapes;
+         beta_edges; platforms; shapes;
        ])

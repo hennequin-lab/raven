@@ -17,7 +17,6 @@ let computes d =
   match d.kind with Host | Driver _ -> true | Io _ -> false
 let runs_on_host d = Dev.is_host d || d.memory_device
 let alignment d = d.alignment
-let most_parts d = d.most_parts
 let reaches = Dev.reaches
 let budget d = d.budget
 let allocated = Memory.allocated
@@ -71,7 +70,9 @@ let signaled = Dev.signaled
 exception Lost = Dev.Lost
 
 let lost = Dev.lost
-let close = Dev.close
+let close d =
+  Profile.read_closing d;
+  Dev.close d
 let fail = Dev.fail
 let failure = Dev.failure
 

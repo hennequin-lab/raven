@@ -24,9 +24,10 @@
    Joins: a part that a later part on the other channel runs after (one
    its [after] names, or its queue's previous part), and a channel's last
    part when the other channel releases v, signal their channel's join
-   word with the tag v << 16 | i + 1, i the part's index; the waiter
-   acquires the tag. Tags rise on each join word, and the acquire compares
-   64 bits circularly, so ">=" is exact. The channel of the last part
+   word with the channel's next join number, counted from JOINS_START at
+   the device's open; the waiter acquires that number. A channel's numbers
+   rise in the order its work runs, and the acquire compares 64 bits
+   circularly, so ">=" is exact. The channel of the last part
    (COMPUTE when there is none, or when v's low 32 bits are 0) waits for
    the other channel's last part, then releases v into the timeline word:
    on COMPUTE a release that waits for the channel to be idle, on COPY a
@@ -52,6 +53,7 @@
 
 #define _GNU_SOURCE
 
+#include <pthread.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
@@ -61,8 +63,6 @@
 /* The waits a submission may carry: rig_nv_room, which does not see
    them, keeps room for this many on each channel. */
 #define MAX_WAITS 256
-
-static uint64_t tag(uint64_t v, int i) { return v << 16 | (uint64_t)(i + 1); }
 
 static int other(int q) { return q == COMPUTE ? COPY : COMPUTE; }
 
@@ -120,14 +120,15 @@ static void put_entries(const struct device *d, struct channel *c,
 /* Returns to [c] what the submissions up to [seen] used. A submission
    before a growth used rings the growth replaced, of which nothing returns
    to [c]: the OCaml side frees them once [seen] passes them. */
-static void reclaim(struct channel *c, uint64_t seen) {
+static void reclaim(const struct device *d, struct channel *c,
+                    uint64_t seen) {
   while (c->count > 0) {
     const struct mark *m = &c->marks[c->first];
     if (m->v > seen) return;
     c->freed = m->put;
     if (m->v >= c->segments_from) c->reclaimed = m->written;
     if (m->v >= c->launches_from) c->landed = m->launched;
-    c->first = (c->first + 1) & (c->entries - 1);
+    c->first = (c->first + 1) & (d->slots - 1);
     c->count--;
   }
 }
@@ -217,7 +218,7 @@ static size_t words_of(const struct rig_part *p) {
 /* Whether [p]'s parts, whose launches' blocks lie in [args], are ones the
    device runs. */
 static int runs(const struct rig_part *p, int n, const uint8_t *args) {
-  if (n < 0 || n > MAX_PARTS) return 0;
+  if (n < 0) return 0;
   for (int i = 0; i < n; i++) {
     const struct rig_part *x = &p[i];
     if (x->queue != COMPUTE && x->queue != COPY) return 0;
@@ -318,17 +319,6 @@ static uint64_t segment_closes(uint64_t bytes) {
   return bytes / (SEGMENT_BYTES_MAX / 2);
 }
 
-/* The most a submission may take: fewer entries than a channel's ring
-   holds, its segment ring, and the launch ring. */
-static struct cost room_of(const struct device *d) {
-  struct cost k = {.launched = d->ch[COMPUTE].launches_size};
-  for (int q = 0; q < CHANNELS; q++) {
-    k.entries[q] = d->ch[q].entries - 1;
-    k.bytes[q] = d->ch[q].size;
-  }
-  return k;
-}
-
 /* What [p], routed by [routes], takes, with the most a wrap past the launch
    ring's end wastes: the largest of its launches' descriptors and banks. */
 static struct cost need(const struct device *d, const struct route *routes,
@@ -369,44 +359,6 @@ static struct cost need(const struct device *d, const struct route *routes,
     k.entries[q] += segment_closes(k.bytes[q]);
   if (k.launched > 0) k.launched += wasted;
   return k;
-}
-
-/* The most whole parts of [per] units of room after [fixed] fit in [room],
-   capped at [n]. */
-static uint64_t least(uint64_t n, uint64_t room, uint64_t fixed,
-                      uint64_t per) {
-  if (room < fixed) return 0;
-  uint64_t m = (room - fixed) / per;
-  return m < n ? m : n;
-}
-
-static uint64_t larger(uint64_t a, uint64_t b) { return a > b ? a : b; }
-
-/* The most parts an idle device runs in one submission, each of the largest
-   size the guarantee covers, by [need]'s costs: a launch, whose descriptor
-   and constant bank take no ring entry and lie in the launch ring, which
-   grows to hold them, or a copy of one COPY_MAX piece, each joined to the
-   part before it on its queue and to one of the other queue. Both channels
-   are used, and either may release the value. The segment ring grows to
-   hold them too, so the ring's entries bound them, through the closes of
-   their segments, and a join tag's index. */
-int rig_nv_most_parts(const struct device *d) {
-  struct cost room = room_of(d), fixed = {0}, launch = {0}, copy = {0};
-  uint64_t release = larger(end_bytes(d, COMPUTE), end_bytes(d, COPY));
-  uint64_t qmd = STRUCTURE_BYTES + QMD_ALIGN - 1;
-  for (int q = 0; q < CHANNELS; q++) {
-    channel_cost(d, q, &fixed);
-    fixed.bytes[q] += release;
-  }
-  part_cost(d, COMPUTE, 0, 2, qmd, 0, 0, &launch);
-  part_cost(d, COPY, 0, 2, 0, 0, 1, &copy);
-  uint64_t n = MAX_PARTS;
-  for (int q = 0; q < CHANNELS; q++) {
-    uint64_t closes = room.entries[q] - fixed.entries[q];
-    n = least(n, closes * (SEGMENT_BYTES_MAX / 2), fixed.bytes[q],
-              larger(launch.bytes[q], copy.bytes[q]));
-  }
-  return (int)n;
 }
 
 /* Adds [r] to [d]'s retired rings, which work after [until] never uses. */
@@ -458,16 +410,71 @@ static int holds(const struct device *d, const struct cost *k) {
   return k->launched <= d->ch[COMPUTE].launches_size;
 }
 
+/* Whether channels whose rings hold [compute] and [copy] entries hold the
+   entries [k] takes, besides the work on them: a ring of [n] entries holds
+   n - 1, since its put and get positions are equal only when it is empty. */
+static int enters(uint64_t compute, uint64_t copy, const struct cost *k) {
+  return k->entries[COMPUTE] < compute && k->entries[COPY] < copy;
+}
+
+static int entered(const struct device *d, const struct cost *k) {
+  return enters(d->ch[COMPUTE].entries, d->ch[COPY].entries, k);
+}
+
+/* Installs the channels a growth made, while [d] drains or if their rings
+   hold the entries [k] takes, once [d] reached every value submitted:
+   RIG_FITS once installed, RIG_LATER until [d] reached them, and RIG_GROW
+   if no channels a growth made hold them. Until then [d] drains: every
+   room answers RIG_LATER, so that the device's work ends even while other
+   threads submit. The channels installed before then hold no work, and the
+   next submission on each new one places its setup words and, on COMPUTE,
+   its local memory, which belong to a channel's context. */
+static int switch_channels(struct device *d, const struct cost *k) {
+  pthread_mutex_lock(&d->channels_mu);
+  const struct channels *g = d->grown_channels;
+  int r = RIG_GROW;
+  if (g != NULL &&
+      (d->draining ||
+       enters(g->ch[COMPUTE].entries, g->ch[COPY].entries, k))) {
+    uint64_t seen = atomic_load_explicit(d->word, memory_order_acquire);
+    r = seen == atomic_load_explicit(&d->last, memory_order_relaxed)
+            ? RIG_FITS
+            : RIG_LATER;
+    d->draining = r == RIG_LATER;
+    for (int q = 0; r == RIG_FITS && q < CHANNELS; q++) {
+      struct channel *c = &d->ch[q];
+      reclaim(d, c, seen);
+      c->ring = g->ch[q].ring;
+      c->entries = g->ch[q].entries;
+      c->gp_put = g->ch[q].gp_put;
+      c->token = g->ch[q].token;
+      c->notifier = g->ch[q].notifier;
+      c->put = c->freed = 0;
+      c->owes_setup = 1;
+    }
+    if (r == RIG_FITS) {
+      d->ch[COMPUTE].owes_local = 1;
+      d->installed = g->id;
+      d->grown_channels = NULL;
+    }
+  }
+  pthread_mutex_unlock(&d->channels_mu);
+  return r;
+}
+
 _Thread_local struct asked rig_nv_asked;
 
 /* Records, for the growth rig asks next on this thread, the bytes each of
-   [d]'s rings lacks to hold [k]. Each submission's growth makes what it
-   needs, so another's growth, larger or short of memory, never stands in
-   for it. */
+   [d]'s rings lacks to hold [k], and the entries each channel's ring lacks.
+   Each submission's growth makes what it needs, so another's growth,
+   larger or short of memory, never stands in for it. */
 static void ask(const struct device *d, const struct cost *k) {
   rig_nv_asked.d = d;
-  for (int q = 0; q < CHANNELS; q++)
-    rig_nv_asked.bytes[q] = k->bytes[q] > d->ch[q].size ? k->bytes[q] : 0;
+  for (int q = 0; q < CHANNELS; q++) {
+    const struct channel *c = &d->ch[q];
+    rig_nv_asked.bytes[q] = k->bytes[q] > c->size ? k->bytes[q] : 0;
+    rig_nv_asked.entries[q] = k->entries[q] < c->entries ? 0 : k->entries[q];
+  }
   rig_nv_asked.bytes[CHANNELS] =
       k->launched > d->ch[COMPUTE].launches_size ? k->launched : 0;
 }
@@ -477,19 +484,26 @@ int rig_nv_room(void *self, const struct rig_part *p, int n,
   struct device *d = ((struct rig_nv_edge *)self)->d;
   if (!runs(p, n, args)) return RIG_NEVER;
   route(d, scratch, p, n);
-  struct cost k = need(d, scratch, p, n), room = room_of(d);
-  for (int q = 0; q < CHANNELS; q++)
-    if (k.entries[q] > room.entries[q]) return RIG_NEVER;
+  struct cost k = need(d, scratch, p, n);
+  if (!enters(ENTRIES_MAX, ENTRIES_MAX, &k)) return RIG_NEVER;
   if (!holds(d, &k)) install(d);
-  if (!holds(d, &k)) {
+  if ((d->draining || !entered(d, &k)) &&
+      switch_channels(d, &k) == RIG_LATER)
+    return RIG_LATER;
+  if (!holds(d, &k) || !entered(d, &k)) {
     ask(d, &k);
     return RIG_GROW;
   }
   const struct channel *compute = &d->ch[COMPUTE];
   uint64_t seen = atomic_load_explicit(d->word, memory_order_acquire);
+  /* Each value in flight holds a slot of the stamp ring and a mark of each
+     channel it uses. */
+  if (atomic_load_explicit(&d->last, memory_order_relaxed) + 1 - seen >
+      d->slots)
+    return RIG_LATER;
   for (int q = 0; q < CHANNELS; q++) {
     struct channel *c = &d->ch[q];
-    reclaim(c, seen);
+    reclaim(d, c, seen);
     if (c->entries - 1 - (c->put - c->freed) < k.entries[q] ||
         c->size - (c->written - c->reclaimed) < k.bytes[q])
       return RIG_LATER;
@@ -514,6 +528,7 @@ struct pending {
 struct submission {
   struct device *d;
   const struct route *routes; /* its parts' */
+  uint64_t joins[CHANNELS];   /* each channel's last join before it */
   uint64_t v;
   const struct rig_wait *waits;
   int nwaits;
@@ -693,14 +708,25 @@ static void enter(struct submission *s, int q) {
      load takes a pending one too: the newer, if it replaced it. */
   uint64_t local = atomic_load_explicit(&d->local, memory_order_acquire);
   if (local != 0 && !(local & LOCAL_TAKEN)) {
-    local = atomic_exchange(&d->local, s->v << 1 | LOCAL_TAKEN);
+    d->placed_local = atomic_exchange(&d->local, s->v << 1 | LOCAL_TAKEN);
+    c->owes_local = 1;
+  }
+  if (c->owes_local && d->placed_local != 0) {
+    local = d->placed_local;
     uint64_t page = (local >> 1) & ((UINT64_C(1) << LOCAL_PAGE_BITS) - 1);
     uint64_t address = page << LOCAL_PAGE_SHIFT;
     uint64_t per_tpc = (local >> (1 + LOCAL_PAGE_BITS)) << LOCAL_UNIT_SHIFT;
     emit(d, c, T_LOCAL, address, per_tpc, 0);
   }
+  c->owes_local = 0;
   if (atomic_exchange(&d->invalidate, 0))
     emit(d, c, T_INVALIDATE, 0, 0, 0);
+}
+
+/* The join number that part [a], placed, signalled on its channel. */
+static uint64_t joined(const struct submission *s, int a) {
+  const struct route *x = &s->routes[a];
+  return s->joins[x->channel] + x->signal;
 }
 
 /* Places the waits of part [i] for the parts on the other channel it runs
@@ -712,11 +738,11 @@ static int join(struct submission *s, const struct rig_part *p, int i) {
   struct channel *c = &d->ch[x->channel];
   uint64_t at = JOIN_GPU(d, other(x->channel));
   int waits = x->join >= 0;
-  if (waits) emit(d, c, T_ACQUIRE, at, tag(s->v, x->join), 0);
+  if (waits) emit(d, c, T_ACQUIRE, at, joined(s, x->join), 0);
   for (int j = 0; j < p[i].nafter; j++) {
     int a = p[i].after[j];
     if (s->routes[a].channel == x->channel) continue;
-    emit(d, c, T_ACQUIRE, at, tag(s->v, a), 0);
+    emit(d, c, T_ACQUIRE, at, joined(s, a), 0);
     waits = 1;
   }
   return waits;
@@ -862,6 +888,7 @@ int rig_nv_submit(void *self, uint64_t v, const struct rig_wait *waits,
   struct route *routes = scratch;
   struct submission s = {.d = d,
                          .routes = routes,
+                         .joins = {d->ch[COMPUTE].joins, d->ch[COPY].joins},
                          .v = v,
                          .waits = waits,
                          .nwaits = nwaits,
@@ -870,6 +897,7 @@ int rig_nv_submit(void *self, uint64_t v, const struct rig_wait *waits,
   int r = releaser(routes, n, v);
   int last[CHANNELS] = {-1, -1};
   for (int i = 0; i < n; i++) last[routes[i].channel] = i;
+  uint32_t signalled[CHANNELS] = {0, 0};
   uint64_t start = compute->launched;
   for (int i = 0; i < n; i++) {
     const struct route *x = &routes[i];
@@ -886,8 +914,10 @@ int rig_nv_submit(void *self, uint64_t v, const struct rig_wait *waits,
       place(d, &d->ch[q], &p[i]);
     }
     if (q == COMPUTE) s.running = 1;
-    if (x->awaited || (i == last[q] && q != r)) {
-      signal_word(d, q, JOIN_GPU(d, q), tag(v, i));
+    int signal = x->awaited || (i == last[q] && q != r);
+    routes[i].signal = signal ? ++signalled[q] : 0;
+    if (signal) {
+      signal_word(d, q, JOIN_GPU(d, q), joined(&s, i));
       if (q == COMPUTE) {
         settle(compute, &s.open, 0);
         s.running = 0;
@@ -898,7 +928,7 @@ int rig_nv_submit(void *self, uint64_t v, const struct rig_wait *waits,
   enter(&s, r);
   int o = other(r);
   if (s.used[o])
-    emit(d, &d->ch[r], T_ACQUIRE, JOIN_GPU(d, o), tag(v, last[o]), 0);
+    emit(d, &d->ch[r], T_ACQUIRE, JOIN_GPU(d, o), joined(&s, last[o]), 0);
   if (s.timed != NULL)
     stamp(d, r, records(d, s.timed) + offsetof(struct stamps, end), v);
   signal_word(d, r, d->word_gpu, v);
@@ -906,8 +936,9 @@ int rig_nv_submit(void *self, uint64_t v, const struct rig_wait *waits,
   for (int q = 0; q < CHANNELS; q++) {
     if (!s.used[q]) continue;
     struct channel *c = &d->ch[q];
+    c->joins += signalled[q];
     close_segment(d, c);
-    c->marks[(c->first + c->count++) & (c->entries - 1)] =
+    c->marks[(c->first + c->count++) & (d->slots - 1)] =
         (struct mark){v, c->put, c->written, c->launched};
   }
   store_fence();

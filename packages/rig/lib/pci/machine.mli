@@ -23,11 +23,6 @@
     ["DDDD:BB:DD.F"], its domain, bus, device and function numbers in lowercase
     hexadecimal, the domain in at least four digits. *)
 
-val address : domain:int -> bus:int -> device:int -> fn:int -> string
-(** [address ~domain ~bus ~device ~fn] is the bus address of function [fn] of
-    device [device] on bus [bus] of domain [domain], such as ["0000:03:00.0"].
-*)
-
 val compare_address : string -> string -> int
 (** [compare_address a b] orders bus addresses in bus order: by domain, then
     bus, device and function, each as a number.
@@ -40,21 +35,7 @@ type t
 (** The type for machines. *)
 
 val this : t
-(** [this] is the machine this process runs on, [at "/"]. *)
-
-val at : string -> t
-(** [at root] is this machine as the directory [root] shows it. Its functions
-    are read under [root/sys/bus/pci], its IOMMU groups under
-    [root/sys/kernel/iommu_groups], its lockdown state at
-    [root/sys/kernel/security/lockdown], its VFIO files under [root/dev/vfio],
-    and the memory of functions taken physically under [root/dev/hugepages],
-    [root/proc/self/mounts] and [root/proc/self/pagemap]. {!Gpus.detach} also
-    reads its processes under [root/proc] and its DRM clients under
-    [root/sys/kernel/debug/dri]. A root that shows no PCI functions makes a
-    machine with none.
-
-    Each call makes another machine. Two machines at one root share no holds
-    ({!Gpus}), and the kernel still refuses a second take of one function. *)
+(** [this] is the machine this process runs on. *)
 
 val name : t -> string option
 (** [name m] is the name of [m] as its transport gives it, such as
@@ -78,12 +59,15 @@ type id = Ops.id = {
 }
 (** The type for the identity of a function. *)
 
-val functions : t -> id list
+val functions : t -> (id list, string) result
 (** [functions m] is the PCI functions of [m], in bus order
     ({!compare_address}). Listing them changes nothing on [m]. For a machine
-    without a transport it is [[]] where the system has no [/sys/bus/pci] or
-    its functions cannot be listed, and a function whose files cannot be read,
-    as while the kernel removes it, is left out. *)
+    without a transport it is [Ok []] where the system has no
+    [/sys/bus/pci], and a function whose files cannot be read, as while the
+    kernel removes it, is left out.
+
+    [Error why] if the functions cannot be listed, such as when the process
+    has no file left or the transport has failed. *)
 
 val reserve : t -> base:int -> int -> (unit, string) result
 (** [reserve m ~base n] reserves the [n] addresses from [base] on, in the
@@ -100,8 +84,8 @@ val reserve : t -> base:int -> int -> (unit, string) result
     from the operations below. A transport runs each operation on the other
     machine as the same operation of {!this} runs here. A request it cannot run
     returns [Error why], with [why] starting with the machine's name, and so
-    does the reason its transport failed ({!failed}). Once the transport has
-    failed, its accesses read all ones, drop writes, and raise nothing.
+    does the reason its transport failed ({!failed}). {!Window} states what
+    accesses give once the transport has failed.
 
     {!Function} refuses misuse before it calls an operation, and counts the
     windows and pins of each function. An operation is called only with
@@ -166,7 +150,8 @@ type ops = Ops.ops = {
       (** The C accesses to the machine's addresses. The machine's windows use
           them, and their [failed] function is {!failed}'s. *)
   page : int;  (** {!val-page}. *)
-  functions : unit -> id list;  (** {!val-functions}, in any order. *)
+  functions : unit -> (id list, string) result;
+      (** {!val-functions}, in any order. *)
   take : string -> (fn, string) result;  (** {!Function.take} on the machine. *)
   reserve : base:int -> int -> (unit, string) result;  (** {!val-reserve}. *)
 }
@@ -177,12 +162,31 @@ val make : name:string -> ops -> t
 
 (**/**)
 
+(* [address ~domain ~bus ~device ~fn] is the bus address of function [fn] of
+   device [device] on bus [bus] of domain [domain], such as ["0000:03:00.0"]. *)
+val address : domain:int -> bus:int -> device:int -> fn:int -> string
+
+(* [at root] is this machine as the directory [root] shows it, {!this} being
+   [at "/"]. Its functions are read under [root/sys/bus/pci], its IOMMU groups
+   under [root/sys/kernel/iommu_groups], its lockdown state at
+   [root/sys/kernel/security/lockdown], its VFIO files under [root/dev/vfio],
+   and the memory of functions taken physically under [root/dev/hugepages],
+   [root/proc/self/mounts] and [root/proc/self/pagemap]. {!Driver.detach} also
+   reads its processes under [root/proc] and its DRM clients under
+   [root/sys/kernel/debug/dri]. A root that shows no PCI functions makes a
+   machine with none.
+
+   Each call makes another machine. Two machines at one root share no holds
+   ({!Driver}), and the kernel still refuses a second take of one function. *)
+val at : string -> t
+
 val window : t -> int -> int -> Window.t
 (** [window m a n] is the [n] bytes at address [a] on [m], reached through [m]'s
     transport. It neither maps nor keeps the memory; the caller keeps it valid.
     Raises [Invalid_argument] if [n < 0]. *)
 
-(* [take m bus] is [m]'s take: {!Function.take} builds on it. *)
+(* [take m bus] is [m]'s take of the function at [bus], or [Error] if [bus]
+   is not a bus address: {!Function.take} builds on it. *)
 val take : t -> string -> (fn, string) result
 
 (* [take_locked m l] is [m]'s take of the function [l] locks, under [l]:
@@ -195,16 +199,12 @@ val take_locked : t -> 's Sysfs.lock -> (fn, string) result
 val reserved : t -> int -> int -> bool
 
 (* [files m] is the files of [m] if the process reaches [m] without a transport:
-   {!this}'s, or those of a machine {!at} made. {!Gpus} reads them, to lock a
-   GPU's function across its checks, its take and its changes to kernel
-   drivers, and {!Memory} the way up the bus from a GPU. *)
+   {!this}'s, or those of a machine {!at} made. {!Driver} reads them, to lock a
+   function across its checks, its take and its changes to kernel drivers, and
+   {!Memory} the way up the bus from a GPU. *)
 val files : t -> Sysfs.t option
 
-(* [wait m ~us f] calls [f], at least once, until it is [true], [m] failed, or
-   at least [us] microseconds passed on a monotonic clock. It is [true] iff [f]
-   became [true] while [m] had not failed: [m]'s state is read after each call
-   of [f], so an answer computed from the all ones of a failed machine is not
-   trusted. For its first millisecond it calls [f] back to back, relaxing the
-   processor; then it sleeps 0.1 ms between calls, so that a long wait holds no
-   core. {!Function.wait} builds on it. *)
+(* [wait m ~us f] is the loop of {!Function.wait} on [m], which builds on it:
+   it calls [f] until it is [true], [m] failed, or at least [us] microseconds
+   passed, and is [true] iff [f] became [true] while [m] had not failed. *)
 val wait : t -> us:int -> (unit -> bool) -> bool

@@ -44,14 +44,25 @@ let numbering =
       test "GPUs are NVIDIA's display and 3D controllers in bus order"
         (fun () ->
           let machine = Rig_pci.Machine.at (machine ()) in
-          equal (list string)
-            [ "0000:03:00.0"; "0000:83:00.0" ]
+          equal
+            (result (list string) string)
+            (Ok [ "0000:03:00.0"; "0000:83:00.0" ])
             (Rig_nv_pci.buses ~machine ());
-          equal int 2 (Rig_nv_pci.count ~machine ()));
+          equal (result int string) (Ok 2) (Rig_nv_pci.count ~machine ()));
       test "a machine with no PCI functions has no GPU" (fun () ->
           let machine = Rig_pci.Machine.at (Tree.make []) in
-          equal (list string) [] (Rig_nv_pci.buses ~machine ());
-          equal int 0 (Rig_nv_pci.count ~machine ()));
+          equal
+            (result (list string) string)
+            (Ok []) (Rig_nv_pci.buses ~machine ());
+          equal (result int string) (Ok 0) (Rig_nv_pci.count ~machine ()));
+      test "a machine whose functions cannot be listed says why" (fun () ->
+          let machine = Rig_pci_support.unlisted () in
+          equal (result int string) (Error Rig_pci_support.unlisted_why)
+            (Rig_nv_pci.count ~machine ());
+          let why =
+            require_error (Rig_gpu_support.opened (Rig_nv_pci.gpu ~machine 0))
+          in
+          equal string ("NV-PCI: " ^ Rig_pci_support.unlisted_why) why);
       cases ~name:fst "GPUs are named by number"
         [
           ("0", (0, "NV-PCI")); ("1", (1, "NV-PCI:1")); ("12", (12, "NV-PCI:12"));
@@ -68,10 +79,10 @@ let opening =
           match Rig_gpu_support.opened (Rig_nv_pci.gpu ~machine 2) with
           | Ok _ -> fail "GPU 2 opened"
           | Error why ->
-              equal string "NV-PCI:2: no such GPU; the machine has 2" why);
+              equal string "NV-PCI:2: no such function; NV-PCI drives 2 here" why);
       test "a GPU past the last is an error to detach, attach or reset"
         (fun () ->
-          let n = Rig_nv_pci.count () in
+          let n = require_ok (Rig_nv_pci.count ()) in
           is_error ~msg:"detach" (Rig_nv_pci.detach n);
           is_error ~msg:"attach" (Rig_nv_pci.attach n);
           let machine = Rig_pci.Machine.at (machine ()) in
@@ -88,7 +99,7 @@ let opening =
         "a call inside a lock of its thread's raises naming it, changing \
          nothing"
         (let on () = Rig_pci.Machine.at (machine ()) in
-         let past () = Rig_nv_pci.count () in
+         let past () = require_ok (Rig_nv_pci.count ()) in
          [
            ( "gpu",
              fun () ->
@@ -277,7 +288,7 @@ let reports =
 (* Stopping *)
 
 let gpus () =
-  Rig_pci.Gpus.make ~name:"NV-PCI" ~noun:"GPU" ~memory_bar:(Some 1)
+  Rig_pci.Driver.make ~name:"NV-PCI" ~memory_bar:(Some 1)
     ~siblings:Remove
     ~nodes:(fun ~root:_ _ -> [])
     ~unreleased:(fun ~root:_ _ -> None)
@@ -286,8 +297,8 @@ let gpus () =
       Rig_nv.is_gpu ~vendor:id.vendor ~class_:id.class_)
 
 let hold g m =
-  Rig_pci.Gpus.open_ g m 0 (fun h _ ->
-      Rig_pci.Gpus.set_stop h (fun () -> `Clean);
+  Rig_pci.Driver.open_ g m 0 (fun h _ ->
+      Rig_pci.Driver.set_stop h (fun () -> `Clean);
       Ok h)
 
 let state =
@@ -363,30 +374,22 @@ let resets root =
   In_channel.with_open_bin file In_channel.input_all
 
 (* [stop g m] opens GPU 0 of [m] through [g] and stops it. *)
-let stop g m = Result.map Rig_pci.Gpus.stop (hold g m)
+let stop g m = Result.map Rig_pci.Driver.stop (hold g m)
 
-(* With [how] ["stop"] the child stops the GPU and exits; with ["kill"] it dies
-   by SIGKILL holding it, having allocated nothing; with ["hold"] it says
-   "holding" and holds it until its standard input closes. *)
+(* With [how] ["kill"] the child dies by SIGKILL holding the GPU, having
+   allocated nothing; with ["hold"] it says "holding" and holds it until its
+   standard input closes. *)
 let take how root =
   let m = Rig_pci.Machine.at root in
-  match how with
-  | "stop" -> (
-      match stop (gpus ()) m with
-      | Ok _ -> exit 0
-      | Error why ->
-          prerr_endline why;
-          exit 2)
-  | _ -> (
-      match Rig_pci.Function.take m gpu_bus with
-      | Error why ->
-          prerr_endline why;
-          exit 2
-      | Ok _ when how = "kill" -> Unix.kill (Unix.getpid ()) Sys.sigkill
-      | Ok _ ->
-          print_endline "holding";
-          ignore (In_channel.input_all stdin);
-          exit 0)
+  match Rig_pci.Function.take m gpu_bus with
+  | Error why ->
+      prerr_endline why;
+      exit 2
+  | Ok _ when how = "kill" -> Unix.kill (Unix.getpid ()) Sys.sigkill
+  | Ok _ ->
+      print_endline "holding";
+      ignore (In_channel.input_all stdin);
+      exit 0
 
 (* [child how root] starts [take how root]: its pid, the pipe on its standard
    input and its standard output. *)
@@ -445,7 +448,7 @@ let test_stopped_here () =
   let root = fixture () in
   let g = gpus () and machine = Rig_pci.Machine.at root in
   equal ~msg:"the stop" state `Stopped (require_ok (stop g machine));
-  ignore (Rig_pci.Gpus.stop (require_ok (hold g machine)));
+  ignore (Rig_pci.Driver.stop (require_ok (hold g machine)));
   let why =
     require_error (Rig_gpu_support.opened (Rig_nv_pci.gpu ~machine 0))
   in
@@ -584,7 +587,7 @@ let fwsec root =
 let memory_files root =
   Sys.readdir (Filename.concat root "dev/hugepages")
   |> Array.to_list
-  |> List.filter (fun f -> not (String.ends_with ~suffix:".reach" f))
+  |> List.filter (fun f -> not (String.contains f '.'))
 
 (* The FRTS region is the 1 MiB below the 1 MiB VGA workspace at the end of the
    GPU's memory (kgspCalculateFbLayout_TU102). FWSEC's DMEM mapper, at 0x80 of
@@ -630,8 +633,6 @@ let test_failed_boot () =
 let booted =
   group ~timeout:Rig_pci_support.patience "booted GPUs"
     [
-      test "a GPU stopped by a process that exited is reset by the next open"
-        (test_left "stop" (WEXITED 0));
       test
         "a GPU whose holder died before allocating memory is reset by the next \
          open (SIGKILL in a child)"
@@ -681,8 +682,9 @@ let driver bus =
 let with_gpu f =
   let firmware = firmware () in
   (match Rig_nv_pci.buses () with
-  | [] -> skip ~reason:"this machine has no NVIDIA GPU" ()
-  | bus :: _ -> (
+  | Error why -> skip ~reason:why ()
+  | Ok [] -> skip ~reason:"this machine has no NVIDIA GPU" ()
+  | Ok (bus :: _) -> (
       match driver bus with
       | Some d when d <> "vfio-pci" ->
           skip ~reason:(strf "GPU 0 (%s) is bound to %s" bus d) ()

@@ -105,6 +105,14 @@ val log : int -> (bool * int * int) list
 (** [log far] is [far]'s accesses since the last call, oldest first, as
     [(write, address, bytes)]. *)
 
+val unlisted_why : string
+(** [unlisted_why] is ["far: the link broke"]. *)
+
+val unlisted : unit -> Rig_pci.Machine.t
+(** [unlisted ()] is a machine reached through a broken far machine, whose
+    listing of its functions answers [Error unlisted_why], as a transport
+    that failed does. Its take and reserve fail the test. *)
+
 (** {1:tables Page tables in a fake format} *)
 
 (** Page tables in a fake format, in a fake GPU memory that keeps their entries
@@ -274,6 +282,12 @@ module Tree : sig
   (** [flocked_fd fd] is {!flocked} of the file [fd] is open on, asked
       through [fd], which must hold no lock of the file: it makes no open, so
       a check repeated after every call costs two system calls. *)
+
+  val hold : string -> Unix.file_descr
+  (** [hold path] takes flock's exclusive lock on the file or directory at
+      [path], as another process would, and is the descriptor whose close
+      gives it back. Raises [Unix.Unix_error] if [path] cannot be opened or
+      another open file holds a lock on it. *)
 
   val add : string -> string -> string -> unit
   (** [add root file s] writes [s] to [file], a path from the tree [root],

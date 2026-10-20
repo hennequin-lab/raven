@@ -481,28 +481,117 @@ let test_placed_view_owns () =
 exception Failed of int array * float * int32
 
 (* A failing check hands its failure the elements of its data at the first
-   failing index, of each datum's dtype, whatever set the data lie on. *)
+   failing index, of each datum's dtype, whatever set the data lie on: at the
+   call on the host, at the next wait on another set. *)
 let test_check_elements () =
   let x = on_host Plain D.Float32 [| 3 |] [| 1.; -1.; -2. |] in
   let check x =
-    raises (Failed ([| 1 |], -1., -1l)) (fun () ->
-        Nx.Prim.eval ~by:"test"
-          (Check
-             {
-               ok = Nx.less (Nx.zeros_like x) x;
-               data = [ x; Nx.cast D.Int32 x ];
-               fail = (fun i (v, (n, ())) -> Failed (i, v, n));
-             }))
+    Nx.Prim.eval ~by:"test"
+      (Check
+         {
+           ok = Nx.less (Nx.zeros_like x) x;
+           data = [ x; Nx.cast D.Int32 x ];
+           fail = (fun i (v, (n, ())) -> Failed (i, v, n));
+         })
   in
-  check x;
-  check (Nx.place Count2.on x);
-  check (Nx.place (Count2.split ~axis:0) x)
+  let failed = Failed ([| 1 |], -1., -1l) in
+  raises failed (fun () -> check x);
+  let off_host x =
+    check x;
+    raises failed (fun () -> Nx.sync x)
+  in
+  off_host (Nx.place Count2.on x);
+  off_host (Nx.place (Count2.split ~axis:0) x)
+
+exception One of int array * float
+
+(* A check of one element reduces nothing: its flag is read where it lies, on
+   its device or on the one of a cut placement that holds it, and the check
+   holds the flag's memory until a wait reads it, so a donation of the flag
+   computes afresh. A flag of every set is computed there first, as alone. *)
+let test_check_one () =
+  let shape = [| 1; 1 |] in
+  let check ok x =
+    Nx.Prim.eval ~by:"test"
+      (Check { ok; data = [ x ]; fail = (fun i (v, ()) -> One (i, v)) })
+  in
+  let failed = One ([| 0; 0 |], 5.) in
+  let at (type d) (p : d Nx.Placement.t) =
+    let flag b =
+      Nx.place p (Nx.Repr.of_array Nx.Host.v (A.of_array D.Bool shape [| b |]))
+    in
+    let x =
+      Nx.place p
+        (Nx.Repr.of_array Nx.Host.v (A.of_array D.Float32 shape [| 5. |]))
+    in
+    let ok = flag true and not_ok = flag false in
+    C.reset ();
+    check ok x;
+    check not_ok x;
+    equal ~msg:"kernel calls" int 0 (C.calls ());
+    raises failed (fun () -> Nx.sync x)
+  in
+  at Count.on;
+  at (Count2.split ~axis:0);
+  at (Count2.split ~axis:1);
+  let on_count dt v =
+    Nx.place Count.on (Nx.Repr.of_array Nx.Host.v (A.of_array dt shape [| v |]))
+  in
+  let x = on_count D.Float32 5. in
+  (* Computed, so the memory is the flag's alone and a donation may write it. *)
+  let ok = Nx.logical_not (on_count D.Bool true) in
+  check ok x;
+  ignore (Nx.logical_not (Nx.donate ok));
+  raises failed (fun () -> Nx.sync x);
+  let formula () = Nx.equal_s (Nx.zeros D.Float32 shape) 1. in
+  C.reset ();
+  ignore (Nx.place Count.on (formula ()));
+  let alone = C.calls () in
+  C.reset ();
+  check (formula ()) x;
+  equal ~msg:"a formula flag's kernel calls" int alone (C.calls ());
+  raises failed (fun () -> Nx.sync x)
+
+(* Counting nx.cpu, declining every scatter whose targets may repeat, as a
+   library may: nx's expansion computes those. *)
+module Unique_counting = struct
+  include C
+
+  let scatter c ~unique ~axis ~dst ~into idx u =
+    if unique then C.scatter c ~unique ~axis ~dst ~into idx u else A.Declined
+end
+
+module Unique = (val Nx.devices ~kernels:(module Unique_counting) [ m 0 ])
+
+(* A declined scatter whose targets may repeat is a loop of one unique scatter
+   per position, which reads that position's indices and updates as views:
+   each position adds one kernel call, two for a narrow float's sum, which
+   runs two loops in its accumulator. *)
+let test_repeat_kernels () =
+  let calls dt m =
+    let idx = Nx.place Unique.on (Nx.zeros Nx.int64 [| m |]) in
+    let updates = Nx.place Unique.on (Nx.ones dt [| m |]) in
+    let into = Nx.place Unique.on (Nx.zeros dt [| 1 |]) in
+    C.reset ();
+    let y = Nx.scatter ~combine:Nx.Add ~axis:0 idx updates into in
+    let n = C.calls () in
+    equal ~msg:"the sum" (array float_exact) [| Float.of_int m |]
+      (elements (Nx.cast D.Float64 y));
+    n
+  in
+  equal ~msg:"float32, per position" int 1
+    (calls D.Float32 4 - calls D.Float32 3);
+  equal ~msg:"float16, per position" int 2
+    (calls D.Float16 4 - calls D.Float16 3)
 
 let sets =
   group "sets"
     [
       test "a check's failure receives its data's elements"
         test_check_elements;
+      test "a check of one element reduces nothing" test_check_one;
+      test "a repeating scatter's position costs one scatter a loop"
+        test_repeat_kernels;
       test "zeros_like reads none of its argument's elements"
         test_zeros_like_reads_nothing;
       test "every function takes a value of every set" test_every_set;

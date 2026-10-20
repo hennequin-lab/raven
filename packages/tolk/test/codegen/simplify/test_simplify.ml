@@ -235,6 +235,48 @@ let splitting =
 
 (* Reductions *)
 
+(* Reductions of a parameter over a range it ignores, whose size is a variable
+   from 0 to a bound, as a symbolic shape's is: each operation, value and
+   bound. *)
+let reductions_by_size =
+  List.concat_map
+    (fun rop ->
+      List.concat_map
+        (fun x -> List.map (fun hi -> (rop, x, hi)) [ 1; 2; 4 ])
+        [ Float.infinity; Float.neg_infinity; Float.nan; 1.5; 0. ])
+    [ Op.Add; Op.Mul; Op.Max ]
+
+let pp_reduction (rop, x, hi) =
+  Format.asprintf "%a of %g below n <= %d" Op.pp rop x hi
+
+(* The reduction is evaluated at every size up to its bound, 0 included. A
+   maximum of NaN may be NaN or the identity (Tolk.Op.Reduce), so both the
+   reduction and its rewrite are one of the two; every other value is one. *)
+let reduces_by_size (rop, x, hi) =
+  let n = var "n" 0 hi and value = Call.param 0 Float32 in
+  let r = Ops.range ~axis_type:Reduce (Sym n) [ 0 ] in
+  let u = Ops.reduce value rop [ r ] in
+  let at size u =
+    let vars = [ ("n", i size) ] and params = [ (0, `Float x) ] in
+    match Interpreter.eval ~vars ~params u with
+    | `Float f -> `Float (f +. 0.)
+    | v -> v
+  in
+  let either = function
+    | `Float f -> Float.is_nan f || f = Float.neg_infinity
+    | _ -> false
+  in
+  List.iter
+    (fun size ->
+      let msg = Printf.sprintf "at n = %d" size in
+      if rop = Op.Max && Float.is_nan x && size > 0 then
+        satisfies ~msg ~claim:"NaN or the identity"
+          (pair Dtypes.const Dtypes.const)
+          (fun (a, b) -> either a && either b)
+          (at size u, at size (unparent u))
+      else equal ~msg Dtypes.const (at size u) (at size (unparent u)))
+    (List.init (hi + 1) Fun.id)
+
 let unparented =
   let r0 = reduce_range 4 0 and r1 = reduce_range 5 1 in
   let x = Ops.cast r0 Float32 in
@@ -273,6 +315,9 @@ let unparented =
                    ~src:[ x; Ops.O.(r0 + Ops.int 1) ]
                    ~arg:(Reduce { op = Add; num_axes = 0 })
                    Reduce)));
+      cases ~name:pp_reduction
+        "a reduction keeps its value over a range that may run no time"
+        reductions_by_size reduces_by_size;
     ]
 
 (* [sums_to v u] is the claim that [u] has no range left and is worth [v]. *)

@@ -826,27 +826,36 @@ let test_contiguous () =
 
    A function taken physically keeps writing memory after its process dies: its
    memory lies in huge pages of files under the machine's [dev/hugepages], which
-   keep their pages until no function reaches them. *)
+   keep their pages until no function reaches them. Each function that reaches a
+   file is named by an empty file beside it, [<file>.reach-<bus>]. *)
 
 let memory_files root =
   Sys.readdir (Filename.concat root "dev/hugepages")
   |> Array.to_list
   |> List.filter (fun f ->
-      String.starts_with ~prefix:"rig-pci-" f
-      && not (String.ends_with ~suffix:".reach" f))
+      String.starts_with ~prefix:"rig-pci-" f && not (String.contains f '.'))
 
 let memory_file root =
   match memory_files root with
   | [ f ] -> Filename.concat root ("dev/hugepages/" ^ f)
   | fs -> failf "%d memory files" (List.length fs)
 
-(* Every entry of the machine's [dev/hugepages]: files and their lists. *)
+(* Every entry of the machine's [dev/hugepages]: files and their markers. *)
 let hugepages root =
   Sys.readdir (Filename.concat root "dev/hugepages")
   |> Array.to_list |> List.sort compare
 
+(* The buses the markers of [file] name. *)
 let reachers file =
-  In_channel.with_open_bin (file ^ ".reach") In_channel.input_all
+  let marker = Filename.basename file ^ ".reach-" in
+  Sys.readdir (Filename.dirname file)
+  |> Array.to_list
+  |> List.filter_map (fun f ->
+      if String.starts_with ~prefix:marker f then
+        Some (String.sub f (String.length marker)
+                (String.length f - String.length marker))
+      else None)
+  |> List.sort compare
 
 let reserved f =
   granted (Machine.reserve (Function.machine f) ~base:free_base (8 * mib))
@@ -863,8 +872,7 @@ let test_memory_file () =
   equal ~msg:"a file of its own" int 1 (List.length (memory_files root));
   let file = memory_file root in
   equal ~msg:"locked by its process" bool true (Tree.flocked file);
-  equal ~msg:"listing the function" string
-    (Function.bus f ^ "\n")
+  equal ~msg:"listing the function" (list string) [ Function.bus f ]
     (reachers file);
   Function.free_dma f w;
   equal ~msg:"kept while the function is held" int 1
@@ -960,7 +968,7 @@ let test_memory_machines () =
   Function.free_dma f w
 
 let fixture_gpus ?(reset = fun _ -> Ok ()) () =
-  Gpus.make ~name:"fixture" ~noun:"GPU" ~memory_bar:(Some 0) ~siblings:Remove
+  Driver.make ~name:"fixture" ~memory_bar:(Some 0) ~siblings:Remove
     ~nodes:(fun ~root:_ _ -> [])
     ~unreleased:(fun ~root:_ _ -> None)
     ~teardown_ms:0 ~reset
@@ -987,11 +995,11 @@ let hold_memory how root bus va =
     (* Opens the GPU, allocates its memory, renews it, and dies. *)
     let g = fixture_gpus () in
     ignore
-      (Gpus.open_ g (Machine.at root) 0 (fun h f ->
+      (Driver.open_ g (Machine.at root) 0 (fun h f ->
            ok (Machine.reserve (Function.machine f) ~base:free_base (8 * mib));
            if Option.is_none (ok (Function.alloc_dma ~va f mib)) then
              exit refused_code;
-           ok (Gpus.renew h);
+           ok (Driver.renew h);
            Unix.kill (Unix.getpid ()) Sys.sigkill;
            Ok ()))
   end;
@@ -1069,18 +1077,15 @@ let counted_gpus n =
 
 (* [kept h] gives [h] a clean stop and keeps it. *)
 let kept h =
-  Gpus.set_stop h (fun () -> `Clean);
+  Driver.set_stop h (fun () -> `Clean);
   Ok h
 
-let open_held g m = Gpus.open_ g m 0 (fun h _ -> kept h)
-let stop h = ignore (Gpus.stop h : [ `Stopped | `Unknown ])
+let open_held g m = Driver.open_ g m 0 (fun h _ -> kept h)
+let stop h = ignore (Driver.stop h : [ `Stopped | `Unknown ])
 
 (* What a process that died left stays through another take and release, which
    does not reset the GPU, and goes once its GPU is reset. *)
-let test_death () =
-  if not flocks then skip ~reason:"locking a function's file needs flock" ();
-  let fn = Tree.gpu "0000:03:00.0" in
-  let root = Tree.make [ fn ] in
+let death root (fn : Tree.fn) =
   let va = free_base + (6 * mib) in
   ignore (frames root va mib);
   let pid, feed, said = holder "die" root fn.bus va in
@@ -1095,8 +1100,62 @@ let test_death () =
   Function.release (require_ok (Function.take m fn.bus));
   equal ~msg:"kept through a take and a release" (list string) left
     (memory_files root);
-  require_ok (Gpus.reset (fixture_gpus ()) m 0);
+  require_ok (Driver.reset (fixture_gpus ()) m 0);
   equal ~msg:"gone once the GPU is reset" (list string) [] (memory_files root)
+
+let test_death () =
+  if not flocks then skip ~reason:"locking a function's file needs flock" ();
+  let fn = Tree.gpu "0000:03:00.0" in
+  death (Tree.make [ fn ]) fn
+
+(* A directory of its own on this machine's hugetlbfs of 2 MiB pages at
+   /dev/hugepages, if it has a free page and this process may write it. A
+   hugetlbfs refuses write(2), which an ordinary file system's file accepts, so
+   only it shows that what the memory files record survives that refusal. *)
+let hugetlbfs_dir () =
+  let mounted line =
+    match String.split_on_char ' ' line with
+    | _ :: "/dev/hugepages" :: "hugetlbfs" :: options :: _ ->
+        List.mem "pagesize=2M" (String.split_on_char ',' options)
+    | _ -> false
+  in
+  let free line =
+    match String.split_on_char ':' line with
+    | [ "HugePages_Free"; n ] -> int_of_string (String.trim n) > 0
+    | _ -> false
+  in
+  let lines file = In_channel.with_open_text file In_channel.input_lines in
+  if not (on_linux && List.exists mounted (lines "/proc/self/mounts")) then None
+  else if not (List.exists free (lines "/proc/meminfo")) then None
+  else
+    let dir = strf "/dev/hugepages/rig-pci-test-%d" (Unix.getpid ()) in
+    match Unix.mkdir dir 0o700 with
+    | () -> Some dir
+    | exception Unix.Unix_error _ -> None
+
+(* As [test_death], with the machine's memory files on a real hugetlbfs. *)
+let test_death_hugetlbfs () =
+  if not flocks then skip ~reason:"locking a function's file needs flock" ();
+  match hugetlbfs_dir () with
+  | None ->
+      skip
+        ~reason:
+          "no hugetlbfs of 2 MiB pages at /dev/hugepages with a free page this \
+           process may write"
+        ()
+  | Some dir ->
+      let fn = Tree.gpu "0000:03:00.0" in
+      let root = Tree.make [ fn ] in
+      let hugepages = Filename.concat root "dev/hugepages" in
+      Unix.rmdir hugepages;
+      Unix.symlink dir hugepages;
+      let clear () =
+        Array.iter
+          (fun f -> Sys.remove (Filename.concat dir f))
+          (Sys.readdir dir);
+        Unix.rmdir dir
+      in
+      Fun.protect ~finally:clear (fun () -> death root fn)
 
 (* A reset of a GPU another process holds is refused, its memory untouched; the
    holder's exit gives the memory back. *)
@@ -1115,7 +1174,7 @@ let test_reset_held () =
   end;
   let held = memory_files root in
   equal ~msg:"the holder's memory" int 1 (List.length held);
-  ignore (require_error (Gpus.reset (fixture_gpus ()) (Machine.at root) 0));
+  ignore (require_error (Driver.reset (fixture_gpus ()) (Machine.at root) 0));
   equal ~msg:"kept while held" (list string) held (memory_files root);
   Unix.close feed;
   (match wait_exit pid with
@@ -1153,7 +1212,7 @@ let test_released_holder how () =
   ignore (frames root va mib);
   let pid, feed, said = holder how root fn.bus va in
   let reset () =
-    require_ok (Gpus.reset (fixture_gpus ()) (Machine.at root) 0)
+    require_ok (Driver.reset (fixture_gpus ()) (Machine.at root) 0)
   in
   match how with
   | "released-die" ->
@@ -1203,7 +1262,7 @@ let test_released_death () =
     fail "the holder did not hold the function"
   end;
   let file = memory_file root in
-  equal ~msg:"listing no function" string "" (reachers file);
+  equal ~msg:"listing no function" (list string) [] (reachers file);
   Function.release (require_ok (Function.take m other));
   equal ~msg:"kept through a take while its process lives" bool true
     (Sys.file_exists file);
@@ -1215,28 +1274,128 @@ let test_released_death () =
   Function.release (require_ok (Function.take m other));
   equal ~msg:"gone at the next take" (list string) [] (hugepages root)
 
-(* At a take, the files processes that died left go if they list no function:
-   one with no list, which died being made, and one with an empty list. A list
-   whose file is gone goes too. One that lists a function stays until that
-   function's GPU is reset. *)
+(* At a take, the files processes that died left go if they list no function,
+   as one that died being made lists none. A marker whose file is gone goes
+   too. One that lists a function stays until that function's GPU is reset. *)
 let test_left_files () =
   if not flocks then skip ~reason:"locking a function's file needs flock" ();
   let gpu0 = "0000:03:00.0" and gpu1 = "0000:04:00.0" in
   let root = Tree.make [ Tree.gpu gpu0; Tree.gpu gpu1 ] in
-  let add name s = Tree.add root ("dev/hugepages/" ^ name) s in
-  add "rig-pci-1-1" "";
-  add "rig-pci-2-2" "";
-  add "rig-pci-2-2.reach" "";
-  add "rig-pci-3-3" "";
-  add "rig-pci-3-3.reach" (gpu1 ^ "\n");
-  add "rig-pci-4-4.reach" (gpu1 ^ "\n");
+  let add name = Tree.add root ("dev/hugepages/" ^ name) "" in
+  add "rig-pci-1-1";
+  add "rig-pci-3-3";
+  add ("rig-pci-3-3.reach-" ^ gpu1);
+  add ("rig-pci-4-4.reach-" ^ gpu1);
   let m = Machine.at root in
   Function.release (require_ok (Function.take m gpu0));
   equal ~msg:"the file listing a function stays" (list string)
-    [ "rig-pci-3-3"; "rig-pci-3-3.reach" ]
+    [ "rig-pci-3-3"; "rig-pci-3-3.reach-" ^ gpu1 ]
     (hugepages root);
-  require_ok (Gpus.reset (fixture_gpus ()) m 1);
+  require_ok (Driver.reset (fixture_gpus ()) m 1);
   equal ~msg:"gone at its GPU's reset" (list string) [] (hugepages root)
+
+(* Memory a dead process left reaching a function is read as left while
+   another process sweeps the machine's files. The sweep holds the machine's
+   sweep lock, on the directory of the files, and the dead file's own lock while
+   it reads the file's markers; a take waits for the sweep to end. *)
+let test_left_while_swept () =
+  if not flocks then skip ~reason:"locking a function's file needs flock" ();
+  let gpu0 = "0000:03:00.0" in
+  let root = Tree.make [ Tree.gpu gpu0 ] in
+  let add name = Tree.add root ("dev/hugepages/" ^ name) "" in
+  add "rig-pci-3-3";
+  add ("rig-pci-3-3.reach-" ^ gpu0);
+  let dir = Filename.concat root "dev/hugepages" in
+  let sweep = Tree.hold dir in
+  let file = Tree.hold (Filename.concat dir "rig-pci-3-3") in
+  let taken = Atomic.make false in
+  let m = Machine.at root in
+  let taker =
+    Domain.spawn (fun () ->
+        let f = require_ok (Function.take m gpu0) in
+        Atomic.set taken true;
+        let inherited = Function.inherited f in
+        Function.release f;
+        inherited)
+  in
+  Unix.sleepf 0.05;
+  let during = Atomic.get taken in
+  Unix.close file;
+  Unix.close sweep;
+  let inherited = Domain.join taker in
+  equal ~msg:"taken while the sweep held its locks" bool false during;
+  equal ~msg:"the dead process's memory, left for the function" bool true
+    inherited
+
+(* The test's executable, run with [forking], is [fork_in_sweep]'s process: a
+   process that forks may have spawned no domain. *)
+let forking = "--fork-in-sweep"
+
+(* A child forked while a take waits for another process's sweep keeps none of
+   the take's sweeps: once that sweep ends, the take, and a take of another
+   function of the machine after it, end while the child lives. The child
+   closes its copies of the test's own locks, which stand for the other
+   process's. Exits 0 if both takes ended. *)
+let fork_in_sweep () =
+  let gpu0 = "0000:03:00.0" and gpu1 = "0000:04:00.0" in
+  let root = Tree.make [ Tree.gpu gpu0; Tree.gpu gpu1 ] in
+  let add name = Tree.add root ("dev/hugepages/" ^ name) "" in
+  add "rig-pci-3-3";
+  add ("rig-pci-3-3.reach-" ^ gpu0);
+  let dir = Filename.concat root "dev/hugepages" in
+  let sweep = Tree.hold dir in
+  let file = Tree.hold (Filename.concat dir "rig-pci-3-3") in
+  let m = Machine.at root in
+  let taken = Atomic.make 0 in
+  let takes =
+    Thread.create
+      (fun () ->
+        List.iter
+          (fun bus ->
+            Function.release (require_ok (Function.take m bus));
+            Atomic.incr taken)
+          [ gpu0; gpu1 ])
+      ()
+  in
+  Unix.sleepf 0.05;
+  let ends, end_child = Unix.pipe ~cloexec:true () in
+  let child =
+    match Unix.fork () with
+    | 0 ->
+        List.iter Unix.close [ sweep; file; end_child ];
+        ignore (Unix.read ends (Bytes.create 1) 0 1);
+        Unix._exit 0
+    | pid -> pid
+  in
+  Unix.close ends;
+  Unix.close file;
+  Unix.close sweep;
+  (* Both takes end within 5 s, or wait for the child: it ends once its pipe
+     closes. *)
+  let rec wait n =
+    if Atomic.get taken < 2 && n > 0 then begin
+      Unix.sleepf 0.01;
+      wait (n - 1)
+    end
+  in
+  wait 500;
+  let while_child = Atomic.get taken in
+  Unix.close end_child;
+  ignore (Unix.waitpid [] child);
+  Thread.join takes;
+  exit (if while_child = 2 then 0 else 1)
+
+let test_fork_in_sweep () =
+  if not flocks then skip ~reason:"locking a function's file needs flock" ();
+  let exe = Sys.executable_name in
+  let pid =
+    Unix.create_process exe [| exe; forking |] Unix.stdin Unix.stdout
+      Unix.stderr
+  in
+  match Unix.waitpid [] pid with
+  | _, WEXITED c ->
+      equal ~msg:"another function taken while the forked child lives" int 0 c
+  | _ -> fail "the process that forked did not exit"
 
 (* A driver that finds firmware it cannot continue from renews the GPU it holds:
    the vendor's reset runs, the memory of processes that died goes, and the
@@ -1247,7 +1406,7 @@ let test_renew () =
   let root = left_by_death () in
   let m = Machine.at root and resets = Atomic.make 0 in
   let renewing g =
-    Gpus.open_ g m 0 (fun h _ -> Result.bind (Gpus.renew h) (fun () -> kept h))
+    Driver.open_ g m 0 (fun h _ -> Result.bind (Driver.renew h) (fun () -> kept h))
   in
   let g = counted_gpus resets in
   Atomic.set resets 0;
@@ -1395,6 +1554,10 @@ let system_memory =
          GPU's reset (SIGKILL in a child)"
         test_death;
       test
+        "memory a killed process left on a hugetlbfs stays through a release \
+         and goes at its GPU's reset (SIGKILL in a child)"
+        test_death_hugetlbfs;
+      test
         "a reset of a GPU another process holds is refused, its memory kept (a \
          child holds)"
         test_reset_held;
@@ -1421,6 +1584,14 @@ let system_memory =
         "a take deletes the files processes that died left listing no \
          function, and keeps one that lists a function until its reset"
         test_left_files;
+      test
+        "a take waits for another process's sweep, and reads the memory a \
+         dead process left as left"
+        test_left_while_swept;
+      test
+        "a child forked while a take waits for a sweep keeps none of it: a \
+         later take goes on while the child lives (fork in a child process)"
+        test_fork_in_sweep;
       cases
         "memory on a mount that is no hugetlbfs of 2 MiB pages is refused"
         ~name:fst other_mounts test_other_mount;
@@ -2051,6 +2222,7 @@ let this_machine =
 let () =
   match Sys.argv with
   | [| _; arg; root; bus |] when arg = exiting -> exit_mastering root bus
+  | [| _; arg |] when arg = forking -> fork_in_sweep ()
   | [| _; arg; how; root; bus; va |] when arg = holding ->
       hold_memory how root bus (int_of_string va)
   | _ ->

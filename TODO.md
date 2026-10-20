@@ -31,30 +31,26 @@ raven / llama.cpp (Vulkan; ROCm):
 - NV: each open and close of a device on fudge grows glibc's C heap by
   about 19.6 KB, against rig_nv.mli's 24 bytes: find whether rig or the RM
   leaks it (mallinfo2, heaptrack)
-- rig.amd to its spec (_plans/gemini-review-2/REPORT.md,
-  _plans/rig-size-audit/): unused encoders and options removed, the rest
-  behind `(**/**)`; `report`, `block`, `image` hidden; holes as NV's fixed
-  record; `Bus_address` into `Machine`; request.ml inlined; firmware parsing
-  total over the pinned set; rig_amd.mli's 5 µs clock bound excludes KFD,
-  whose GPU-to-CPU gap is one-sided and unbounded under preemption: state it
+- rig.amd over PCI on SDMA 4: program the page queue (regSDMA_PAGE_*,
+  doorbell sdma_engine0 + 1, as sdma_v4_4_2 does) as the copy queue's
+  second slot once an AMD host runs it, and drop its 16 MiB ring
 - one generator, pins file and excerpt tree per driver (AMD, NV); NV keeps
   615's headers whole (licence checked first) and only `per_release`
   structs for older releases
-- `?root` behind `(**/**)` on amdgpu and nvidia
-- the SQTT decoder's home (rig.amd.abi, or beside the tools that read
-  traces) and whether the per-driver floor drivers stay in the benches,
-  each derived from rig's identity and the rule that a row times what a
-  user calls
+- whether the per-driver floor drivers stay in the benches, derived from
+  rig's identity and the rule that a row times what a user calls
 
 ### limits and size
 
 - limits no hardware or spec imposes, one commit each
-  (_plans/rig-device-reuse/70-, 71-): AMD's 512 parts per submission;
-  AMD's segment grows as NV's segment and launch rings do, and its compute
-  and copy rings resize only at idle (`AMDKFD_IOC_UPDATE_QUEUE` or the PCI
-  MQD; check KFD keeps rptr/wptr), then `Rig.most_parts` goes; NV's 65,535
-  parts (the 16-bit index of `v << 16 | i + 1`): a per-channel join counter
-  has no bound;
+  (_plans/rig-device-reuse/70-, 71-): NV's 256 waits per submission
+  (`MAX_WAITS`, `facts.waits.most`): room keeps a fixed reserve because it
+  cannot see the waits, so it goes once `room` takes the waits' count;
+  NV over PCI keeps the channel sets a growth replaces until stop: free
+  them through the GSP's free RPC (NV_VGPU_MSG_FUNCTION_FREE,
+  `rpcRmApiFree_GSP`), with gsp.ml tracking per object the instance block,
+  method buffer and context buffers it gave the GSP, so `Gsp.rm`'s `free`
+  becomes `Some`;
   PCI system memory's arena from physical memory; bnxt sized as Linux sizes
   it
 - NV address spaces: Device memory in the 49-bit space on the PCI path;
@@ -62,27 +58,15 @@ raven / llama.cpp (Vulkan; ROCm):
   past ~39 GiB of 4 KiB-page host mappings on fudge (hardware-notes.md;
   rig_nv_nvidia.mli states the bound): map in larger pages if that is the
   cause
-- size cuts in _plans/rig-size-audit/SUMMARY.md §A (core, PCI, NV, small):
-  NV's five field accessors, the debugfs scan; classify each unused value
-  (speculative, superseded, unpropagated, missed) before it goes
-- test cuts in _plans/rig-simplify-audit/tests.md, each shown covered
-  before it goes: rows 2, 5, 7 (once rig_pool.h stops stating its
-  internals), 11-14, 18 (format models only), 19-26; decide 10, 15-17
-- docs: an inventory (file:line pairs) of contracts restated across rig's
-  .mli files, then each folded to one place; rig_disk_stubs.c's six
-  platform branches into its Windows and POSIX sections; rig_device.c's
-  Windows locks against rig_pool.c's pthreads: say why or agree
+- memory.ml's release paths: `retired` and `pending` both wait for a
+  device value; word unmaps become a `pending` case, kept sorted at
+  insertion (`retire_locked` reads `next_value`, `pending` `submitted`)
 
 ### API
 
 - copies: a device copy that returns once queued, copies of several runs or
   a strided box in one call, `fill` on the copy engine, run-value offsets in
   rig_program's `Move` step; done when placing on N GPUs costs one wait
-- from its callers: `Profile.take` raises `Lost`
-- rig.gpus: one card appears through two paths, and `openers` drops each
-  path's refusal reason and names paths, not GPUs; `Rig_pci.Gpus`, which bnxt's
-  NICs use too, becomes `Rig_pci.Driver`: a user-space PCI driver's match,
-  hold, reset and stop, as Linux's `struct pci_driver` (API review)
 - GPU memory between machines over RDMA (GPUDirect), as nx.rdma had: the
   GPU drivers give a buffer's bus ranges (PCI paths, for rig.bnxt) or a
   dma-buf (kernel paths, for rig.mlx5), and a copy between two machines'
@@ -90,8 +74,6 @@ raven / llama.cpp (Vulkan; ROCm):
 
 ### tests and runs
 
-- flakes, each failed once: test_submit "a part follows the earlier parts
-  that may share memory"
 - relock windtrap once its `workers-block` branch (a883e72, a start
   barrier that sleeps once workers stop arriving) lands: rig_pci.space
   "two domains allocate and free at once" times out at its 10 s bound in
@@ -104,17 +86,19 @@ raven / llama.cpp (Vulkan; ROCm):
   library on a host with the driver; NV's `entry` `No_memory`, which a
   kernel whose local memory outgrows the GPU's forces
   (_plans/rig-release/failure-paths.md)
+- fudge, NV's channel growth: test_nv's "channels" group, joined_parts and
+  join_alternation, which cross the join words' 32-bit carry; and the
+  largest channel ring the RM accepts (rings of 2^20, 2^24 and 2^31
+  entries): `ENTRIES_MAX` and rig_nv.mli's RIG_NEVER bound become the
+  RM's cap if it is below 2^31; re-record rig_nv's bench after both
 - baselines: fudge sections for rig_cuda, rig_disk, rig_elf, rig_host,
   rig_pci_space, rig_pci_window, rig_pool, rig_program and rig_remote,
-  whose only Linux rows are kimchi's; on the M1, Metal
-  `launch/pipelined-100`, `buffer/read-64M`, and re-blesses of rig_program's
-  `polled/*` and rig_remote's `request/alloc` and `rail/4K`, recorded under
-  load; the vendor comparison (packages/rig/bench/compare/run.py) on the
-  Mac, then fudge; rig's `submit/polled/pool-two-domains` (0 words warm),
-  `submit/polled/stores-30` and `copy/queue-64K-two-domains` (the words of
-  `copy/queue-64K`) on every machine, and every rig row a run of one
-  submission changed (`submit/polled/*`, `replay/polled/*`, `device/*`,
-  `drain/*`)
+  whose only Linux rows are kimchi's; the vendor comparison
+  (packages/rig/bench/compare/run.py) on fudge; rig's
+  `submit/polled/pool-two-domains` (0 words warm), `submit/polled/stores-30`
+  and `copy/queue-64K-two-domains` (the words of `copy/queue-64K`) on fudge,
+  and every rig row a run of one submission changed (`submit/polled/*`,
+  `replay/polled/*`, `device/*`, `drain/*`)
 
 ### perf
 
@@ -123,10 +107,9 @@ raven / llama.cpp (Vulkan; ROCm):
   54 ns, 31 words on the M1; nx's `dispatch/add-1` 214 ns): profile malloc
   against the custom block and `host_memory`, then A/B a per-domain free
   list of small host buffers
-- a collected buffer's release allocates in the call that drains it
-  (memory.ml:628-632, ~4 words a buffer); done when `drain/dropped-1000`
-  allocates only its creates and kaun's GPU decode rows measure allocation
-  again (bench_decode.ml's gpu_metrics)
+- kaun's GPU decode rows measure allocation again (bench_decode.ml's
+  gpu_metrics) once a decode call's words are shown not to depend on the
+  collector's phase, on Metal and CUDA
 - results between about a quarter of the last-level cache and half of it
   rotate past it under rig's due point (rig_heap.c, heap_cycle_bytes): at
   a small heap, set-row-8M's 8 MiB results rotate through four buffers,
@@ -150,7 +133,7 @@ raven / llama.cpp (Vulkan; ROCm):
   in a chained launch (a WFI release costs ~0.67 µs); first a hardware test
   that a release implies the earlier launches completed
 - read a memory's atomic entry once per path (the dropped patch no longer
-  applies), A/B on the M1's `submit/polled/*` and `copy/*`;
+  applies), A/B on fudge's `submit/polled/*` and `copy/*`;
   `Submission.order`'s cheaper design against `submit/polled/make-4096` on
   fudge
 - measure, then keep or cut, each with its keep threshold stated before the
@@ -168,19 +151,22 @@ raven / llama.cpp (Vulkan; ROCm):
 - a compile on 10 domains takes about twice the CPU of one domain. At load
   25-40 on the M1 Max, a jera tsit5 solve of y'' = -sin y took 18 s of CPU on
   10 domains, 8.9 s on 1 and 10 s on 10 with `OCAMLRUNPARAM=s=4M`; of
-  y'' = -tanh y, 5.0, 3.4 and 3.8 s. Candidate cause: the domain count, 10
-  over the M1 Max's 8 P-cores and 2 E-cores (cap at the P-cores). Decided on
-  fudge, quiet: wall and CPU time at 1, 2, 4, 8 and 10 domains; `s` at the
-  default and at 4M, one domain included; minor collections and promoted
-  words (`OCAMLRUNPARAM=v=0x400`); a sample of the 10-domain run, the
-  stop-the-world barrier against `pthread_mutex_lock`
-- tolk.engine refuses a back edge whose flag moves with the run's words
-  (tolk_engine.ml:775); no GPU test of a loop whose body mixes a GPU kernel
-  and a host program
-- sizes in [0,1], unreachable with concrete shapes (prepare.ml:607 folds
-  empty values first): a sum at n=0 reads its accumulator uninitialised; a
-  loop whose index uses fold to 0 loads at invalid ids. Fix with symbolic
-  shapes
+  y'' = -tanh y, 5.0, 3.4 and 3.8 s. Counts: minor collections do not grow
+  with domains (rune's test_laws compilation group, 1971 at `PARALLEL=1`,
+  1874 at 10), which rules out more collections. Each compiling domain's
+  exit also empties every minor heap (191 spawns among the 1874).
+  Candidates: time inside each collection, waiting for the slowest domain
+  (an E-core's, or one descheduled at that load); major marking and
+  sweeping shared across domains; the shard lock per node; spawn and join
+  per `Worker.map`. Decided by time: on fudge (6P+8E), quiet, wall and CPU
+  at 1, 2, 4, 6 and 14 domains, and 6 pinned to the P-cores; `s` at the
+  default and at 4M; a sample of the 14-domain run, the stop-the-world
+  barrier against `pthread_mutex_lock`. nx2's P-core cap, on this CPU
+  (kimchi, 2026-10-01), timed large GEMMs at x0.96-1.04 and batched
+  64x32x32 at x1.59 slower. The M1 Max's cap at its 8 P-cores
+  (`hw.perflevel0.physicalcpu`, as nx2's) needs the same runs on the Mac
+- tolk.engine: no GPU test of a loop whose body mixes a GPU kernel and a
+  host program
 - search timing on NV clears no L2 (tinygrad's invalidate_caches); AMD
   counters and thread traces are not collected: encode both as words parts
 - AMD machine code without comgr (_plans/amd-isa/design-reviewed.md): an
@@ -190,8 +176,16 @@ raven / llama.cpp (Vulkan; ROCm):
   references (tinygrad HEAD, papers, other compilers) for a better
   solution; keep it with its reason or replace it
 - compile speed: one Clang process per kernel (~30 ms each; one per program
-  saves ~20%); float64 sin/cos inline the full Payne–Hanek reduction (40-170
-  KB kernels); structural comparisons in the rewriter (~6%); parallel
+  saves ~20%). Hypothesis, to time first: on fudge, each Clang run's wall
+  time against its source's bytes, on a model-size schedule; if the process
+  start dominates, one Clang invocation over several translation units, one
+  object per kernel (`clang -c 0/k.c 1/k.c ...`), keeps per-kernel cache
+  keys and Worker.map's balance, once each object is shown a function of its
+  source alone; float64 sin/cos inline the full Payne–Hanek reduction (40-170
+  KB kernels); structural comparisons in the rewriter (~6% before patterns
+  tested their operations as a set): the polymorphic `List.mem` left in
+  ops.ml on operation lists (1549, 2208, 2220, 2231, 2319) and dtype lists
+  (1503, 1609, 1719, 2189, 2244), until a profile clears them; parallel
   compile saturates at ~4 domains (a shard lock per node, domains spawned
   per `Worker.map`); Metal builds run one at a time and NVRTC in-process;
   a 5 KB r_32_32 kernel, max |x| over `where (i >= j) x xᵀ` at 32x32,
@@ -222,6 +216,13 @@ raven / llama.cpp (Vulkan; ROCm):
 
 ## rune, kaun, vega
 
+- compiled `eigh` skips a pair below u·‖A‖_F (`norm_roundoff`), svd below
+  u·‖a‖‖b‖ per pair: two rules for one cause. One relative floor in
+  `tangents`, |γ| ≤ u·√(|α||β|) (Demmel and Veselić, LAPACK Working Note
+  15; eager's split test), removes `norm_roundoff`, its reduction and
+  `lower_linalg.mli`'s graded-matrix carve-out. `norm_roundoff` overflows
+  today: a float32 matrix with diagonal 2.5e38 and finite eigenvalues
+  returns NaN
 - baselines on fudge: the `compile` suite's four `trig/` rows, and a
   re-record of the `compiled` suite's float64 sine rows
   (`transcendental/sin*`, `special/sin*`), whose kernels now take vector lanes
@@ -267,29 +268,56 @@ raven / llama.cpp (Vulkan; ROCm):
 
 ## nx2
 
-- frontend, `Ptree` at a brand (RFC 0006's names at `('s, 'd) t`, `Walk`,
-  `S`, `sized`, the `tensor` alias), with `check` over it, `Rng.ptree` and
-  `associative_scan`
+- the kinds quiet the NaN they return. `nx_nan1`, `nx_nan2`, `nx_maximum`
+  and `nx_minimum` keep a signalling NaN's bits (`nx_kinds.h`), while
+  reductions, scans, scatters and ranges promise it quieted, so each Max or
+  Min path quiets again (`reduce.c`'s `quiet_*`, `index.c`'s `QUIETED`,
+  `Expand.quieted`). IEEE 754-2019 §6.2.1 and §9.6 quiet it in the
+  operation. Done when the kinds quiet it and those wrappers are gone;
+  elementwise bits change for signalling NaNs
+- `reduce_ranges` flattens its result to quiet it, which gathers a result
+  cut along its row axis onto every device; its sparse table's `assemble`
+  gathers a row-cut `x` at every level
+- a reshape that factors or merges a cut axis gathers it whole onto every
+  device where the tiles don't divide both extents: gpt-oss's 2880 inputs,
+  90 MXFP4 blocks, over 4 or 8 devices. A halo exchange, as GSPMD's
+  reshape realigns an uneven cut (arXiv 2105.04663 §4.1), would move only
+  the rows across each window's boundary
+- a check on another machine's device waits for its step: settling reads
+  its result with `Nx_array.to_device`, whose `Rig.Buffer.copy` follows
+  every value submitted there. Done when rig offers a read of a remote
+  device's memory that doesn't follow its later work
+
 - frontend, `fuse` and `widen` (`float_fn`, `Ptree.fuse`): one rounding
   per element, bit for bit with `f ()` on one kernel library
-- frontend, symbolic shapes: `Size.v`, `Size.dims`; `shape`, `dim` and
-  `numel` raising on a symbolic axis under a trace; inheritance through
-  `_like`, movements, broadcasting and pattern groups
-- frontend, `attention` with `causal`, `kv` (`Dense | Paged`) and `pair`,
-  over new primitives
+- frontend, symbolic shapes: `Size.v`, `Size.dims`, `Ptree.sized`; `shape`,
+  `dim` and `numel` raising on a symbolic axis under a trace; inheritance
+  through `_like`, movements, broadcasting and pattern groups
+- `Nx.attention`'s error bound: derive it for the identity score, state it
+  in nx.mli, and tie the law's tolerance in `test_attention.ml` to it
+- the attention family: `Attention`, `Attention_tangent` and
+  `Attention_cotangent` with nx.cpu's forward and cotangent kernels and
+  `Prog.status`, in place of `Nx.attention`'s composition, which stores each
+  head's `tq × tk` scores and gives an interpreter only its contractions,
+  maps and reduction. Kernels keep hidden values out of `o`: a partial
+  tile with a non-finite value takes the selecting path. Record
+  `attention/host-*` and `gpu/*/attention-4096-causal` on the composition
+  first; the family lands only if its kernels beat it by 2x on each,
+  forward and cotangent
 - frontend, `contract`'s `?a_scale`, `?b_scale` (`scale`) and `?segments`,
   after `Prim.Contract` and nx.cpu take them
-- frontend, `sync` with deferred per-set checks (a read raises the earliest
-  failed one); then the samplers' parameter checks move there, and
-  `Rng.truncated_normal`, `dirichlet`, `categorical`, `permutation`
-- frontend, donated reuse for `set`'s and `scatter`'s target and
-  `contract`'s `init`, with a `dispatch/kv-append-4096` row
+- record `dispatch/kv-append-4096` and its `-copied` twin; donation's kill
+  criterion is at least 2x over the copy on CUDA and AMD
 - order and counting operations: check their contracts, public laws and
   bench baselines
 - nx.io on nx2, then Rune over nx2 with tolk lowering, before the GPT-2 and
   gpt-oss comparisons; rune.mli refuses a traced value on "another fiber",
   where `Nx.Prim` refuses one on a fiber a scheduler outside the
   interpretation forks: state rune's boundary as nx's
+- the GPU kernel libraries, nx.cuda, nx.metal and nx.amd, from branch
+  `nx2-gpu` (`dev/nx2/lib/{cuda,metal,amd}`) onto nx2's current kernel
+  interface
+- nx.ragged and nx.wide on nx2
 - nx.cpu's jobs size their threads by older cost estimates, many below the
   call prices' measured kind and term costs, so costly kinds get too few
   threads (a float64 pow over 16 K elements runs on 3): derive the job
@@ -326,6 +354,15 @@ raven / llama.cpp (Vulkan; ROCm):
 
 ## norn, jera
 
+- jera: Newton stops at the floats' limit by three rules (`still`, the
+  merit-rounding branch, `at_limit` with `bounded`), because `still` floors
+  each component at |x|·ε, which is 0 at 0. One test in norm in
+  `Search.judge` (MINPACK's `hybrd`: a step within xtol·‖x‖) covers Root,
+  System, Broyden, Anderson and Minimize, which miss it today. Meanwhile
+  `at_limit` reads a step that did not move (q = r = ∞) as at the limit,
+  and the unscaled `Search.norm` underflows, so a lane of small unknowns
+  converges 100 times off its tolerance; `resolved` converges without
+  meeting `tol`; `jera.mli` states the limit rule for every method
 - eager NUTS: ~3.3 ms per transition, ~475 µs per leapfrog against HMC's
   ~110 µs on the same density. Profile its bookkeeping; add a row
 - jera eager `Sde.march`: 2,000 lanes at Brownian depth 12 take ~6 ms a step
@@ -385,8 +422,9 @@ raven / llama.cpp (Vulkan; ROCm):
   design campaign that audits its references (formats' specs, zlib, zstd,
   lz4, snappy) and holds it to rig's bar; `Nx_io.gunzip` moves with it
 - private modules: each gets an .mli per doc/dev/documentation.md, rig as
-  the reference (143 lib/ modules have none; jera, norn and ymir dropped
-  theirs)
+  the reference. Left, in rig's lib/: amd/amdgpu/request.ml,
+  nv/pci/gsp_defs.ml and the `defs.ml` of amd/abi, amd/pci, bnxt, mlx5,
+  mlx5/abi, mlx5/uverbs, nv, nv/abi, nv/nvidia and nv/pci
 - windtrap: its per-test timeout does nothing on Windows; release 0.3.0 and
   drop the git pins in dune-project and ci.yml
 - tests: CI runtest under a memory cap

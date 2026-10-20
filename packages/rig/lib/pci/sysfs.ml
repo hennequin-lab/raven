@@ -117,14 +117,14 @@ let driver l = driver_of l.files l.bus
 let group m bus = link m bus "iommu_group"
 
 (* A function the kernel lists but whose files cannot be read, as while it is
-   being removed, is left out, and a directory that cannot be read lists
-   none. *)
+   being removed, is left out. A system without the directory has none. *)
 let functions m =
-  match Sys.readdir m.devices with
-  | exception Sys_error _ -> []
-  | buses ->
-      Array.to_list buses
-      |> List.filter_map (fun bus ->
+  if not (Sys.file_exists m.devices) then Ok []
+  else
+    match Sys.readdir m.devices with
+    | exception Sys_error why -> Error ("listing the PCI functions: " ^ why)
+    | buses ->
+        let id bus =
           match
             {
               Ops.bus;
@@ -134,7 +134,9 @@ let functions m =
             }
           with
           | id -> Some id
-          | exception Fail.Failed _ -> None)
+          | exception Fail.Failed _ -> None
+        in
+        Ok (List.filter_map id (Array.to_list buses))
 
 (* The other functions of [bus]'s device, such as its audio function. *)
 let siblings m bus =
@@ -538,11 +540,12 @@ let resize { files = m; bus; _ } i =
    Linux decides whether a PCI bus carries one device's requests to another's
    BAR in drivers/pci/p2pdma.c (calc_map_type_and_dist). Walking up from the
    device that owns the BAR, the first bridge above both carries them, unless
-   a device on the way up to it, that bridge included, redirects peer
-   requests to the root complex by ACS. Requests that go through the root
-   complex, with no common bridge or with a redirect, are carried only where
-   the CPU is an AMD one from Zen on, or the root complexes are on Linux's
-   list (pci_p2pdma_whitelist). *)
+   a device on the way up to it, that bridge included, or on the way up from
+   the other device to below it, redirects peer requests to the root complex
+   by ACS. Requests that go through the root complex, with no common bridge
+   or with a redirect, are carried only where the CPU is an AMD one from Zen
+   on (cpu_supports_p2pdma), or the root complexes are on Linux's list
+   (pci_p2pdma_whitelist). *)
 
 (* A host bridge on Linux's list, some only between devices under that one
    bridge. *)

@@ -99,9 +99,10 @@
 type t
 (** The type for open devices. *)
 
-val count : unit -> int
-(** [count ()] is the number of GPUs: [1] on a Mac whose GPU supports Metal,
-    [0] otherwise. A counted GPU opens only where {!section-opening} says. *)
+val count : unit -> (int, string) result
+(** [count ()] is the number of GPUs: [Ok 1] on a Mac whose GPU supports
+    Metal, and [Ok 0] otherwise. A counted GPU opens only where
+    {!section-opening} says. *)
 
 val gpu : int -> t Rig_edge.opener
 (** [gpu i] is the opener of GPU [i], named ["METAL"] for [0] and ["METAL:i"]
@@ -109,9 +110,9 @@ val gpu : int -> t Rig_edge.opener
     command queue, a timeline and a {!val-capability} of its own, even while
     an earlier device of the GPU is open or its work still runs.
 
-    [make] is [Error] with the reason if [i >= count ()], if the Mac lacks
-    what {!section-opening} requires, or if Metal cannot make the device's
-    command queue, fence or residency set.
+    [make] is [Error] with the reason if the Mac has no GPU [i] ({!count}), if
+    the Mac lacks what {!section-opening} requires, or if Metal cannot make the
+    device's command queue, fence or residency set.
 
     Raises [Invalid_argument] if [i < 0]. *)
 
@@ -145,7 +146,7 @@ val capability : t -> Rig_metal_abi.t
       | [queues]         | ["COMPUTE:0"], which runs [Fill], [Launch]     |
       | [copy_engine]    | [None]                                         |
       | [completion]     | [Host]                                         |
-      | [waits]          | no [stores], [hosts] or [objects]; [most] [0]  |
+      | [waits]          | no [stores] or [hosts]; [most] [0]             |
       | [may_block]      | [true]                                         |
       | [hang_ms]        | [None]                                         |
       | [maps_host]      | [true]                                         |

@@ -80,6 +80,12 @@ value caml_rig_amd_create(value unit) {
     free(d);
     caml_raise_out_of_memory();
   }
+  if (pthread_mutex_init(&d->grown_mu, NULL) != 0) {
+    pthread_mutex_destroy(&e->hdp_mu);
+    free(e);
+    free(d);
+    caml_raise_out_of_memory();
+  }
   e->driver = &driver;
   e->d = d;
   link_edge(e);
@@ -95,6 +101,8 @@ value caml_rig_amd_end(value v_self) {
   struct rig_amd *d = e->d;
   e->d = NULL;
   pthread_mutex_unlock(&e->hdp_mu);
+  free(d->grown);
+  pthread_mutex_destroy(&d->grown_mu);
   free(d);
   return Val_unit;
 }
@@ -103,6 +111,8 @@ value caml_rig_amd_end(value v_self) {
 value caml_rig_amd_destroy(value v_self) {
   struct rig_amd_edge *e = Edge_val(v_self);
   unlink_edge(e);
+  free(e->d->grown);
+  pthread_mutex_destroy(&e->d->grown_mu);
   free(e->d);
   pthread_mutex_destroy(&e->hdp_mu);
   free(e);
@@ -119,17 +129,12 @@ value caml_rig_amd_write_code(value v_host, value v_bytes) {
   return Val_unit;
 }
 
-/* The word, the slots (set to low32(-1), which no early wait compares
-   with) and the segment, at their host and GPU addresses. */
-value caml_rig_amd_memory(value v_self, value v_word, value v_word_gpu,
-                             value v_slots, value v_slots_gpu) {
+/* The word, at its host and GPU addresses. */
+value caml_rig_amd_memory(value v_self, value v_word, value v_word_gpu) {
   struct rig_amd *d = Device_val(v_self);
   d->word = Host_val(v_word);
   Edge_val(v_self)->word = d->word;
   d->word_gpu = (uint64_t)Long_val(v_word_gpu);
-  d->slots = Host_val(v_slots);
-  d->slots_gpu = (uint64_t)Long_val(v_slots_gpu);
-  for (int i = 0; i < RIG_AMD_SLOTS; i++) d->slots[2 * i] = UINT32_MAX;
   return Val_unit;
 }
 
@@ -164,72 +169,203 @@ value caml_rig_amd_clock(value v_self, value v_source) {
   return Val_bool(ok);
 }
 
+/* The argument segment, at open: [v_size] bytes, a power of two, at the
+   host address [v_host] and the GPU's [v_gpu]. */
 value caml_rig_amd_segment(value v_self, value v_host, value v_gpu,
-                              value v_size) {
+                           value v_size) {
   struct rig_amd *d = Device_val(v_self);
   d->segment.host = Host_val(v_host);
   d->segment.gpu = (uint64_t)Long_val(v_gpu);
   d->segment.size = (uint64_t)Long_val(v_size);
+  d->installed[0] = d->segment.gpu;
   return Val_unit;
 }
 
-/* Ring [q]: its words, size in bytes, write-position word and doorbell, all
-   host addresses, and its kind (RING_PM4, RING_AQL, RING_SDMA). */
+/* The compute queue's AQL descriptor, at open: at the host address
+   [v_host] and the GPU's [v_gpu]. */
+value caml_rig_amd_descriptor(value v_self, value v_host, value v_gpu) {
+  struct rig_amd *d = Device_val(v_self);
+  d->desc = Host_val(v_host);
+  d->desc_gpu = (uint64_t)Long_val(v_gpu);
+  return Val_unit;
+}
+
+/* Growth (rig_amd_ring.c) */
+
+/* What the submission whose rig_amd_room last answered RIG_GROW on this
+   thread needs, as rig_amd_asked numbers it: the bytes the segment must
+   have, then each ring, 0 for those the device's or the growth's handed
+   hold; the record is consumed. Under the device's growth lock. */
+value caml_rig_amd_needed(value v_self) {
+  CAMLparam1(v_self);
+  CAMLlocal1(v);
+  struct rig_amd *d = Device_val(v_self);
+  int mine = rig_amd_asked.d == d;
+  rig_amd_asked.d = NULL;
+  uint64_t w[1 + RIG_AMD_QUEUES] = {0};
+  pthread_mutex_lock(&d->grown_mu);
+  const struct rig_amd_grown *g = d->grown;
+  if (mine && rig_amd_asked.bytes > d->segment.size &&
+      (g == NULL || rig_amd_asked.bytes > g->size))
+    w[0] = rig_amd_asked.bytes;
+  for (int q = 0; q < RIG_AMD_QUEUES; q++) {
+    uint64_t want = mine ? rig_amd_asked.rings[q] : 0;
+    if (want > 4 * d->rings[q].size &&
+        (g == NULL || want > 4 * g->ring[q].size))
+      w[1 + q] = want;
+  }
+  pthread_mutex_unlock(&d->grown_mu);
+  v = caml_alloc_tuple(1 + RIG_AMD_QUEUES);
+  for (int i = 0; i <= RIG_AMD_QUEUES; i++)
+    Store_field(v, i, Val_long((intnat)w[i]));
+  CAMLreturn(v);
+}
+
+/* The fields of a grown queue in [caml_rig_amd_hand]'s [v_rings]. */
+enum { q_words, q_bytes, q_write, q_doorbell, q_id, q_fields };
+
+/* Hands the next room that needs it what a growth made, in place of what
+   one handed before and no room installed, whose parts it keeps where this
+   one makes none: [v_segment], the segment's host and GPU addresses and
+   bytes, 0 bytes for none; [v_rings], for each queue, a new queue's ring's
+   host address and bytes, its write-position word's and doorbell's host
+   addresses and its name, 0 bytes for none; and [v_desc], the host and GPU
+   addresses of a new AQL compute queue's descriptor, or 0. [false] without
+   host memory for its record. Under the device's growth lock. */
+value caml_rig_amd_hand(value v_self, value v_segment, value v_rings,
+                        value v_desc) {
+  struct rig_amd *d = Device_val(v_self);
+  struct rig_amd_grown *g = malloc(sizeof *g);
+  if (g == NULL) return Val_false;
+  pthread_mutex_lock(&d->grown_mu);
+  struct rig_amd_grown *handed = d->grown;
+  if (handed != NULL) *g = *handed;
+  else memset(g, 0, sizeof *g);
+  if (at(v_segment, 2) > 0) {
+    g->host = Host_val(Field(v_segment, 0));
+    g->gpu = (uint64_t)at(v_segment, 1);
+    g->size = (uint64_t)at(v_segment, 2);
+  }
+  for (int q = 0; q < RIG_AMD_QUEUES; q++) {
+#define F(i) at(v_rings, q * q_fields + (i))
+    if (F(q_bytes) == 0) continue;
+    g->ring[q].words = (volatile uint32_t *)F(q_words);
+    g->ring[q].size = (uint64_t)F(q_bytes) / 4;
+    g->ring[q].write = (volatile uint64_t *)F(q_write);
+    g->ring[q].doorbell = (volatile uint64_t *)F(q_doorbell);
+    g->ring[q].id = (uint64_t)F(q_id);
+#undef F
+  }
+  if (at(v_desc, 0) != 0) {
+    g->desc = Host_val(Field(v_desc, 0));
+    g->desc_gpu = (uint64_t)at(v_desc, 1);
+  }
+  d->grown = g;
+  pthread_mutex_unlock(&d->grown_mu);
+  free(handed);
+  return Val_true;
+}
+
+/* Takes back from what a growth handed and no room installed its queue of
+   ring [v_q], which then holds no work, so that the growth that replaces it
+   destroys it before it makes its own. Under the device's growth lock. */
+value caml_rig_amd_unhand(value v_self, value v_q) {
+  struct rig_amd *d = Device_val(v_self);
+  int q = Int_val(v_q);
+  pthread_mutex_lock(&d->grown_mu);
+  struct rig_amd_grown *g = d->grown;
+  if (g != NULL && g->ring[q].size > 0) {
+    memset(&g->ring[q], 0, sizeof g->ring[q]);
+    if (q == RIG_AMD_COMPUTE) g->desc = NULL;
+    int left = g->size > 0;
+    for (int r = 0; r < RIG_AMD_QUEUES; r++) left |= g->ring[r].size > 0;
+    if (!left) {
+      d->grown = NULL;
+      free(g);
+    }
+  }
+  pthread_mutex_unlock(&d->grown_mu);
+  return Val_unit;
+}
+
+/* The names of what is installed and of what is handed, 0 for none, in
+   rig_amd_asked's order: the segment's, then each queue's ring's, read at
+   one instant. */
+value caml_rig_amd_growth(value v_self) {
+  CAMLparam1(v_self);
+  CAMLlocal1(v);
+  struct rig_amd *d = Device_val(v_self);
+  uint64_t names[2 * (1 + RIG_AMD_QUEUES)] = {0};
+  pthread_mutex_lock(&d->grown_mu);
+  for (int i = 0; i <= RIG_AMD_QUEUES; i++) names[i] = d->installed[i];
+  const struct rig_amd_grown *g = d->grown;
+  if (g != NULL) {
+    names[1 + RIG_AMD_QUEUES] = g->size > 0 ? g->gpu : 0;
+    for (int q = 0; q < RIG_AMD_QUEUES; q++)
+      names[2 + RIG_AMD_QUEUES + q] = g->ring[q].size > 0 ? g->ring[q].id : 0;
+  }
+  pthread_mutex_unlock(&d->grown_mu);
+  v = caml_alloc_tuple(2 * (1 + RIG_AMD_QUEUES));
+  for (int i = 0; i < 2 * (1 + RIG_AMD_QUEUES); i++)
+    Store_field(v, i, Val_long((intnat)names[i]));
+  CAMLreturn(v);
+}
+
+/* Ring [q], at open: its words, its size and the most bytes of a ring of
+   its path, its write-position word and doorbell, all host addresses, its
+   kind (RING_PM4, RING_AQL, RING_SDMA), and its name, its GPU address. */
 value caml_rig_amd_ring(value v_self, value v_q, value v_words,
-                           value v_bytes, value v_write, value v_doorbell,
-                           value v_kind) {
-  struct rig_amd_ring *r = &Device_val(v_self)->rings[Int_val(v_q)];
+                        value v_bytes, value v_most, value v_write,
+                        value v_doorbell, value v_kind, value v_id) {
+  struct rig_amd *d = Device_val(v_self);
+  struct rig_amd_ring *r = &d->rings[Int_val(v_q)];
   r->words = Host_val(v_words);
   r->size = (uint64_t)Long_val(v_bytes) / 4;
+  r->most = (uint64_t)Long_val(v_most) / 4;
   r->write = Host_val(v_write);
   r->doorbell = Host_val(v_doorbell);
   r->kind = Int_val(v_kind);
+  d->installed[1 + Int_val(v_q)] = (uint64_t)Long_val(v_id);
   return Val_unit;
 }
 
 value caml_rig_amd_ring_byte(value *argv, int argn) {
   (void)argn;
   return caml_rig_amd_ring(argv[0], argv[1], argv[2], argv[3], argv[4],
-                              argv[5], argv[6]);
+                           argv[5], argv[6], argv[7], argv[8]);
 }
 
-/* A hole's record, as Template lays it out: 64-bit words, the index of its
-   first word, its argument, its words (1 or 2), its operations' count, then
-   each operation and its constant. Template refuses a record outside the
-   bounds; C checks only what keeps its reads and the ring's writes in their
-   arrays, with a fixed message. */
+/* A hole's record, as Template lays it out: six 64-bit words, the index of
+   its first word, its words (1 or 2), its argument, then its add, shift and
+   set. Template refuses a record outside the bounds; C checks only what
+   keeps its reads and the ring's writes in their arrays, with a fixed
+   message. */
 
 #define OUT_OF_BOUNDS "Rig_amd: a template or launch is out of bounds"
 #define LAUNCH "Rig_amd.entry: a launch's "
+#define HOLE_WORDS 6
 
 /* Reads the hole records [v_holes], for words [n] long, into [h], at most
    [max] of them, each reading an argument below [nargs]: their count. */
 static int holes(value v_holes, struct rig_amd_hole *h, int max, int nargs,
                  int n) {
-  size_t len = caml_string_length(v_holes) / 8;
-  uint64_t f[4 + 2 * RIG_AMD_HOLE_OPS];
-  int count = 0;
-  for (size_t i = 0; i < len; i += 4 + 2 * (size_t)f[3]) {
-    if (count == max || len - i < 4) caml_invalid_argument(OUT_OF_BOUNDS);
-    memcpy(f, String_val(v_holes) + 8 * i, 4 * 8);
-    if (f[3] > RIG_AMD_HOLE_OPS || len - i - 4 < 2 * f[3] ||
-        f[1] >= (uint64_t)nargs || f[2] < 1 || f[2] > 2 ||
-        f[0] + f[2] > (uint64_t)n)
+  size_t len = caml_string_length(v_holes) / (8 * HOLE_WORDS);
+  if (len > (size_t)max || caml_string_length(v_holes) % (8 * HOLE_WORDS))
+    caml_invalid_argument(OUT_OF_BOUNDS);
+  for (size_t i = 0; i < len; i++) {
+    uint64_t f[HOLE_WORDS];
+    memcpy(f, String_val(v_holes) + 8 * HOLE_WORDS * i, sizeof f);
+    if (f[1] < 1 || f[1] > 2 || f[0] > (uint64_t)n ||
+        f[0] + f[1] > (uint64_t)n || f[2] >= (uint64_t)nargs || f[4] > 63)
       caml_invalid_argument(OUT_OF_BOUNDS);
-    memcpy(f + 4, String_val(v_holes) + 8 * (i + 4), 2 * 8 * f[3]);
-    struct rig_amd_hole *o = &h[count++];
-    o->at = (uint8_t)f[0];
-    o->arg = (uint8_t)f[1];
-    o->wide = (uint8_t)f[2];
-    o->nops = (uint8_t)f[3];
-    for (int j = 0; j < o->nops; j++) {
-      uint64_t op = f[4 + 2 * j], k = f[5 + 2 * j];
-      if (op == OP_SHIFT && k > 63) caml_invalid_argument(OUT_OF_BOUNDS);
-      o->op[j] = (uint8_t)op;
-      o->k[j] = k;
-    }
+    h[i] = (struct rig_amd_hole){.at = (uint8_t)f[0],
+                                 .wide = (uint8_t)f[1],
+                                 .arg = (uint8_t)f[2],
+                                 .add = f[3],
+                                 .shift = (uint8_t)f[4],
+                                 .set = f[5]};
   }
-  return count;
+  return (int)len;
 }
 
 /* Template [t]: its words as little-endian bytes, and its holes, records as
@@ -335,10 +471,6 @@ value caml_rig_amd_launches_free(value v_launches) {
   for (value l = v_launches; Is_block(l); l = Field(l, 1))
     free((void *)Long_val(Field(l, 0)));
   return Val_unit;
-}
-
-value caml_rig_amd_most_parts(value v_self) {
-  return Val_long(rig_amd_most_parts(Device_val(v_self)));
 }
 
 value caml_rig_amd_max_copy(value v_self, value v_n) {
@@ -456,10 +588,10 @@ value caml_rig_amd_raise(value v_self) {
 }
 
 /* Publishes a new scratch at the GPU address [base], with the writes of
-   it to an AQL queue's descriptor: the 32-bit [values] at the GPU addresses
-   [at], which the next submission places. Answers the value whose
-   submission placed the publication this one replaces, or 0 if none did,
-   read under the lock. */
+   it to an AQL queue's descriptor: the 32-bit [values] at the offsets [at]
+   of the descriptor, which the next submission places. Answers the value
+   whose submission placed the publication this one replaces, or 0 if none
+   did, read under the lock. */
 value caml_rig_amd_scratch(value v_self, value v_base, value v_at,
                            value v_values) {
   struct rig_amd *d = Device_val(v_self);
@@ -509,17 +641,10 @@ value caml_rig_amd_copy_word(value v_to, value v_from) {
 
 /* Makes [v] the value after the device's last one; the device is idle. A
    ring that released the last value is taken to have released v - 1, which
-   the word now holds, and each slot gets low32(v - 1 - age), last written
-   at v - 1 - age: the writer refreshes a slot once it is more than 2^31
-   values old. */
-value caml_rig_amd_renumber(value v_self, value v_v, value v_age) {
+   the word now holds. */
+value caml_rig_amd_renumber(value v_self, value v_v) {
   struct rig_amd *d = Device_val(v_self);
   uint64_t prev = (uint64_t)Long_val(v_v) - 1;
-  uint64_t written = prev - (uint64_t)Long_val(v_age);
-  for (int i = 0; i < RIG_AMD_SLOTS; i++) {
-    d->slots[2 * i] = (uint32_t)written;
-    d->slot_last[i] = written;
-  }
   uint64_t last = atomic_load_explicit(&d->last, memory_order_relaxed);
   for (int q = 0; q < RIG_AMD_QUEUES; q++)
     if (d->rings[q].released == last) d->rings[q].released = prev;

@@ -49,8 +49,9 @@ val keep : 's lock -> Unix.file_descr
 val exists : t -> string -> bool
 (** [exists m bus] is [true] iff [m] has a function at [bus]. *)
 
-val functions : t -> Ops.id list
-(** [functions m] is [m]'s functions, [[]] without [sys/bus/pci]. *)
+val functions : t -> (Ops.id list, string) result
+(** [functions m] is [m]'s functions, [Ok []] without [sys/bus/pci], or
+    [Error why] if its directory cannot be read. *)
 
 val vfio_pci : string
 (** [vfio_pci] is VFIO's driver, ["vfio-pci"]. *)
@@ -165,13 +166,9 @@ val route : t -> string -> route option
     is [None] if the files cannot be read. *)
 
 val forwards : provider:route -> client:route -> bool
-(** [forwards ~provider ~client] is [true] iff Linux's p2pdma
-    ([calc_map_type_and_dist]) lets the function of [client] reach a BAR of
-    the function of [provider]: a bridge above both carries the requests, and
-    no device from [provider] up to it, nor from [client] up to below it,
-    redirects them by ACS; or else the CPU or both host bridges carry them
-    through the root complex ([cpu_supports_p2pdma],
-    [pci_p2pdma_whitelist]). *)
+(** [forwards ~provider ~client] is [true] iff the bus carries the requests
+    of [client]'s function to a BAR of [provider]'s, as {!Memory.reaches}
+    states Linux's p2pdma decides. *)
 
 (** {1:open Open devices} *)
 

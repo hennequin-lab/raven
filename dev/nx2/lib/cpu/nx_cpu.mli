@@ -16,11 +16,14 @@
     [Failure] naming itself and its operands' dtypes and shapes.
 
     A call keeps other domains waiting to collect for no longer than about
-    one unloaded core's copy of 1 MiB. It holds the domain lock while it
-    reads its operands, then runs its work with the lock released where
-    nx.cpu estimates that work to take longer than that copy; the estimate
-    is an upper bound of the work's time on one core of the machines it was
-    measured on, an Apple M1 Max and an Intel Core Ultra 5 235.
+    one unloaded core's copy of 1 MiB at a time, however many operands,
+    reductions or program nodes it has
+    ({!Nx_array.section-kernels}). It runs its work with the domain lock
+    released where nx.cpu estimates that work to take longer than that copy;
+    the estimate is an upper bound of the work's time on one core of the
+    machines it was measured on, an Apple M1 Max and an Intel Core Ultra 5
+    235. Other threads of the calling domain may run OCaml code during a
+    call.
 
     [apply0] to [apply3] compute every kind at every dtype of its domain. A
     [Copy] whose operand's dtype is not [dst]'s is refused with
@@ -67,12 +70,11 @@
 
     [reduce] and [scan] compute one [Sum], [Prod], [Max] or [Min] of a
     program's one operand, read plain or padded, at every dtype, into a
-    destination of any dtype. Terms of a float narrower than [float32]
-    reduce in [float32], of [int4] and [uint4] in [int8] and [uint8], and
-    of [bit] in [bool], their carrier, each block of them converted into it
-    as a cast does; others in their own dtype. Each result rounds once
-    into its destination's dtype, as a cast does, which keeps a NaN's sign
-    and payload: into the operand's own dtype, a NaN result where a term is
+    destination of any dtype. Terms reduce in their carrier
+    ({!Nx_kernel.carrier}), each block of them converted into it as a cast
+    does where it is not their dtype. Each result rounds once into its
+    destination's dtype, as a cast does, which keeps a NaN's sign and
+    payload: into the operand's own dtype, a NaN result where a term is
     NaN is the first such term quieted. They also compute one [Arg] so, its
     positions into [int64] and its extreme into the operand's own dtype the
     term itself, quieted where a NaN, and one [Logsumexp] so at every
@@ -232,52 +234,9 @@ include Nx_kernel.S
 
 (**/**)
 
-val reduce_on :
-  threads:int ->
-  Nx_kernel.Prog.t ->
-  shape:int array ->
-  axes:int iarray ->
-  (Nx_kernel.reduction * int) array ->
-  dsts:Nx_array.any array ->
-  Nx_kernel.load array ->
-  Nx_array.answer
-(** [reduce_on ~threads] is {!reduce} on one thread where [threads] is [1],
-    on as many as its job gives where it is [0]. The bits are the same. *)
-
-val scan_on :
-  threads:int ->
-  ?carry:Nx_array.any ->
-  Nx_kernel.Prog.t ->
-  axis:int ->
-  Nx_kernel.reduction * int ->
-  dsts:Nx_array.any array ->
-  Nx_kernel.load array ->
-  Nx_array.answer
-(** [scan_on ~threads] is {!scan}, threaded as {!reduce_on}. *)
-
-val c2c_on :
-  threads:int ->
-  Nx_kernel.direction ->
-  axes:int iarray ->
-  dst:(Complex.t, 's) Nx_array.t ->
-  (Complex.t, 's) Nx_array.t ->
-  Nx_array.answer
-(** [c2c_on ~threads] is {!c2c}, threaded as {!reduce_on}. *)
-
-val r2c_on :
-  threads:int ->
-  axes:int iarray ->
-  dst:(Complex.t, 'c) Nx_array.t ->
-  (float, 'r) Nx_array.t ->
-  Nx_array.answer
-(** [r2c_on ~threads] is {!r2c}, threaded as {!reduce_on}. *)
-
-val c2r_on :
-  threads:int ->
-  axes:int iarray ->
-  dst:(float, 'r) Nx_array.t ->
-  (Complex.t, 'c) Nx_array.t ->
-  Nx_array.answer
-(** [c2r_on ~threads] is {!c2r}, threaded as {!reduce_on}. *)
+val one_thread : (unit -> 'a) -> 'a
+(** [one_thread f] is [f ()], every call of the calling thread running its
+    work on that thread alone while [f] runs, nested calls included. The
+    bits are those of any threads. For tests. *)
 
 (**/**)

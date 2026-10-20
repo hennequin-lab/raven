@@ -275,13 +275,28 @@ let numbering =
       test "GPUs are AMD's display controllers and accelerators in bus order"
         (fun () ->
           let root = machine () in
-          equal (list string)
-            [ "0000:02:00.0"; "0000:03:00.0"; "0000:83:00.0" ]
+          equal
+            (result (list string) string)
+            (Ok [ "0000:02:00.0"; "0000:03:00.0"; "0000:83:00.0" ])
             (Rig_amd_pci.buses ~machine:(Rig_pci.Machine.at root) ());
-          equal int 3 (Rig_amd_pci.count ~machine:(Rig_pci.Machine.at root) ()));
+          equal (result int string) (Ok 3)
+            (Rig_amd_pci.count ~machine:(Rig_pci.Machine.at root) ()));
       test "a machine with no PCI functions has no GPU" (fun () ->
-          equal int 0
+          equal (result int string) (Ok 0)
             (Rig_amd_pci.count ~machine:(Rig_pci.Machine.at (Tree.make [])) ()));
+      test "a machine whose functions cannot be listed says why" (fun () ->
+          let machine = Rig_pci_support.unlisted () in
+          equal (result int string) (Error Rig_pci_support.unlisted_why)
+            (Rig_amd_pci.count ~machine ());
+          equal
+            (result (list string) string)
+            (Error Rig_pci_support.unlisted_why)
+            (Rig_amd_pci.buses ~machine ());
+          let why =
+            require_error
+              (Rig_gpu_support.opened (Rig_amd_pci.gpu ~machine 0))
+          in
+          equal string ("AMD-PCI: " ^ Rig_pci_support.unlisted_why) why);
       cases ~name:fst "GPUs are named by number"
         [
           ("0", (0, "AMD-PCI"));
@@ -295,11 +310,11 @@ let numbering =
           match Rig_gpu_support.opened (Rig_amd_pci.gpu ~machine 3) with
           | Ok _ -> fail "GPU 3 opened"
           | Error why ->
-              equal string "AMD-PCI:3: no such GPU; the machine has 3" why);
+              equal string "AMD-PCI:3: no such function; AMD-PCI drives 3 here" why);
       test "a reset past the last GPU names the GPU and the count" (fun () ->
           let machine = Rig_pci.Machine.at (machine ()) in
           equal (result pass string)
-            (Error "AMD-PCI:3: no such GPU; the machine has 3")
+            (Error "AMD-PCI:3: no such function; AMD-PCI drives 3 here")
             (Rig_amd_pci.reset ~machine 3));
       cases ~name:fst "a negative GPU number raises"
         [
@@ -313,7 +328,7 @@ let numbering =
         "a call inside a lock of its thread's raises naming it, changing \
          nothing"
         (let on () = Rig_pci.Machine.at (machine ()) in
-         let past () = Rig_amd_pci.count () in
+         let past () = require_ok (Rig_amd_pci.count ()) in
          [
            ( "gpu",
              fun () ->

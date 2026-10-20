@@ -26,6 +26,12 @@ external create : string -> string -> Unix.file_descr
   = "caml_rig_pci_sysmem_create"
 
 external own_lock : Unix.file_descr -> unit = "caml_rig_pci_flock"
+external flock_wait : Unix.file_descr -> unit = "caml_rig_pci_flock_wait"
+
+external sweep_open : string -> int -> bool -> Unix.file_descr
+  = "caml_rig_pci_sweep_open"
+
+external sweep_close : int -> unit = "caml_rig_pci_sweep_close"
 external zero : int -> int -> unit = "caml_rig_pci_sysmem_zero"
 
 let page = page_size ()
@@ -152,15 +158,25 @@ let unmap w = unmap_range (Window.address w) (Window.length w)
    page ][ hole ] one huge page a block
 
    The file lists the functions that reach it: its reachers, which the process
-   keeps in memory and mirrors in a sidecar [<file>.reach], one bus a line,
-   written before the function first reaches it, for when the process dies. A
-   function that no longer reaches memory leaves the list: at its release the
-   process's file, from memory; at its GPU's reset every file under the root
-   that a process that died left. A file whose list is empty and that holds no
-   block goes, and a dead process's file whose list is empty goes at the next
-   take of a function of the machine, blocks and all. The process holds a shared
-   flock on its file from before the file has a name until it dies, so a take or
-   a reset tells a dead process's file by taking the lock. *)
+   keeps in memory and records, for when it dies, as one empty file per bus
+   beside it, its marker [<file>.reach-<bus>], made before the function first
+   reaches the file. A hugetlbfs refuses write(2), so a list cannot be a file's
+   contents; a marker is made and removed in one call each, so no reader meets
+   half a list, and two processes that change one file's list lose neither's
+   change. [close], [forget], [collect_dead] and [exit] in sysmem.mli state
+   when a function leaves a list and when a file goes. The process holds a
+   shared flock on its file from before the file has a name until it dies, so
+   a take or a reset tells a dead process's file by taking the lock, and reads
+   its markers only then, once they can no longer change.
+
+   A sweep holds a dead process's file's lock while it reads and changes its
+   markers, which another process taking the lock would read as the file's
+   process alive. So each sweep, and each look for what dead processes left,
+   holds the machine's sweep lock, an exclusive flock on the directory of the
+   files: under it, a file's lock is held only by its own process. A flock
+   belongs to the open file, which a forked child would share and keep
+   locked, so a sweep opens its descriptors in slots a forked child closes
+   (rig_pci_sysmem.c). *)
 
 type file = {
   pid : int; (* the process that made it *)
@@ -180,11 +196,7 @@ type block = {
   mutable users : int; (* bytes allocations and peers hold in it *)
 }
 
-type store = {
-  root : string;
-  bus : string;
-  placed : unit Tables.Address.t; (* the addresses of its live windows *)
-}
+type store = { root : string; bus : string }
 
 (* [state] guards every value below and every store, file and block. *)
 let state = Lock.create ()
@@ -194,12 +206,43 @@ let blocks : block Tables.Address.t = Tables.Address.create 16
 (* The range memory without an address takes its addresses from. *)
 let own_length = 1 lsl 30
 let own : Tlsf.t option ref = ref None
-let store ~root ~bus = { root; bus; placed = Tables.Address.create 16 }
+let store ~root ~bus = { root; bus }
 let root s = s.root
 let prefix = "rig-pci-"
 let hugepages = "dev/hugepages"
-let reach_suffix = ".reach"
-let tmp_suffix = reach_suffix ^ ".tmp"
+
+(* A memory file's name has no ".", so a marker's name splits at its first. *)
+let reach = ".reach-"
+let marker path bus = path ^ reach ^ bus
+
+(* The file and the bus a marker's name names, if it is one. *)
+let marked name =
+  match String.index_opt name '.' with
+  | Some i
+    when String.starts_with ~prefix:reach
+           (String.sub name i (String.length name - i)) ->
+      let at = i + String.length reach in
+      Some (String.sub name 0 i, String.sub name at (String.length name - at))
+  | _ -> None
+
+(* The slots of a sweep's descriptors: the directory's and the judged file's. *)
+let dir_slot = 0
+let file_slot = 1
+
+let rec lock_wait fd =
+  match flock_wait fd with
+  | () -> ()
+  | exception Unix.Unix_error (EINTR, _, _) -> lock_wait fd
+
+(* [f ()] under [root]'s sweep lock. Without a directory of memory files there
+   is nothing to sweep, so [f] runs without it. *)
+let swept ~root f =
+  match sweep_open (Filename.concat root hugepages) dir_slot false with
+  | exception Unix.Unix_error _ -> f ()
+  | fd ->
+      Fun.protect ~finally:(fun () -> sweep_close dir_slot) @@ fun () ->
+      lock_wait fd;
+      f ()
 
 let hugetlbfs =
   "it must be a hugetlbfs of 2 MiB pages: mount -t hugetlbfs -o pagesize=2M \
@@ -221,29 +264,39 @@ let unlink path =
         (strf "rig.pci: keeping %s, which could not be deleted: %s" path
            (Unix.error_message e))
 
-(* A list is written whole to a new file renamed over the old one, so that a
-   reader never meets a part of it. *)
-let persist path buses =
-  let tmp = path ^ tmp_suffix in
-  try
-    Out_channel.with_open_text tmp (fun oc ->
-        List.iter (fun b -> output_string oc (b ^ "\n")) buses);
-    Unix.rename tmp (path ^ reach_suffix)
-  with Sys_error why | Unix.Unix_error (_, why, _) ->
-    Fail.fail "the reachers of %s could not be written: %s" path why
+let mark path bus =
+  match
+    Unix.openfile (marker path bus) [ O_WRONLY; O_CREAT; O_CLOEXEC ] 0o600
+  with
+  | fd -> Unix.close fd
+  | exception Unix.Unix_error (e, _, _) ->
+      Fail.fail "the reachers of %s could not be written: %s" path
+        (Unix.error_message e)
 
-(* A list that loses a bus and is not written keeps a bus that no longer reaches
-   the file, which only leaks it. *)
-let write_reachers path buses =
-  try persist path buses
-  with Fail.Failed why -> prerr_endline ("rig.pci: " ^ why)
+(* A marker that is not removed keeps a bus that no longer reaches the file,
+   which only leaks it. *)
+let unmark path bus = unlink (marker path bus)
 
-(* The file goes first: a crash in between leaves a list without its file, which
-   the next take of a function of the machine takes. *)
-let delete path =
+(* The buses that markers of the file at [path] name, or [None] if its directory
+   cannot be read. *)
+let markers path =
+  match Sys.readdir (Filename.dirname path) with
+  | exception Sys_error _ -> None
+  | names ->
+      let name = Filename.basename path in
+      Some
+        (Array.fold_left
+           (fun buses n ->
+             match marked n with
+             | Some (file, bus) when file = name -> bus :: buses
+             | _ -> buses)
+           [] names)
+
+(* A file goes before its markers: a marker without its file names nothing, and
+   the next take of a function of the machine removes it. *)
+let delete path buses =
   unlink path;
-  unlink (path ^ tmp_suffix);
-  unlink (path ^ reach_suffix)
+  List.iter (unmark path) buses
 
 let has_blocks f =
   Tables.Address.fold (fun _ b r -> r || b.file == f) blocks false
@@ -254,13 +307,13 @@ let exit () =
   let pid = Unix.getpid () in
   if List.exists (fun f -> f.pid = pid) !files then
     Lock.protect state @@ fun () ->
-    List.iter (fun f -> if f.reachers = [] then delete f.path) !files
+    List.iter (fun f -> if f.reachers = [] then delete f.path []) !files
 
 (* A file that lists no function and holds no block goes. *)
 let collect f =
   if f.reachers = [] && not (has_blocks f) then begin
     files := List.filter (( != ) f) !files;
-    delete f.path;
+    delete f.path [];
     Unix.close f.fd
   end
 
@@ -302,10 +355,10 @@ let on_hugetlbfs root =
         options point hugetlbfs
   | None -> Fail.fail "no mount holds %s; %s" hugepages_dir hugetlbfs
 
-(* The process's file under [root], made with its list naming [bus] before it
-   holds a page. It has a name only once locked, and its list only once named: a
-   process that meets a file unlocked with no list takes it for one that died
-   being made. *)
+(* The process's file under [root], made with its marker of [bus] before it
+   holds a page. It has a name only once locked, and its markers only once
+   named: a process that meets a file unlocked with no marker takes it for one
+   that died being made. *)
 let file_of ~root bus =
   match List.find_opt (fun (f : file) -> f.root = root) !files with
   | Some f -> f
@@ -327,9 +380,9 @@ let file_of ~root bus =
                | ENOENT | EOPNOTSUPP -> Some hugetlbfs
                | _ -> None))
       in
-      (try persist path [ bus ]
+      (try mark path bus
        with e ->
-         delete path;
+         delete path [];
          Unix.close fd;
          raise e);
       let f =
@@ -349,9 +402,8 @@ let file_of ~root bus =
 (* [bus] joins [f]'s list, on disk first. *)
 let join f bus =
   if not (List.mem bus f.reachers) then begin
-    let buses = f.reachers @ [ bus ] in
-    persist f.path buses;
-    f.reachers <- buses
+    mark f.path bus;
+    f.reachers <- bus :: f.reachers
   end
 
 let release_range fd off n =
@@ -448,9 +500,9 @@ let own_addresses ~align n =
 let own_free a =
   match !own with
   | Some t when a >= Tlsf.base t && a < Tlsf.base t + Tlsf.length t ->
-      (* [free] gives back only addresses [placed] holds. *)
+      (* Function frees only the live windows [alloc] gave. *)
       if not (Tlsf.free t a) then
-        invalid_arg (strf "Function.free_dma: no addresses at 0x%x" a)
+        failwith (strf "freeing system memory: no addresses at 0x%x" a)
   | _ -> ()
 
 (* The physical runs of the [n] bytes at [a], whose blocks exist: one a block,
@@ -510,21 +562,16 @@ let alloc ?(contiguous = false) ?va s n =
           raise e)
   with
   | exception Exhausted -> None
-  | a ->
-      Tables.Address.replace s.placed a ();
-      Some (Window.v a n, runs a n)
+  | a -> Some (Window.v a n, runs a n)
 
-let free s w =
+let free w =
   let a = Window.address w and n = Window.length w in
   Lock.protect state @@ fun () ->
-  if Tables.Address.mem s.placed a then begin
-    Tables.Address.remove s.placed a;
-    List.iter
-      (fun (at, _, len) ->
-        Option.iter (fun b -> drop b len) (Tables.Address.find_opt blocks at))
-      (parts a n);
-    own_free a
-  end
+  List.iter
+    (fun (at, _, len) ->
+      Option.iter (fun b -> drop b len) (Tables.Address.find_opt blocks at))
+    (parts a n);
+  own_free a
 
 (* The function at [bus] under [root] leaves the lists of the process's
    files. *)
@@ -533,7 +580,7 @@ let leave ~root bus =
     (fun (f : file) ->
       if f.root = root && List.mem bus f.reachers then begin
         f.reachers <- List.filter (( <> ) bus) f.reachers;
-        write_reachers f.path f.reachers;
+        unmark f.path bus;
         collect f
       end)
     !files
@@ -555,7 +602,7 @@ let reach ~root ~bus a n =
     let bs =
       List.map (fun (at, _, len) -> (Tables.Address.find blocks at, len)) ps
     in
-    (* Each file lists [bus] before a block counts it: a failed record counts
+    (* Each file lists [bus] before a block counts it: a failed marker counts
        nothing, and a list longer than needed only leaks. *)
     List.iter (fun (b, _) -> join b.file bus) bs;
     List.iter (fun (b, len) -> b.users <- b.users + len) bs;
@@ -572,26 +619,15 @@ let unreach ~a ~n =
 (* [f ()] if the process that made the file at [path] died: the lock it held
    while it lived is free. *)
 let if_dead path f =
-  match Unix.openfile path [ O_RDWR; O_CLOEXEC ] 0 with
+  match sweep_open path file_slot true with
   | exception Unix.Unix_error _ -> ()
   | fd -> (
-      Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
+      Fun.protect ~finally:(fun () -> sweep_close file_slot) @@ fun () ->
       match own_lock fd with () -> f () | exception Unix.Unix_error _ -> ())
 
-(* A dead process's file without a list died being made, and holds no page. *)
-let reachers_on_disk path =
-  let list = path ^ reach_suffix in
-  match Unix.openfile list [ O_RDONLY; O_CLOEXEC ] 0 with
-  | exception Unix.Unix_error (ENOENT, _, _) -> None
-  | exception Unix.Unix_error (e, _, _) ->
-      Fail.fail "reading %s: %s" list (Unix.error_message e)
-  | fd ->
-      let ic = Unix.in_channel_of_descr fd in
-      Fun.protect ~finally:(fun () -> close_in_noerr ic) @@ fun () ->
-      Some (List.filter (( <> ) "") (In_channel.input_lines ic))
-
-(* The memory files under [root] other processes made, and the lists that
-   outlived their files. [state] is held. *)
+(* The memory files under [root] other processes made, and the markers whose
+   file is gone: a file is named before its markers and deleted before them, so
+   a marker is an orphan only once its file was deleted. [state] is held. *)
 let others ~root =
   let mine = List.map (fun (f : file) -> f.path) !files in
   let dir = Filename.concat root hugepages in
@@ -601,63 +637,62 @@ let others ~root =
       Array.fold_right
         (fun name (files, orphans) ->
           let path = Filename.concat dir name in
-          if
-            String.ends_with ~suffix:reach_suffix name
-            && not (Sys.file_exists (Filename.chop_suffix path reach_suffix))
-          then (files, path :: orphans)
-          else if
-            String.starts_with ~prefix name
-            && (not (String.ends_with ~suffix:reach_suffix name))
-            && (not (String.ends_with ~suffix:tmp_suffix name))
-            && not (List.mem path mine)
-          then (path :: files, orphans)
-          else (files, orphans))
+          match marked name with
+          | Some (file, _) when not (Sys.file_exists (Filename.concat dir file))
+            ->
+              (files, path :: orphans)
+          | Some _ -> (files, orphans)
+          | None
+            when String.starts_with ~prefix name
+                 && (not (String.contains name '.'))
+                 && not (List.mem path mine) ->
+              (path :: files, orphans)
+          | None -> (files, orphans))
         names ([], [])
 
 (* The bus whose GPU was [reset], if any, leaves the lists of the files under
    [root] that processes that died left, and the files no function reaches go.
-   [state] is held. *)
+   A file whose markers cannot be listed stays, which only leaks it. [state] is
+   held. *)
 let sweep ~root ~reset =
   let files, orphans = others ~root in
   List.iter unlink orphans;
-  (* A list that cannot be read keeps its file, which only leaks it. *)
   List.iter
     (fun path ->
       if_dead path (fun () ->
-          match reachers_on_disk path with
-          | exception Fail.Failed why -> prerr_endline ("rig.pci: " ^ why)
-          | None | Some [] -> delete path
+          match markers path with
+          | None -> ()
           | Some buses -> (
               match List.filter (fun b -> Some b <> reset) buses with
-              | [] -> delete path
-              | rest when rest <> buses -> write_reachers path rest
-              | _ -> ())))
+              | [] -> delete path buses
+              | _ -> Option.iter (unmark path) reset)))
     files
 
-let collect_dead ~root = Lock.protect state @@ fun () -> sweep ~root ~reset:None
+let collect_dead ~root =
+  Lock.protect state @@ fun () ->
+  swept ~root @@ fun () -> sweep ~root ~reset:None
 
 let forget ~root ~bus =
-  Lock.protect state @@ fun () -> sweep ~root ~reset:(Some bus)
+  Lock.protect state @@ fun () ->
+  swept ~root @@ fun () -> sweep ~root ~reset:(Some bus)
 
 (* A file that cannot be opened for another reason than its end might hold the
    GPU's memory: it is no answer. *)
 let left ~root ~bus =
   Lock.protect state @@ fun () ->
+  swept ~root @@ fun () ->
   let listed = ref false in
   List.iter
     (fun path ->
       if not !listed then
-        match Unix.openfile path [ O_RDWR; O_CLOEXEC ] 0 with
+        match sweep_open path file_slot true with
         | exception Unix.Unix_error (ENOENT, _, _) -> ()
         | exception Unix.Unix_error (e, _, _) ->
             Fail.fail "reading %s: %s" path (Unix.error_message e)
         | fd -> (
-            Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
+            Fun.protect ~finally:(fun () -> sweep_close file_slot) @@ fun () ->
             match own_lock fd with
             | exception Unix.Unix_error _ -> ()
-            | () ->
-                listed :=
-                  List.mem bus
-                    (Option.value (reachers_on_disk path) ~default:[])))
+            | () -> listed := Sys.file_exists (marker path bus)))
     (fst (others ~root));
   !listed

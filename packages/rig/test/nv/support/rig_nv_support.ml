@@ -46,7 +46,7 @@ type path = Kernel | Pci
    GSP's firmware there. Behind an IOMMU that translates, Function.take
    refuses an unbound GPU, so its open fails, naming why. *)
 let path_of i =
-  match List.nth_opt (Rig_nv_pci.buses ()) i with
+  match List.nth_opt (Result.value (Rig_nv_pci.buses ()) ~default:[]) i with
   | None -> None
   | Some bus -> (
       match driver bus with
@@ -83,7 +83,19 @@ module Edge = struct
   external submit_c : nativeint -> int -> (int * int array) array -> unit
     = "rig_nv_test_submit"
 
+  external room_c : nativeint -> (int * int array) array -> int
+    = "rig_nv_test_room"
+
   let submit g ~v ps = submit_c (N.facts g).edge v ps
+
+  (* rig_edge.h's answers, by value. *)
+  let room g ps =
+    match room_c (N.facts g).edge ps with
+    | 0 -> "FITS"
+    | 1 -> "LATER"
+    | 2 -> "NEVER"
+    | 3 -> "GROW"
+    | a -> Printf.sprintf "answer %d" a
 end
 
 (* Host memory *)

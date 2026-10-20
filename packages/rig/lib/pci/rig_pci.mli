@@ -40,7 +40,7 @@
     v}
 
     A driver's open of a GPU usually goes like this:
-    + {!Gpus.open_} holds GPU [i] of a machine, takes its function and calls
+    + {!Driver.open_} holds GPU [i] of a machine, takes its function and calls
       the driver's [f], which starts the GPU.
     + [f] reserves its vendor's space on the machine
       ({!Machine.val-reserve}), maps the function's BARs ({!Function.map}) and
@@ -49,9 +49,9 @@
       the GPU's {!Memory} over them, from which it allocates its rings and its
       users' buffers.
     + Before the GPU can be left running, [f] gives the hold the GPU's stop
-      ({!Gpus.set_stop}).
+      ({!Driver.set_stop}).
     + The driver submits work through windows.
-    + {!Gpus.stop} ends the GPU's work and releases its function. The
+    + {!Driver.stop} ends the GPU's work and releases its function. The
       process's exit does this for each GPU it still holds.
 
     The modules below are in reading order, from the hardware up; each builds
@@ -62,46 +62,36 @@
     A {e PCI function} is one device on a machine's PCI bus, named by its bus
     address, such as [0000:03:00.0]. A GPU is one function, beside others of
     its card such as its audio function. GPU [i] of a machine is the [i]th GPU
-    of its vendor in bus order, whichever driver holds it ({!Gpus}).
+    of its vendor in bus order, whichever driver holds it ({!Driver}).
 
     An open of a GPU with no kernel driver needs:
     - The GPU detached from its kernel driver, once, outside the program
-      ({!Gpus.detach}). {!Gpus.section-changes} states the privileges this
+      ({!Driver.detach}). {!Driver.section-changes} states the privileges this
       needs and what persists.
     - A function the process can take, behind an IOMMU or physically, as the
       machine's state decides ({!Function}).
     - For a function taken physically, the free huge pages its system memory
       lies in ({{!Function.dma}system memory}).
-    - The firmware images the driver boots the GPU with, verified by digest
-      ({!Firmware}), in rig's firmware directory ({!Firmware.directory}) or
-      in directories the driver's caller names. An open downloads nothing,
-      and the [rig firmware] command fetches the pinned images into rig's
-      directory. Keep a directory of the caller's apart from [/lib/firmware]:
-      the kernel's drivers load their images from there, and an image
-      replaced there changes what they load.
+    - The firmware images the driver boots the GPU with, verified by digest,
+      in rig's firmware directory or in directories the driver's caller names
+      ({!Firmware}).
 
-    {!Gpus} defines the states a GPU then passes through: detached, held and
-    lost. Each driver states what its next open does in each.
+    {!Driver} defines the states a function then passes through: detached,
+    held and lost. Each driver states what its next open does in each.
 
     {1:safety What a function can reach}
 
-    A function reaches system memory by DMA once its bus mastering is on.
-    Behind an IOMMU it reaches only the memory the process mapped for it. Taken
-    physically, nothing confines it. It can read and write any physical memory
-    of its machine, the kernel's included. It keeps writing after its process
-    dies by a signal or a crash, so the library gives it memory that outlives
-    the process.
-    {!Function} states both ways, the privileges each needs, and what stays
-    after the process. {!Gpus} states the changes to the machine that
-    persist.
+    A function reaches system memory by DMA once its bus mastering is on
+    ({!Function.set_bus_master}). {!Function} states what it reaches behind
+    an IOMMU and taken physically, the privileges each way needs, and when its
+    access ends: after its release, at the process's exit and after its death.
+    {{!Function.dma}System memory} states the memory that outlives the process
+    and which pages the kernel can still move under a function taken
+    physically. {!Driver} states the changes to the machine that persist.
 
-    {!Function} also states when a function's access ends, after its
-    release, at the process's exit and after its death, and
-    {{!Function.dma}system memory} which pages the kernel can still move under
-    a function taken physically. An IOMMU is the only protection from a wrong
-    address in a function's work and from a page the kernel moves, so a
-    machine whose GPU is taken physically trusts that GPU's work with all of
-    its memory.
+    An IOMMU is the only protection from a wrong address in a function's work
+    and from a page the kernel moves, so a machine whose GPU is taken
+    physically trusts that GPU's work with all of its memory.
 
     {1:errors Errors}
 
@@ -116,8 +106,7 @@
       ones and drops writes, and nothing tells the process. Through a machine
       whose transport has failed, accesses do the same. Failure is state, which
       {!Machine.failed} reports for a machine and {!Function.failed} for a
-      function. {!Function.wait} returns [Error] once its machine has failed,
-      and notices a function that has left the bus only at its bound.
+      function.
     - {e Misuse} raises [Invalid_argument], such as an index below zero, bytes
       outside a window, or memory given back twice.
     - The library's locks count among the locks a thread holds ([rig_hold] in
@@ -126,7 +115,7 @@
       section). A call of this library's from such a callback raises
       [Invalid_argument] where it would take a lock its thread holds,
       without taking it. What it did before stays done, as after any
-      exception there, and a {!Gpus.stop} that raised so gives its GPU back
+      exception there, and a {!Driver.stop} that raised so gives its GPU back
       at the next stop.
 
     A message names what failed and, where something grants what is missing, the
@@ -190,10 +179,10 @@ module Page_table = Page_table
 module Memory = Memory
 (** The memory a GPU addresses, placed by kind. *)
 
-(** {1:gpus GPUs} *)
+(** {1:drivers Drivers} *)
 
 module Firmware = Firmware
 (** Firmware images, verified by digest. *)
 
-module Gpus = Gpus
-(** A vendor's GPUs, and the process's hold on them. *)
+module Driver = Driver
+(** User-space drivers of a machine's PCI functions. *)

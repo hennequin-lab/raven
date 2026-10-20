@@ -22,6 +22,7 @@ type t = {
 
 let max_rank = Shape.max_rank
 let max_numel = Shape.max_numel
+let fits = Shape.fits
 let contiguous_flag = 1
 let distinct_flag = 2
 let empty_flag = 4
@@ -323,8 +324,9 @@ let same_shape l l' =
 (* The coalescer refuses what is checked here first, so it answers [NX_OK]. *)
 let coalesce ls =
   let n = Array.length ls in
-  if n < 1 || n > 16 then
-    invalid_argf "Layout.coalesce: %d layouts, not 1 to 16" n;
+  if n < 1 || n > Shape.max_operands then
+    invalid_argf "Layout.coalesce: %d layouts, not 1 to %d" n
+      Shape.max_operands;
   if not (Array.for_all (same_shape ls.(0)) ls) then
     invalid_arg "Layout.coalesce: layouts of different shapes";
   let out = Array.make (1 + max_rank + (n * (1 + max_rank))) 0 in

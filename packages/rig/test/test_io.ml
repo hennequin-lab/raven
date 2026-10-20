@@ -146,6 +146,147 @@ let test_overlaps () =
   Rig.Claim.with_ ~read:[ wrapped ] ~donate:[ disjoint ] (fun _ -> ());
   equal ~msg:"inspection reuses the mapping" int 1 (count "pages" t)
 
+(* rig_buffers_overlap of two byte ranges answers as Buffer.overlaps of the
+   views over them, over buffers of every kind of place: host memory, a view
+   of it and a device's borrow of it; io memory, its views, a device's borrow,
+   the host borrow that maps its pages and a bigarray over those pages; memory
+   a free killed and memory made after it; an empty view. Besides any two
+   buffers, pairs put two ranges in one buffer, a borrow beside its memory,
+   the dead buffer beside any, or the bigarray beside a buffer of the io
+   memory, whose overlap only the cached host address shows. *)
+let bigarray_at = 0
+let io_family = [| 1; 2; 3; 4; 5 |]
+let freed_at = 9
+
+(* The buffers, made at the first case: the bigarray at [bigarray_at], the io
+   memory's buffers at [io_family], the dead one at [freed_at]. *)
+let universe =
+  lazy
+    (let io, _ = open_pages () in
+     let d, _ = P.open_ "io:overlap" in
+     let h = B.create Rig.host page_bytes and m = B.create io page_bytes in
+     let mapped = require_some (B.borrow Rig.host m) in
+     let pages = B.read mapped Bigarray.char Fun.id in
+     let freed = B.create Rig.host 64 in
+     ignore (B.free freed : bool);
+     [|
+       B.of_bigarray (Bigarray.Array1.sub pages 8 16);
+       m;
+       mapped;
+       B.view m ~first:12 ~length:8;
+       B.view m ~first:24 ~length:8;
+       require_some (B.borrow d m);
+       h;
+       B.view h ~first:16 ~length:32;
+       require_some (B.borrow d h);
+       freed;
+       B.create Rig.host 64;
+       B.view h ~first:0 ~length:0;
+     |])
+
+let universe_size = 12
+
+(* The borrows beside their memory: [(borrow, memory)]. *)
+let borrows = [ (2, 1); (5, 1); (8, 6) ]
+
+(* A range of at most 32 bytes from the first 32 of [b]. *)
+let range b (first, bytes) =
+  let first = Int.min first (B.length b) in
+  (first, Int.min bytes (B.length b - first))
+
+(* Whether two ranges share bytes, by their buffers' spans, for a dead
+   buffer, whose views raise. The dead buffer is freed host memory, whose
+   place no io page shares, as the pages are live host memory of their own:
+   the ranges share bytes iff they intersect in one space. *)
+let spans_overlap a (af, an) b (bf, bn) =
+  let sa, fa = Support.Reader.span a and sb, fb = Support.Reader.span b in
+  an > 0 && bn > 0 && sa = sb
+  && fa + af < fb + bf + bn
+  && fb + bf < fa + af + an
+
+(* Whether two ranges share bytes, by Buffer.overlaps of their views where
+   both buffers are live. *)
+let reference a ra b rb =
+  let view b (first, bytes) = B.view b ~first ~length:bytes in
+  if B.dead a <> None || B.dead b <> None then spans_overlap a ra b rb
+  else B.overlaps (view a ra) (view b rb)
+
+let range_gen = Gen.pair (Gen.int_range 0 32) (Gen.int_range 0 32)
+
+(* Pairs whose second buffer holds the first's bytes [shift] bytes in: one
+   buffer twice, but the empty view; a borrow beside its memory; the bigarray
+   beside the io memory, its host borrow and its device's borrow, which hold its
+   bytes from 8. *)
+let aligned =
+  let pair shift (i, j) = Gen.constant (i, j, shift) in
+  [
+    Gen.map (fun k -> (k, k, 0)) (Gen.int_range 0 (universe_size - 2));
+    Gen.one_of (List.map (pair 0) borrows);
+    Gen.one_of (List.map (fun j -> pair 8 (bigarray_at, j)) [ 1; 2; 5 ]);
+  ]
+
+(* An aligned pair and two non-empty ranges within its first 8 bytes, which
+   every buffer but the empty view holds: the second over the first's bytes, or
+   after them. Ranges drawn independently reach these in few cases. *)
+let aligned_case =
+  Gen.bind
+    (Gen.pair (Gen.one_of aligned) (Gen.int_range 0 6))
+    (fun ((i, j, shift), f) ->
+      Gen.bind (Gen.int_range 1 (7 - f)) (fun n ->
+          Gen.map
+            (fun (after, m) ->
+              let second =
+                if after then (f + n + shift, m) else (f + shift, n)
+              in
+              ((i, j), ((f, n), second)))
+            (Gen.pair Gen.bool (Gen.int_range 1 (8 - f - n)))))
+
+let overlap_case =
+  let any = Gen.int_range 0 (universe_size - 1) in
+  let io = Gen.map (fun k -> io_family.(k)) (Gen.int_range 0 4) in
+  let beside_pages = Gen.pair (Gen.constant bigarray_at) io in
+  let one_buffer = Gen.map (fun k -> (k, k)) any in
+  let borrow = Gen.one_of (List.map Gen.constant borrows) in
+  let dead = Gen.pair (Gen.constant freed_at) any in
+  let drawn =
+    Gen.pair
+      (Gen.one_of [ Gen.pair any any; one_buffer; borrow; dead; beside_pages ])
+      (Gen.pair range_gen range_gen)
+  in
+  Gen.frequency [ (1, drawn); (1, aligned_case) ]
+
+let overlap_law ((i, j), (ri, rj)) =
+  let all = Lazy.force universe in
+  let a = all.(i) and b = all.(j) in
+  let ((af, an) as ra) = range a ri and ((bf, bn) as rb) = range b rj in
+  let expected = reference a ra b rb in
+  cover "overlapping" expected;
+  cover "disjoint" (not expected);
+  cover "disjoint slices of one buffer"
+    (i = j && (not expected) && an > 0 && bn > 0);
+  cover "overlapping slices of one buffer" (i = j && expected);
+  cover "a borrow beside its memory, overlapping"
+    (expected && List.mem (i, j) borrows);
+  cover "a bigarray over io pages beside the io memory, overlapping"
+    (expected && i = bigarray_at && Array.mem j io_family);
+  cover "a part of a dead buffer"
+    (i = freed_at && B.dead a <> None && an < B.length a);
+  cover "an empty range" (an = 0 || bn = 0);
+  equal ~msg:"rig_buffers_overlap" bool expected
+    (Support.Reader.overlap a af an b bf bn)
+
+(* Ranges at a buffer's bounds lie within it: an empty range at its end
+   overlaps nothing, its last byte overlaps itself, and two halves of it share
+   no byte. A range past the bounds aborts the process, which no test in the
+   process can observe. *)
+let test_overlap_bounds () =
+  let a = B.create Rig.host 64 in
+  let overlap af an bf bn = Support.Reader.overlap a af an a bf bn in
+  equal ~msg:"an empty range at the end" bool false (overlap 64 0 0 64);
+  equal ~msg:"the last byte" bool true (overlap 63 1 63 1);
+  equal ~msg:"two halves" bool false (overlap 0 32 32 32);
+  equal ~msg:"the whole buffer" bool true (overlap 0 64 0 64)
+
 (* Publishing a host mapping cannot move the coordinates of a span already read
    by an overlap check. Views retain their offsets in the same space. *)
 let test_span_stable () =
@@ -426,6 +567,105 @@ let test_faults () =
   equal ~msg:"after Fault" (option string) (Some "the link went down")
     (Rig.lost io)
 
+(* A copy from or into a borrow of io memory's pages goes through the io
+   library's read or write, never the pages: toward host memory, toward a
+   device's memory, where the device maps none of the pages, and back, and so
+   do the blits and a fill, and a copy between two views of the one
+   allocation. *)
+let test_borrow_copies () =
+  let io, t = open_pages () in
+  let d, p = P.open_ ~host_visible:false "io:borrow-copies" in
+  let m = B.create io page_bytes in
+  let hb = require_some (B.borrow Rig.host m) in
+  let calls () = (count "read" t, count "write" t) in
+  let calls_of f =
+    let r, w = calls () in
+    f ();
+    let r', w' = calls () in
+    (r' - r, w' - w)
+  in
+  let reads_writes = pair int int in
+  equal ~msg:"from the host into the borrow" reads_writes (0, 1)
+    (calls_of (fun () -> B.copy ~src:(filled page_bytes 'a') ~dst:hb));
+  let out = filled page_bytes '0' in
+  equal ~msg:"from the borrow into the host" reads_writes (1, 0)
+    (calls_of (fun () -> B.copy ~src:hb ~dst:out));
+  equal ~msg:"the host's bytes" string (String.make page_bytes 'a') (bytes out);
+  let on_d = B.create d page_bytes in
+  equal ~msg:"from the borrow into the device" reads_writes (1, 0)
+    (calls_of (fun () -> B.copy ~src:hb ~dst:on_d));
+  equal ~msg:"from the device into the borrow" reads_writes (0, 1)
+    (calls_of (fun () -> B.copy ~src:on_d ~dst:hb));
+  equal ~msg:"the device's maps of the pages" bool false
+    (List.mem page_bytes (P.host_maps p));
+  let into = Bytes.create page_bytes in
+  equal ~msg:"a blit out of the borrow" reads_writes (1, 0)
+    (calls_of (fun () -> B.blit_to_bytes hb 0 into 0 page_bytes));
+  equal ~msg:"a blit into the borrow" reads_writes (0, 1)
+    (calls_of (fun () ->
+         B.blit_from_string (Bytes.to_string into) 0 hb 0 page_bytes));
+  equal ~msg:"a fill of the borrow" reads_writes (0, 1)
+    (calls_of (fun () -> B.fill hb 'c'));
+  let half = page_bytes / 2 in
+  B.copy ~src:(filled half 'b') ~dst:(B.view hb ~first:0 ~length:half);
+  equal ~msg:"within the allocation" reads_writes (1, 1)
+    (calls_of (fun () ->
+         B.copy
+           ~src:(B.view hb ~first:0 ~length:half)
+           ~dst:(B.view hb ~first:half ~length:half)));
+  B.copy ~src:m ~dst:out;
+  equal ~msg:"the moved bytes" string (String.make page_bytes 'b') (bytes out)
+
+(* Io memory and a borrow of its pages copy to and from a device of another
+   machine, through the host's staging memory: the io library reads and
+   writes, and every byte lands. *)
+let test_far_copies () =
+  let io, t = open_pages () in
+  let machine = Support.machine "io-far" in
+  let far =
+    require_ok ~pp:Format.pp_print_string
+      (Rig.open_ ~machine
+         {
+           name = "io:far";
+           driver = (module P);
+           make =
+             (fun ~word ->
+               Ok (P.bind ~word (P.make ~host_visible:false ~peers:false ())));
+         })
+  in
+  let m = B.create io page_bytes in
+  let hb = require_some (B.borrow Rig.host m) in
+  let on_far = B.create far page_bytes in
+  let reads = count "read" t and writes = count "write" t in
+  B.copy ~src:(filled page_bytes 'f') ~dst:on_far;
+  B.copy ~src:on_far ~dst:m;
+  B.copy ~src:(filled page_bytes 'g') ~dst:hb;
+  B.copy ~src:hb ~dst:on_far;
+  let out = filled page_bytes '0' in
+  B.copy ~src:on_far ~dst:out;
+  equal ~msg:"from the borrow, through the far device" string
+    (String.make page_bytes 'g') (bytes out);
+  B.copy ~src:(filled page_bytes 'h') ~dst:on_far;
+  B.copy ~src:on_far ~dst:hb;
+  B.copy ~src:m ~dst:on_far;
+  B.copy ~src:on_far ~dst:out;
+  equal ~msg:"into the borrow, then from the io memory" string
+    (String.make page_bytes 'h') (bytes out);
+  equal ~msg:"reads and writes of the io library" (pair int int) (2, 3)
+    (count "read" t - reads, count "write" t - writes)
+
+(* A fault of an io read under a copy from a borrow of its pages loses the io
+   device, which owns the memory, and leaves the host. *)
+let test_borrow_fault () =
+  let io, t = open_pages () in
+  let hb = require_some (B.borrow Rig.host (B.create io page_bytes)) in
+  t.during <- (fun () -> raise (Pages.Fault "the link went down"));
+  raises_match (lost io) (fun () ->
+      B.copy ~src:hb ~dst:(filled page_bytes '0'));
+  equal ~msg:"the io device" (option string) (Some "the link went down")
+    (Rig.lost io);
+  equal ~msg:"the host" (option string) None (Rig.lost Rig.host)
+
 (* A region an io library made is a buffer of its io device only, by its
    library's key, never exclusive. *)
 let test_of_io () =
@@ -622,6 +862,11 @@ let tests =
         test "overlaps uses cached io pages without mapping" test_overlaps;
         test "an io span stays stable when its pages are published"
           test_span_stable;
+        prop ~count:300
+          "rig_buffers_overlap of two ranges is Buffer.overlaps of their views"
+          overlap_case overlap_law;
+        test "rig_buffers_overlap of ranges at a buffer's bounds"
+          test_overlap_bounds;
         test "sorted claims check cached io aliases" test_sorted_overlaps;
         test "a borrow back on the io device is its memory" test_borrow_back;
         test "an empty io borrow keeps its host address without mapping"
@@ -644,6 +889,15 @@ let tests =
           test_staged_device;
         test "a fault of io loses its device, a failure of its memory nothing"
           test_faults;
+        test
+          "a copy from or into a borrow of io memory goes through its io \
+           library"
+          test_borrow_copies;
+        test "a fault under a copy from a borrow loses the io device"
+          test_borrow_fault;
+        test
+          "io memory and a borrow of it copy with another machine's device"
+          test_far_copies;
         test "a region an io library made is a buffer of its device alone"
           test_of_io;
         test "a closed io device makes no buffer" test_of_io_closed;

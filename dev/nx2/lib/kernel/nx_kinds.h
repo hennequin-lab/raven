@@ -12,7 +12,8 @@
    bit for bit and two libraries agree wherever the kind is exact. The
    float kinds are written once, in nx_kinds_real.h, which this header
    includes for f32 and f64; the pieces whose algorithm differs between the
-   two are written here.
+   two are written here. The complex transcendental kinds are written once
+   too, in nx_kinds_complex.h, included for c64 and c128.
 
    Compute types. float16, bfloat16 and the float8 dtypes compute in f32
    through nx_dtype.h's codecs and round once on the store. 8- and 16-bit
@@ -240,6 +241,13 @@ NX_INLINE uint64_t nx_threefry_u64(uint64_t counter, uint64_t key) {
 #undef NX_THREEFRY_ROUND
 #undef NX_THREEFRY_FOUR
 
+/* A table's address, in the memory NX_TABLE puts it. */
+#if defined(__METAL_VERSION__)
+#define NX_TABLE_PTR constant uint32_t *
+#else
+#define NX_TABLE_PTR const uint32_t *
+#endif
+
 /* The bits of 2/pi after the point, behind one zero word, for the
    Payne-Hanek reductions. */
 NX_TABLE uint32_t nx_two_over_pi[] = {
@@ -253,10 +261,25 @@ NX_TABLE uint32_t nx_two_over_pi[] = {
     0x6BFB5FB1u, 0x1F8D5D08u, 0x56033046u, 0xFC7B6BABu, 0xF0CFBC20u,
     0x9AF4361Du};
 
-/* The 32 bits of 2/pi from bit [g] on, bit 0 the first of the zero word. */
-NX_INLINE uint32_t nx_two_over_pi_at(int32_t g) {
+/* The bits of 2 ln2 / pi after the point, behind one zero word, for the
+   complex exp2's phase y ln2 reduced as the trigonometric kinds reduce
+   theirs. */
+NX_TABLE uint32_t nx_two_ln2_over_pi[] = {
+    0x00000000u, 0x70F7263Du, 0xFA5A6EECu, 0xB608582Eu, 0x55FEF3DDu,
+    0x8E13BECDu, 0x1D495C36u, 0x1D72013Au, 0xEA9F8FCAu, 0x76E866FCu,
+    0x9B48BE48u, 0x15F5CB6Fu, 0xD8BEE211u, 0x0394DB30u, 0x20D6EB52u,
+    0x30FFA9AEu, 0x90CBC735u, 0x51358CEDu, 0x67C0DB3Cu, 0x490D15BDu,
+    0xD91A29F5u, 0x682402AFu, 0x5E8F9C23u, 0xBFF15CBCu, 0x71F05FEDu,
+    0xFE0BB062u, 0x2A8C8F67u, 0x7309C45Au, 0x7502282Au, 0xEAD0C243u,
+    0x5C5527BBu, 0x759F345Eu, 0x2D0628E8u, 0xB1A563A2u, 0x53E62918u,
+    0xEA5FFDABu, 0xEAC0D479u, 0xCFEDB1B6u, 0xFC78B439u, 0xA333A25Fu,
+    0xDC77BE31u};
+
+/* The 32 bits of table t's number from bit [g] on, bit 0 the first of the
+   zero word. */
+NX_INLINE uint32_t nx_bits_at(NX_TABLE_PTR t, int32_t g) {
   int32_t w = g >> 5, sh = g & 31;
-  uint64_t pair = ((uint64_t)nx_two_over_pi[w] << 32) | nx_two_over_pi[w + 1];
+  uint64_t pair = ((uint64_t)t[w] << 32) | t[w + 1];
   return (uint32_t)((pair << sh) >> 32);
 }
 
@@ -315,6 +338,17 @@ NX_INLINE uint32_t nx_two_over_pi_at(int32_t g) {
 #define NX_POW_LO_F32 -160.0f
 #define NX_PIO2_BIG_F32 0x1p+15f
 #define NX_TRIG_TINY_F32 0x1p-12f
+/* The complex kinds': ln2 rounded and its remainder; clamps past which
+   e^x c and 2^x c overflow for every finite non-zero c; where sinh and
+   cosh are e^|x|/2, asin and acos their terms at infinity, and atanh is
+   past its overflow guard, sqrt of the largest float over 4. */
+#define NX_LN2_F32 0x1.62e430p-1f
+#define NX_LN2_LOW_F32 -0x1.05c610p-29f
+#define NX_CEXP_HI_F32 194.0f
+#define NX_CEXP2_HI_F32 280.0f
+#define NX_HYP_BIG_F32 12.0f
+#define NX_ASIN_BIG_F32 0x1p13f
+#define NX_ATANH_BIG_F32 0x1p62f
 
 typedef struct {
   float hi, lo;
@@ -391,7 +425,7 @@ NX_INLINE float nx_tanh_t_f32(float z) {
 }
 
 NX_INLINE nx_rem_f32 nx_rem_pio2_cw_f32(float x);
-NX_INLINE nx_rem_f32 nx_rem_pio2_big_f32(float x);
+NX_INLINE nx_rem_f32 nx_rem_pio2_big_f32(NX_TABLE_PTR t, float x);
 
 #define NX_T float
 #define NX_U uint32_t
@@ -430,19 +464,20 @@ NX_INLINE nx_rem_f32 nx_rem_pio2_cw_f32(float x) {
   return r;
 }
 
-/* Payne and Hanek, for finite |x| >= NX_PIO2_BIG_F32. x = m 2^e with m an
-   integer of 24 bits; the bits of 2/pi worth 4 or more against m 2^e
-   leave x 2/pi unchanged mod 4, so a window W of 96 bits from there gives
-   x 2/pi = m W 2^-94 mod 4. Bits 94 and 95 of m W are q, the 64 below the
-   fraction, rounded to nearest so that it is signed. */
-NX_INLINE nx_rem_f32 nx_rem_pio2_big_f32(float x) {
+/* Payne and Hanek: x k reduced by pi/2, for finite |x| >= NX_PIO2_BIG_F32
+   and t the bits of k 2/pi, below 1: nx_two_over_pi for k = 1. x = m 2^e
+   with m an integer of 24 bits; the bits of t worth 4 or more against
+   m 2^e leave x t unchanged mod 4, so a window W of 96 bits from there
+   gives x t = m W 2^-94 mod 4. Bits 94 and 95 of m W are q, the 64 below
+   the fraction, rounded to nearest so that it is signed. */
+NX_INLINE nx_rem_f32 nx_rem_pio2_big_f32(NX_TABLE_PTR t, float x) {
   uint32_t ix = nx_float_bits(x) & 0x7FFFFFFFu;
   int32_t e = (int32_t)(ix >> 23) - 150;
   uint64_t m = (ix & 0x007FFFFFu) | 0x00800000u;
   int32_t g = e + 30;
-  uint64_t a0 = m * nx_two_over_pi_at(g + 64);
-  uint64_t a1 = m * nx_two_over_pi_at(g + 32);
-  uint64_t a2 = m * nx_two_over_pi_at(g);
+  uint64_t a0 = m * nx_bits_at(t, g + 64);
+  uint64_t a1 = m * nx_bits_at(t, g + 32);
+  uint64_t a2 = m * nx_bits_at(t, g);
   uint64_t t1 = (a0 >> 32) + a1;
   uint64_t t2 = (t1 >> 32) + a2;
   uint64_t f = (t2 << 34) | ((t1 & 0xFFFFFFFFu) << 2) | ((a0 & 0xFFFFFFFFu) >> 30);
@@ -646,6 +681,13 @@ NX_INLINE int nx_double_nan(double d) {
 #define NX_POW_LO_F64 -1080.0
 #define NX_PIO2_BIG_F64 0x1p+28
 #define NX_TRIG_TINY_F64 0x1p-27
+#define NX_LN2_F64 0x1.62e42fefa39efp-1
+#define NX_LN2_LOW_F64 0x1.abc9e3b39803fp-56
+#define NX_CEXP_HI_F64 1456.0
+#define NX_CEXP2_HI_F64 2101.0
+#define NX_HYP_BIG_F64 22.0
+#define NX_ASIN_BIG_F64 0x1p28
+#define NX_ATANH_BIG_F64 0x1p510
 
 typedef struct {
   double hi, lo;
@@ -753,7 +795,7 @@ NX_INLINE double nx_tanh_t_f64(double z) {
 }
 
 NX_INLINE nx_rem_f64 nx_rem_pio2_cw_f64(double x);
-NX_INLINE nx_rem_f64 nx_rem_pio2_big_f64(double x);
+NX_INLINE nx_rem_f64 nx_rem_pio2_big_f64(NX_TABLE_PTR t, double x);
 
 #define NX_T double
 #define NX_U uint64_t
@@ -795,15 +837,15 @@ NX_INLINE nx_rem_f64 nx_rem_pio2_cw_f64(double x) {
 }
 
 /* Payne and Hanek, for finite |x| >= NX_PIO2_BIG_F64: as f32's, x = m 2^e
-   with m of 53 bits and a window W of 192 bits, x 2/pi = m W 2^-190 mod 4;
+   with m of 53 bits and a window W of 192 bits, x t = m W 2^-190 mod 4;
    the fraction's top 128 bits are kept. */
-NX_INLINE nx_rem_f64 nx_rem_pio2_big_f64(double x) {
+NX_INLINE nx_rem_f64 nx_rem_pio2_big_f64(NX_TABLE_PTR t, double x) {
   uint64_t ix = nx_double_bits(x) & 0x7FFFFFFFFFFFFFFFu;
   int32_t e = (int32_t)(ix >> 52) - 1075;
   uint64_t m = (ix & 0x000FFFFFFFFFFFFFu) | 0x0010000000000000u;
   int32_t g = e + 30;
   uint32_t w[6], p[8];
-  for (int j = 0; j < 6; j++) w[j] = nx_two_over_pi_at(g + 32 * (5 - j));
+  for (int j = 0; j < 6; j++) w[j] = nx_bits_at(t, g + 32 * (5 - j));
   uint64_t ml = m & 0xFFFFFFFFu, mh = m >> 32, c = 0;
   for (int j = 0; j < 6; j++) {
     uint64_t t = ml * w[j] + c;
@@ -1045,7 +1087,49 @@ NX_INLINE uint32_t nx_double_sign(double d) {
    Less_equal by the order. A number with a NaN part is a NaN: Equal, Less
    and Less_equal with it are false, and Maximum and Minimum give the first
    such operand, as the real kinds do. Maximum and Minimum order -0 below
-   +0 in each part. */
+   +0 in each part.
+
+   The transcendental kinds, exp, exp2, log, log2, sqrt, sin, cos, tan,
+   asin, acos, atan, sinh, cosh, tanh, asinh, acosh, atanh and pow, are the
+   principal values of C99 7.3 (ISO/IEC 9899), with the special values of
+   its Annex G, G.6; sign is z / |z|. asinh, acosh and atanh have no float
+   kind. nx_kinds_complex.h computes them from the part type's kinds,
+   branching, so that a vector loop runs them on scalars. Their bounds,
+   normwise in u where the result's modulus is a normal float:
+
+     sqrt, sign                                3
+     exp, exp2, log, log2                      4
+     asin, acos, atan, asinh, acosh, atanh     5
+     sin, cos, tan, sinh, cosh, tanh           6
+     pow, z^w                                  3 + 3 |w log z|
+
+   The bounds are measured, not proven: each kind's worst error at the
+   goldens of test/kernel/gen/kinds.py and at ten times as many points of
+   the same regions, branch cuts, poles and overflow edges among them, was
+   at least 1.3u inside its bound (log2's 2.66u at c128, tan's 4.53u at
+   c64). On the real axis, at a non-zero real part where
+   the float kind is defined, the real part is the float kind's result;
+   pow's is at a positive base and a real exponent. Every NaN part of their
+   results is the quiet NaN of a clear sign bit.
+
+   Where Annex G leaves a sign unspecified, each kind keeps f(conj z) =
+   conj f(z) and its parity bit for bit, a NaN part's sign bit counting as
+   its sign, and gives, at operands of positive parts:
+
+     exp(-inf + i inf), exp(-inf + i NaN)      +0 + i0
+     exp(inf + i inf), exp(inf + i NaN)        inf + i NaN
+     sqrt(-inf + i NaN)                        NaN + i inf
+     sinh(+0 + i inf), sinh(+0 + i NaN)        +0 + i NaN
+     sinh(inf + i inf), sinh(inf + i NaN)      inf + i NaN
+     cosh(+0 + i inf), cosh(+0 + i NaN),
+       cosh(NaN + i0)                          NaN + i0
+     cosh(inf + i inf)                         inf + i NaN
+     tanh(inf + i inf), tanh(inf + i NaN)      1 + i0
+     asin(inf + i NaN)                         NaN + i inf
+     acos(inf + i NaN)                         NaN - i inf
+     atan(inf + i NaN)                         pi/2 + i0
+     asinh(NaN + i inf)                        inf + i NaN
+     atanh(NaN + i inf)                        +0 + i pi/2 */
 
 #define NX_COMPLEX_KINDS(C, T, R, FMA, ISNAN, SIGN, NANC)                    \
   typedef struct {                                                           \
@@ -1140,6 +1224,56 @@ NX_COMPLEX_KINDS(c64, float, f32, nx_fmaf, nx_float_nan, nx_float_sign,
 #ifndef __METAL_VERSION__
 NX_COMPLEX_KINDS(c128, double, f64, nx_fmad, nx_double_nan, nx_double_sign,
                  NX_NAN_F64)
+#endif
+
+#define NX_T float
+#define NX_U uint32_t
+#define NX_CT nx_c64
+#define NX_(f) f##_f32
+#define NX_Z(f) f##_c64
+#define NX_MK nx_c64_of
+#define NX_C(c) NX_##c##_F32
+#define NX_FMA nx_fmaf
+#define NX_SQRT nx_sqrtf
+#define NX_BITS nx_float_bits
+#define NX_OF_BITS nx_bits_float
+#include "nx_kinds_complex.h"
+#undef NX_T
+#undef NX_U
+#undef NX_CT
+#undef NX_
+#undef NX_Z
+#undef NX_MK
+#undef NX_C
+#undef NX_FMA
+#undef NX_SQRT
+#undef NX_BITS
+#undef NX_OF_BITS
+
+#ifndef __METAL_VERSION__
+#define NX_T double
+#define NX_U uint64_t
+#define NX_CT nx_c128
+#define NX_(f) f##_f64
+#define NX_Z(f) f##_c128
+#define NX_MK nx_c128_of
+#define NX_C(c) NX_##c##_F64
+#define NX_FMA nx_fmad
+#define NX_SQRT nx_sqrtd
+#define NX_BITS nx_double_bits
+#define NX_OF_BITS nx_bits_double
+#include "nx_kinds_complex.h"
+#undef NX_T
+#undef NX_U
+#undef NX_CT
+#undef NX_
+#undef NX_Z
+#undef NX_MK
+#undef NX_C
+#undef NX_FMA
+#undef NX_SQRT
+#undef NX_BITS
+#undef NX_OF_BITS
 #endif
 
 #endif /* NX_KINDS_H */

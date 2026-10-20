@@ -56,9 +56,17 @@ enum {
    (clc56f.h, GP_ENTRY1_LENGTH 30:10). */
 #define SEGMENT_BYTES_MAX (4 * ((UINT64_C(1) << 21) - 1))
 
-/* A patch, Rig_nv_abi.Template.patch: the little-endian word of [width]
-   bytes (1, 2, 4 or 8) at byte [at] whose low [bits] bits take
-   (value [slot] + [add]) >> [shift]; its other bits stay. */
+/* The most entries of a channel's ring: the channel's context holds log2 of
+   their number in 5 bits on every generation the driver runs: Ampere and
+   Ada's NV_PPBDMA_GP_BASE_HI_LIMIT2 20:16 (open-gpu-doc's
+   dev_pbdma.ref.txt), Hopper's NV_PBDMA_GP_INFO_LIMIT2 4:0 and Blackwell's
+   NV_PBDMA_MISC_FETCH_STATE_GP_INFO_LIMIT2 28:24 (open-gpu-kernel-modules'
+   dev_esched_pbdma.h). Whether the RM accepts that many is measured on
+   hardware. */
+#define ENTRIES_MAX (UINT64_C(1) << 31)
+
+/* A patch, as Rig_nv_abi.Template.patch defines it, with [width] the
+   bytes of its word. */
 struct patch {
   uint16_t at;
   uint8_t width, bits, slot, shift;
@@ -151,6 +159,7 @@ struct channel {
   uint64_t entries, put, freed;
   volatile uint32_t *gp_put; /* in USERD */
   uint32_t token;            /* the work submit token the doorbell takes */
+  volatile const uint8_t *notifier; /* its error notification, RM's */
   /* the driver's segments, as the host writes them */
   uint8_t *segments;
   uint64_t segments_gpu, size, written, reclaimed;
@@ -159,29 +168,55 @@ struct channel {
   uint8_t *launches;
   uint64_t launches_gpu, launches_size, launched, landed;
   int bar;
-  struct mark *marks; /* a queue of [entries] marks */
+  struct mark *marks; /* a queue of the device's [slots] marks */
   uint64_t first, count;
   /* the first values whose work the segment ring and the launch ring hold:
      a mark of an earlier value counts in rings a growth replaced */
   uint64_t segments_from, launches_from;
   uint64_t released; /* the last value this channel released into the word */
+  uint64_t joins;    /* JOINS_START and the joins it signalled since */
   int owes_setup;    /* whether its setup words were not yet placed */
-  volatile const uint8_t *notifier; /* its error notification, RM's */
+  int owes_local;    /* on COMPUTE: whether it owes the local memory */
   /* During a submission: where its open segment starts and its words. */
   uint64_t open, open_words;
 };
 
-/* A join tag, v << 16 | i + 1, holds a part's index in its low 16 bits:
-   the tag's layout bounds a submission's parts, not the GPU. */
-#define MAX_PARTS 65535
+/* The join count each channel starts at, and its join word, 2^10 below
+   2^32: the word's high 32 bits first change within a channel's first
+   thousand joins, so that every device soon crosses the carry that the
+   copy engine's write of two 32-bit words must keep whole (rig_nv_ring.c's
+   [releaser]), and so does every test that joins its channels that
+   often. */
+#define JOINS_START ((UINT64_C(1) << 32) - (UINT64_C(1) << 10))
 
 /* Where a part of a submission runs: its channel; whether the driver's
-   copy kernel runs it; whether a later part on the other channel runs
-   after it; and the part before it on its queue, when that ran on the
-   other channel, or -1. */
+   copy kernel runs it; and whether a later part on the other channel runs
+   after it. Until the writer placed the part, [join] is the part before it
+   on its queue, when that ran on the other channel, or -1; then [signal]
+   is the number of the join it signalled among its channel's joins in the
+   submission, from 1, or 0 if it signalled none. */
 struct route {
   uint8_t channel, kernel, awaited;
-  int32_t join;
+  union {
+    int32_t join;
+    uint32_t signal;
+  };
+};
+
+/* The channels a growth made, whose rings hold more entries: for each, the
+   fields of its struct channel that name it, and [id], the GPU address of
+   their rings, by which the OCaml side knows them. The RM fixes a ring's
+   entries when it allocates its channel, so a channel's ring grows only as
+   a new channel. */
+struct channels {
+  uint64_t id;
+  struct {
+    volatile uint64_t *ring;
+    uint64_t entries;
+    volatile uint32_t *gp_put;
+    uint32_t token;
+    volatile const uint8_t *notifier;
+  } ch[CHANNELS];
 };
 
 /* A submission's routes lie in its scratch. */
@@ -247,10 +282,8 @@ struct flush {
    from a path's source, once they lie RATE_BASE_NS apart, and at the
    timer's nominal rate before. A measure whose host readings lie more than
    READ_BOUND_NS apart is dropped. A device of the timer's registers
-   measures at open only. Values convert in value order, and a value's
-   start is never before the end of the value converted before it: a
-   value's work starts once the work of every value before it has
-   completed, on every channel. */
+   measures at open only. Values convert in value order, as Rig_edge's
+   calls section states for settle. */
 
 /* A release with the timer: the value released and the timer's
    nanoseconds. */
@@ -318,6 +351,20 @@ struct device {
   _Atomic(struct ring *) grown[CHANNELS + 1];
   _Atomic(struct ring *) current[CHANNELS + 1];
   _Atomic(struct ring *) retired;
+  /* The channels a growth made, which the next room that needs them installs
+     once the device reached every value submitted, NULL for none, and the
+     [id] of the channels installed, under [channels_mu]. The OCaml side owns
+     every struct channels; it frees one neither handed nor installed, which
+     no work uses and no room reads. */
+  pthread_mutex_t channels_mu;
+  struct channels *grown_channels;
+  uint64_t installed;
+  /* whether a room waits for the device to reach every value submitted, to
+     install the channels a growth made: rooms, which run under rig's turn,
+     alone read and write it */
+  int draining;
+  /* the local memory word a submission last placed, 0 for none */
+  uint64_t placed_local;
   struct flush flushes[FLUSHES];
   /* set while a submission reads [flushes]' words, from before its full
      fence: a stop that took a word out waits until it clears */
@@ -346,10 +393,12 @@ struct device {
 /* What a growth on a thread makes: the bytes each ring of [d] must hold for
    the submission whose rig_nv_room last answered RIG_GROW on the thread, 0
    for those it holds, as each channel's segment ring, then COMPUTE's launch
-   ring. */
+   ring; and the entries each channel's ring must hold, 0 for those it
+   holds. */
 struct asked {
   const struct device *d;
   uint64_t bytes[CHANNELS + 1];
+  uint64_t entries[CHANNELS];
 };
 
 extern _Thread_local struct asked rig_nv_asked;
@@ -413,9 +462,5 @@ int rig_nv_measure(const struct device *d, struct measure *m,
 #define LOCAL_PAGE_BITS 37
 #define LOCAL_UNIT_SHIFT 15
 #define LOCAL_TAKEN UINT64_C(1)
-
-/* The most parts of the largest size an idle device runs in one
-   submission (rig_nv_ring.c). */
-int rig_nv_most_parts(const struct device *d);
 
 #endif

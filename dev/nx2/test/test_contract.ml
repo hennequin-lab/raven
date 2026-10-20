@@ -1214,7 +1214,7 @@ let errors =
             (x [| 2; 2; 3 |])
             (x [| 3; 3; 2 |]));
       refuses "a size an operand contradicts"
-        {|Nx.contract: "i k, k j -> i j | k": k is 5 in sizes and 3 in a|}
+        {|Nx.contract: "i k, k j -> i j | k": k is 5 in ~sizes and 3 in a|}
         (fun () ->
           Nx.contract ~sizes:[ ("k", 5) ] Nx.float32
             (Nx.Pattern.v "i k, k j -> i j | k")
@@ -1274,6 +1274,16 @@ let errors =
               (x [| 5; 3 |])
           in
           equal (array int) [| 3; 4; 0; 3 |] (Nx.shape y));
+      test "a group's quotient gives another group its last name" (fun () ->
+          (* (a b) gives b = 6 / 2, then (b c) gives c = 12 / 3. *)
+          let y =
+            Nx.contract Nx.float32
+              ~sizes:[ ("a", 2) ]
+              (Nx.Pattern.v "(b c) k, (a b) k -> a b c | k")
+              (x [| 12; 5 |])
+              (x [| 6; 5 |])
+          in
+          equal (array int) [| 2; 3; 4 |] (Nx.shape y));
       refuses "a known zero in a group of elements"
         {|Nx.contract: "(h d) k, k j -> h d j | k": (h d) is 10 in a, and its names multiply to 0|}
         (fun () ->
@@ -1296,6 +1306,21 @@ let errors =
             ~sizes:[ ("z", 2) ]
             (Nx.Pattern.v "i k, k j -> i j | k")
             (x [| 2; 3 |])
+            (x [| 3; 2 |]));
+      refuses "a size given twice"
+        {|Nx.contract: "(h d) k, k j -> h d j | k": h is twice in ~sizes|}
+        (fun () ->
+          Nx.contract Nx.float32
+            ~sizes:[ ("h", 2); ("h", 2) ]
+            (Nx.Pattern.v "(h d) k, k j -> h d j | k")
+            (x [| 10; 5 |])
+            (x [| 5; 3 |]));
+      refuses "too few axes under ..."
+        {|Nx.contract: "... i k, ... k j -> ... i j | k" names at least 2 axes for a; a is float32 [3]|}
+        (fun () ->
+          Nx.contract Nx.float32
+            (Nx.Pattern.v "... i k, ... k j -> ... i j | k")
+            (x [| 3 |])
             (x [| 3; 2 |]));
       refuses "a one-operand pattern"
         {|Nx.contract: "i k -> k i" has one operand; use Nx.rearrange|}
@@ -1404,10 +1429,14 @@ module Conv = struct
   let x_shape c = Array.concat [ [| c.n |]; c.spatial; [| c.groups * c.cg |] ]
   let w_shape c = Array.concat [ [| c.groups * c.og |]; c.taps; [| c.cg |] ]
 
+  (* The dilated kernel's extent along axis [i]: none without a tap. *)
+  let dilated c i =
+    if c.taps.(i) = 0 then 0 else (c.dilation.(i) * (c.taps.(i) - 1)) + 1
+
   (* The windows along axis [i] of an input of extent [d]. *)
   let count c i d =
     let lo, hi = c.padding.(i) in
-    let span = (c.dilation.(i) * (c.taps.(i) - 1)) + 1 in
+    let span = dilated c i in
     let e = d + lo + hi in
     if e < span then 0 else ((e - span) / c.stride.(i)) + 1
 
@@ -1423,7 +1452,7 @@ module Conv = struct
        let* groups = int_range 1 2 in
        let* cg = int_range 0 2 in
        let* og = int_range 1 2 in
-       let* taps = ints k 1 3 in
+       let* taps = ints k 0 3 in
        let* stride = ints k 1 3 in
        let* dilation = ints k 1 2 in
        let* los = ints k (-1) 2 in
@@ -1503,6 +1532,8 @@ module Conv = struct
           (axes (fun i -> c.spatial.(i) + fst c.padding.(i) + snd c.padding.(i) < 0));
         cover "a stride and a dilation above 1"
           (axes (fun i -> c.stride.(i) > 1 && c.dilation.(i) > 1));
+        cover "a kernel axis of no element, under an output"
+          (Array.mem 0 c.taps && Array.length want > 0);
         equal ~msg:"float64" (array float_exact) want (run D.Float64 c);
         equal ~msg:"float32" (array float_exact) want (run D.Float32 c);
         equal ~msg:"float16, summed at float32" (array float_exact) want (run D.Float16 c);
@@ -1525,6 +1556,7 @@ module Conv = struct
         let t = c.spatial in
         let least = Array.mapi (least c) t in
         cover "no input has the count" (Array.exists Option.is_none least);
+        cover "a kernel axis of no element" (Array.mem 0 c.taps);
         cover "a padding past the span, cut in the transpose"
           (Array.exists Fun.id
              (Array.mapi
@@ -1535,9 +1567,8 @@ module Conv = struct
              (Array.mapi
                 (fun i d ->
                   let lo, hi = c.padding.(i) in
-                  let span = c.dilation.(i) * (c.taps.(i) - 1) in
                   t.(i) > 0 && d = Some 0
-                  && ((t.(i) - 1) * c.stride.(i)) + span + 1 - lo - hi < 0)
+                  && ((t.(i) - 1) * c.stride.(i)) + dilated c i - lo - hi < 0)
                 least));
         let o = c.groups * c.og in
         let gs = Array.concat [ [| c.n |]; t; [| o |] ] in
@@ -1623,17 +1654,27 @@ module Conv = struct
     names "Nx.conv_transpose" (fun () ->
         Nx.conv_transpose (live [| 1; 3; 2 |]) (dead [| 2; 2; 2 |]))
 
-  (* A kernel of no tap along a spatial axis has no window to count. *)
+  (* A kernel of no tap along a spatial axis sums no term: +0 at each index
+     of the result its formula shapes, an empty kernel's dilated extent being
+     0 whatever the dilation: [t = s + 1] at stride 1 and [s = t - 1] for the
+     transpose, on the operands' set. *)
   let test_no_taps () =
-    let x = Nx.zeros Nx.float32 [| 1; 5; 4 |] and w = Nx.zeros Nx.float32 [| 2; 0; 4 |] in
-    let no_taps by f =
-      raises_match
-        (Exn.invalid_arg ~substring:(by ^ ": the kernel float32 [2; 0; 4] has a spatial axis of no element"))
-        f
+    let f32 s v = Nx.create Nx.float32 s (Array.make (numel s) v) in
+    let w = f32 [| 2; 0; 4 |] 1. in
+    let zeros s y =
+      equal ~msg:"shape" (array int) s (Nx.shape y);
+      equal ~msg:"+0" (array float_exact) (Array.make (numel s) 0.)
+        (Nx.to_array y);
+      equal ~msg:"on the host" bool true (Option.is_some (Nx.placement y))
     in
-    no_taps "Nx.conv" (fun () -> Nx.conv x w);
-    no_taps "Nx.conv_transpose" (fun () ->
-        Nx.conv_transpose (Nx.zeros Nx.float32 [| 1; 5; 2 |]) w)
+    zeros [| 1; 6; 2 |] (Nx.conv (f32 [| 1; 5; 4 |] 1.) w);
+    zeros [| 1; 6; 2 |] (Nx.conv ~dilation:[| 2 |] (f32 [| 1; 5; 4 |] 1.) w);
+    zeros [| 1; 3; 2 |] (Nx.conv ~stride:[| 2 |] (f32 [| 1; 5; 4 |] 1.) w);
+    zeros [| 1; 0; 2 |]
+      (Nx.conv ~dilation:[| 3 |] ~padding:[| (-2, 0) |] (f32 [| 1; 1; 4 |] 1.) w);
+    zeros [| 1; 5; 4 |]
+      (Nx.conv_transpose ~dilation:[| 3 |] (f32 [| 1; 6; 2 |] 1.) w);
+    zeros [| 1; 5; 4 |] (Nx.conv_transpose (f32 [| 1; 6; 2 |] 1.) w)
 
   (* A [[1; 0; 1]] input at stride 3 and padding (1, 1) has one window: the
      transpose of that count has an input to find. *)
@@ -1656,7 +1697,7 @@ module Conv = struct
         test "conv_transpose finds an input shorter than its formula's"
           test_transpose_short;
         test "each refusal names its function" test_refusals;
-        test "a kernel of no tap raises" test_no_taps;
+        test "a kernel of no tap sums no term" test_no_taps;
         test "a dead operand names the function called" test_dead_names;
       ]
 end

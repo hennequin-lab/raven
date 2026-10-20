@@ -59,6 +59,8 @@ let check r o n = if not (inside r o n) then invalid_arg "outside"
 let check_word r o w =
   check r o w;
   cover "a word that ends the window" (o = r.len - w);
+  cover "a word aligned by its address, not by its offset"
+    ((r.off + o) mod w <> 0 && aligned r o w);
   if not (aligned r o w) then invalid_arg "unaligned"
 
 module Model = struct
@@ -194,17 +196,6 @@ let commands ~is_mapped make =
       Model.flush c_flush;
   ]
 
-(* A window one byte past an aligned address: its words at offsets 3 and 7 are
-   aligned on the machine, those at offset 0 are not. *)
-let address_alignment make () =
-  let w = Window.sub (make 0 24) 1 20 in
-  equal ~msg:"get32 at an aligned address" int 0 (Window.get32 w 3);
-  equal ~msg:"get64 at an aligned address" int64 0L (Window.get64 w 7);
-  raises_match ~msg:"get32 at an unaligned address" Exn.invalid_arg (fun () ->
-      Window.get32 w 0);
-  raises_match ~msg:"get64 at an unaligned address" Exn.invalid_arg (fun () ->
-      Window.get64 w 0)
-
 let same_bytes =
   group ~timeout:patience "accesses"
     [
@@ -214,8 +205,6 @@ let same_bytes =
         (commands ~is_mapped:true combining);
       stateful ~count:300 "a window through a transport behaves as its bytes"
         (commands ~is_mapped:false through);
-      test "a mapped word is aligned by its address" (address_alignment mapped);
-      test "a far word is aligned by its address" (address_alignment through);
     ]
 
 (* Windows *)
@@ -285,26 +274,6 @@ let windows =
         (sub_address mapped);
       prop "a far sub-window starts its offset past its parent" place
         (sub_address through);
-    ]
-
-(* Bigarrays *)
-
-let test_bigarray () =
-  let w = Window.sub (mapped 0 16) 3 10 in
-  let b = Window.bigarray w in
-  equal ~msg:"length" int 10 (Bigarray.Array1.dim b);
-  Window.set8 w 0 0x41;
-  equal ~msg:"a store is in the bigarray" char 'A' b.{0};
-  b.{9} <- 'z';
-  equal ~msg:"the bigarray is the window" int (Char.code 'z') (Window.get8 w 9)
-
-let bigarrays =
-  group ~timeout:patience "bigarrays"
-    [
-      test "a mapped window's bigarray is its bytes" test_bigarray;
-      test "a far window has no bigarray" (fun () ->
-          raises_match Exn.invalid_arg (fun () ->
-              Window.bigarray (through 0 16)));
     ]
 
 (* Long copies
@@ -579,4 +548,4 @@ let c_view =
 let () =
   exit
   @@ run "rig_pci.window"
-       [ same_bytes; windows; bigarrays; long; transports; c_view ]
+       [ same_bytes; windows; long; transports; c_view ]

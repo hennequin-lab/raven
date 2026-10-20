@@ -135,7 +135,8 @@ let law_int32 (s, axes, keepdims, xs) =
   in
   check "sum" Int32.add 0l (fun ?axes ~keepdims x -> Nx.sum ?axes ~keepdims x);
   check "prod" Int32.mul 1l (fun ?axes ~keepdims x -> Nx.prod ?axes ~keepdims x);
-  if List.exists (fun a -> s.(a) = 0) ax then begin
+  let elements = Array.fold_left ( * ) 1 (reduced s ax) in
+  if List.exists (fun a -> s.(a) = 0) ax && elements > 0 then begin
     names "max" (fun () -> Nx.max ?axes x);
     names "min" (fun () -> Nx.min ?axes x)
   end
@@ -328,14 +329,18 @@ let law_any (Case a, axes) =
   let dt = A.dtype a in
   let s = L.shape (A.layout a) in
   let ax = Array.of_list (normal (Array.length s) axes) in
-  let empty = Array.exists (fun i -> s.(i) = 0) ax in
+  (* An element of the result of no term: an extreme there raises. *)
+  let no_term =
+    Array.exists (fun i -> s.(i) = 0) ax
+    && Array.fold_left ( * ) 1 (reduced s (Array.to_list ax)) > 0
+  in
   List.iter
     (fun (name, m, f) ->
       let f () = bits_of (host_array (f ?axes (value a))) in
       let extreme =
         match (m : Nx_kernel.monoid) with Max | Min -> true | _ -> false
       in
-      if documented m dt && not (empty && extreme) then begin
+      if documented m dt && not (no_term && extreme) then begin
         cover "computed" true;
         match reference m a ax with
         | Some want ->
@@ -359,9 +364,18 @@ let test_errors () =
   names "sum" (fun () ->
       Nx.sum (value (A.of_array D.Bool [| 2 |] [| true; false |])));
   names "mean" (fun () ->
-      Nx.mean (value (A.of_array D.Int32 [| 2 |] [| 1l; 2l |])));
+      Nx.mean (value (A.of_array D.Bool [| 2 |] [| true; false |])));
   names "cumsum" (fun () ->
       Nx.cumsum (value (A.of_array D.Bool [| 2 |] [| true; false |])))
+
+(* A refused axis is printed as the caller passed it. *)
+let test_axis_printed () =
+  let x = value (A.of_array D.Float32 [| 2; 3; 4 |] (Array.make 24 1.)) in
+  let says sub f = raises_match (Exn.invalid_arg ~substring:sub) f in
+  says "Nx.sum: -5 is not an axis of float32 [2; 3; 4]" (fun () ->
+      Nx.sum ~axes:[ -5 ] x);
+  says "Nx.sum: axis -1 of float32 [2; 3; 4] repeats" (fun () ->
+      Nx.sum ~axes:[ 2; -1 ] x)
 
 let test_mean () =
   let x = value (A.of_array D.Float32 [| 2; 2 |] [| 1.; 2.; 3.; 6. |]) in
@@ -372,6 +386,162 @@ let test_mean () =
   equal (array float_exact) [| 3. |] (A.to_array all);
   let none = value (A.of_array D.Float64 [| 0 |] [||]) in
   equal bool true (Float.is_nan (A.to_array (host_array (Nx.mean none))).(0))
+
+(* Integer means *)
+
+(* An integer's bits: an unsigned 32-bit one zero-extended. *)
+let to_int64 (type v s) (dt : (v, s) D.t) (v : v) : int64 =
+  match dt with
+  | D.Int64 -> v
+  | D.Uint64 -> v
+  | D.Int32 -> Int64.of_int32 v
+  | D.Uint32 -> Int64.logand (Int64.of_int32 v) 0xFFFF_FFFFL
+  | D.Int16 -> Int64.of_int v
+  | D.Uint16 -> Int64.of_int v
+  | D.Int8 -> Int64.of_int v
+  | D.Uint8 -> Int64.of_int v
+  | D.Int4 -> Int64.of_int v
+  | D.Uint4 -> Int64.of_int v
+  | _ -> invalid_arg "to_int64: not an integer dtype"
+
+(* The value of [dt] whose low bits are [x]'s. *)
+let of_int64 (type v s) (dt : (v, s) D.t) (x : int64) : v =
+  let b = D.bits dt in
+  let x =
+    if b = 64 then x
+    else if D.is D.Signed dt then
+      Int64.shift_right (Int64.shift_left x (64 - b)) (64 - b)
+    else Int64.shift_right_logical (Int64.shift_left x (64 - b)) (64 - b)
+  in
+  match dt with
+  | D.Int64 -> x
+  | D.Uint64 -> x
+  | D.Int32 -> Int64.to_int32 x
+  | D.Uint32 -> Int64.to_int32 x
+  | D.Int16 -> Int64.to_int x
+  | D.Uint16 -> Int64.to_int x
+  | D.Int8 -> Int64.to_int x
+  | D.Uint8 -> Int64.to_int x
+  | D.Int4 -> Int64.to_int x
+  | D.Uint4 -> Int64.to_int x
+  | _ -> invalid_arg "of_int64: not an integer dtype"
+
+(* An integer's value as limbs [(hi, lo)], [hi * 2^32 + lo], [lo] in
+   [[0, 2^32)]: sums of them are exact in [int]. *)
+let limbs (type v s) (dt : (v, s) D.t) (v : v) =
+  let x = to_int64 dt v in
+  let hi =
+    if D.is D.Signed dt then Int64.shift_right x 32
+    else Int64.shift_right_logical x 32
+  in
+  (Int64.to_int hi, Int64.to_int (Int64.logand x 0xFFFF_FFFFL))
+
+let add_limbs (h, l) (h', l') = (h + h', l + l')
+
+(* The sum [(h, l)] of [n] integers divided by [n], truncated toward zero, by
+   long division of its magnitude in base 2^32: its bits, and whether it is
+   negative and inexact. *)
+let divided n (h, l) =
+  let h = h + (l asr 32) and l = l land 0xFFFF_FFFF in
+  let negative = h < 0 in
+  let a, b =
+    if not negative then (h, l)
+    else if l = 0 then (-h, 0)
+    else (-h - 1, 0x1_0000_0000 - l)
+  in
+  let low = ((a mod n) lsl 32) + b in
+  let q = Int64.(add (shift_left (of_int (a / n)) 32) (of_int (low / n))) in
+  ((if negative then Int64.neg q else q), negative && low mod n <> 0)
+
+let integer_dtypes =
+  List.filter
+    (fun (D.Any dt) -> D.is D.Signed dt || D.is D.Unsigned dt)
+    D.all
+
+let int_case =
+  let open Gen in
+  with_pp
+    (fun ppf (D.Any dt, s, axes, _) ->
+      Format.fprintf ppf "%a %a over %s" D.pp dt pp_ints s
+        (match axes with
+        | None -> "all"
+        | Some l -> String.concat "," (List.map string_of_int l)))
+    (let* (D.Any dt) =
+       of_list ~pp:(fun ppf (D.Any dt) -> D.pp ppf dt) integer_dtypes
+     in
+     let* s = shape in
+     let* axes = axes_of (Array.length s) in
+     let extremes =
+       [ to_int64 dt (D.min_value dt); to_int64 dt (D.max_value dt) ]
+     in
+     let+ xs =
+       array
+         ~size:(constant (Array.fold_left ( * ) 1 s))
+         (frequency
+            [
+              (3, map Int64.of_int (int_range (-5) 5));
+              (2, of_list extremes);
+              (1, int64);
+            ])
+     in
+     (D.Any dt, s, axes, xs))
+
+let law_int_mean (D.Any dt, s, axes, xs) =
+  let ax = normal (Array.length s) axes in
+  let xs = Array.map (of_int64 dt) xs in
+  let x = value (A.of_array dt s xs) in
+  let n = List.fold_left (fun n a -> n * s.(a)) 1 ax in
+  if n = 0 && Array.fold_left ( * ) 1 (reduced s ax) > 0 then
+    names "mean" (fun () -> Nx.mean ?axes x)
+  else begin
+    let sums = fold add_limbs (0, 0) s ax (Array.map (limbs dt) xs) in
+    let want = Array.map (divided n) sums in
+    let got =
+      Array.map (to_int64 dt) (A.to_array (host_array (Nx.mean ?axes x)))
+    in
+    cover "64 bits" (D.bits dt = 64);
+    cover "a negative mean rounded toward zero" (Array.exists snd want);
+    equal (array int64) (Array.map fst want) got
+  end
+
+(* Means the spec gives: the exact mean rounded toward zero, between the least
+   and greatest element. *)
+let test_int_mean () =
+  let mean dt xs =
+    let x = value (A.of_array dt [| Array.length xs |] xs) in
+    to_int64 dt (Nx.item [] (Nx.mean x))
+  in
+  equal ~msg:"int32 3.5" int64 3L (mean D.Int32 [| 3l; 4l |]);
+  equal ~msg:"int32 -3.5" int64 (-3L) (mean D.Int32 [| -3l; -4l |]);
+  equal ~msg:"int32 -1/3" int64 0L (mean D.Int32 [| -1l; 0l; 0l |]);
+  equal ~msg:"int8 -127.5" int64 (-127L) (mean D.Int8 [| -128; -127 |]);
+  equal ~msg:"int4 -7.5" int64 (-7L) (mean D.Int4 [| -8; -7 |]);
+  equal ~msg:"uint4 14.5" int64 14L (mean D.Uint4 [| 15; 14 |]);
+  equal ~msg:"uint8 254.5" int64 254L (mean D.Uint8 [| 255; 254 |]);
+  equal ~msg:"uint32 2^32 - 1.5" int64 0xFFFF_FFFEL
+    (mean D.Uint32 [| -1l; -2l |]);
+  let i64 = Int64.(max_int, min_int) in
+  equal ~msg:"int64 max" int64 Int64.max_int
+    (mean D.Int64 [| fst i64; fst i64 |]);
+  equal ~msg:"int64 min" int64 Int64.min_int
+    (mean D.Int64 [| snd i64; snd i64 |]);
+  equal ~msg:"int64 (max + min) / 2 = -1/2" int64 0L
+    (mean D.Int64 [| fst i64; snd i64 |]);
+  equal ~msg:"int64 (2 min - 1) / 3" int64 (-6148914691236517205L)
+    (mean D.Int64 [| snd i64; snd i64; -1L |]);
+  equal ~msg:"uint64 2^64 - 1" int64 (-1L) (mean D.Uint64 [| -1L; -1L |]);
+  equal ~msg:"uint64 (2^64 - 1) / 2" int64 Int64.max_int
+    (mean D.Uint64 [| -1L; 0L |]);
+  equal ~msg:"uint64 (2^65 - 1) / 3" int64 (-6148914691236517206L)
+    (mean D.Uint64 [| -1L; -1L; 1L |]);
+  let x = value (A.of_array D.Int32 [| 2; 0 |] [||]) in
+  names "mean" (fun () -> Nx.mean ~axes:[ 1 ] x);
+  equal ~msg:"an empty axis of an empty result" (array int) [| 0 |]
+    (Nx.shape (Nx.mean ~axes:[ 0 ] x));
+  let x = value (A.of_array D.Int16 [| 2; 2 |] [| 1; 2; 4; 7 |]) in
+  let kept = host_array (Nx.mean ~axes:[ 1 ] ~keepdims:true x) in
+  equal ~msg:"kept" (array int) [| 2; 1 |] (L.shape (A.layout kept));
+  equal ~msg:"kept" (array int) [| 1; 5 |] (A.to_array kept)
 
 (* Scans of complex numbers and narrow floats: a complex sum adds the parts,
    and a narrow float accumulates at float32, rounding each prefix once. *)
@@ -1899,7 +2069,7 @@ let test_optional_rules () =
       reduce1 (Moments (0, Nx.int32)) [| 0 |] x);
   raises (Invalid_argument "t: Moments does not take int32") (fun () ->
       scan1 (Moments (0, Nx.int32)) 0 x);
-  raises (Invalid_argument "t: Arg Max of no term") (fun () ->
+  raises (Invalid_argument "t: an extreme of no term: no element along axis 0 of [0]") (fun () ->
       reduce1 (Arg (Max, 0, Nx.int32)) [| 0 |] (vector D.Int32 [||]))
 
 (* NaN results on every path *)
@@ -2412,6 +2582,45 @@ let optional_group =
       test "their rules raise naming the caller" test_optional_rules;
     ]
 
+(* An extreme along an empty axis is refused only where its result has an
+   element: one with none is the empty result, on one device or cut over
+   three along either axis. *)
+let test_empty_extremes () =
+  let empty s = value (A.of_array D.Float32 s [||]) in
+  let shape x = L.shape (A.layout (host_array x)) in
+  equal ~msg:"max" (array int) [| 0 |]
+    (shape (Nx.max ~axes:[ 1 ] (empty [| 0; 0 |])));
+  equal ~msg:"min, kept" (array int) [| 0; 1 |]
+    (shape (Nx.min ~axes:[ 1 ] ~keepdims:true (empty [| 0; 0 |])));
+  equal ~msg:"argmax" (array int) [| 0 |]
+    (shape (Nx.argmax ~axis:1 (empty [| 0; 0 |])));
+  equal ~msg:"argmin" (array int) [| 3; 0 |]
+    (shape (Nx.argmin ~axis:1 (empty [| 3; 0; 0 |])));
+  List.iter
+    (fun axis ->
+      let x = Nx.place (Cpu3.split ~axis) (empty [| 0; 0 |]) in
+      equal ~msg:"max, cut" (array int) [| 0 |] (shape (Nx.max ~axes:[ 1 ] x));
+      equal ~msg:"argmin, cut" (array int) [| 0 |]
+        (shape (Nx.argmin ~axis:1 x)))
+    [ 0; 1 ];
+  names "max" (fun () -> Nx.max ~axes:[ 1 ] (empty [| 2; 0 |]));
+  names "min" (fun () -> Nx.min (empty [| 0; 0 |]));
+  names "argmax" (fun () -> Nx.argmax ~axis:1 (empty [| 2; 0 |]));
+  names "argmin" (fun () -> Nx.argmin (empty [| 0; 0 |]))
+
+(* A donated operand that another operation consumed is dead: a scan and an
+   arg reduction without an axis, which read the elements in C order, name
+   themselves. *)
+let test_dead_named () =
+  let dead () =
+    let x = Nx.create Nx.float64 [| 2; 2 |] [| 1.; 2.; 3.; 4. |] in
+    ignore (Nx.neg (Nx.donate x));
+    x
+  in
+  names "cumsum" (fun () -> Nx.cumsum (dead ()));
+  names "argmax" (fun () -> Nx.argmax (dead ()));
+  names "argmin" (fun () -> Nx.argmin ~keepdims:true (dead ()))
+
 let reductions_group =
   group "reductions"
     [
@@ -2424,7 +2633,14 @@ let reductions_group =
       test
         "bad axes, empty extremes and refused dtypes raise naming the function"
         test_errors;
+      test "a refused axis is printed as passed" test_axis_printed;
+      test "a dead operand names the function called" test_dead_named;
+      test "an extreme of no term raises only where its result has an element"
+        test_empty_extremes;
       test "mean divides the sum by the count" test_mean;
+      prop "an integer mean is the exact mean truncated toward zero" int_case
+        law_int_mean;
+      test "integer means of extremes and empty axes" test_int_mean;
       test "a complex cumsum adds the parts, a narrow float's rounds once"
         test_scan_expansions;
       prop

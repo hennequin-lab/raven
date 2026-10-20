@@ -12,6 +12,7 @@
   test_reduce
   test_statistics
   test_activations
+  test_attention
   test_order
   test_sort
   test_fft
@@ -34,7 +35,11 @@
   test_print
   test_special
   test_patches
-  test_segments)
+  test_segments
+  test_sync
+  test_ptree
+  test_check
+  test_scan)
  (modules
   test_devices
   test_values
@@ -44,6 +49,7 @@
   test_reduce
   test_statistics
   test_activations
+  test_attention
   test_order
   test_sort
   test_fft
@@ -66,7 +72,11 @@
   test_print
   test_special
   test_patches
-  test_segments)
+  test_segments
+  test_sync
+  test_ptree
+  test_check
+  test_scan)
  (libraries
   nx
   nx_array
@@ -76,10 +86,10 @@
   nx_support
   rig
   threads.posix
+  unix
   windtrap)
- ; test_special reads nx's goldens of its special functions.
  (deps
-  (glob_files ../../../packages/nx/test/golden/special/*.golden)))
+  (glob_files golden/special/*.golden)))
 
 (copy_files
  (files ../lib/{grid,devices,route,prim,place,pairwise,expand,partial,exec,repr}.{ml,mli}))

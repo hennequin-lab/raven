@@ -221,7 +221,6 @@ type pending = {
   on : int;
   mutable parts : Rig_program.part list;
   slots : Rig_program.slot Dynarray.t;
-  mutable nparts : int;
 }
 
 (* A kernel of the schedule, for reports and timing: the device it runs on, its
@@ -497,22 +496,18 @@ let flush b =
              fixed = Iarray.of_list [];
            })
 
-(* The submission of [on] that takes the next part: one of at most the parts
-   its device always runs ([Rig.most_parts]). *)
+(* The submission of [on] that takes the next part. *)
 let pending b on =
   match b.pending with
-  | Some p
-    when p.on = on && p.nparts < Rig.most_parts (Dynarray.get b.rigs on) ->
-      p
+  | Some p when p.on = on -> p
   | _ ->
       flush b;
-      let p = { on; parts = []; slots = Dynarray.create (); nparts = 0 } in
+      let p = { on; parts = []; slots = Dynarray.create () } in
       b.pending <- Some p;
       p
 
 let add_part b p part =
   p.parts <- part :: p.parts;
-  p.nparts <- p.nparts + 1;
   if b.separate then flush b
 
 let slot_index p (s : Rig_program.slot) =
@@ -930,6 +925,56 @@ type t = {
   kernels : kernel list;
 }
 
+(* The schedule [linear] that [b] links. *)
+let assemble b linear =
+  List.iter (entry b) (Ops.src linear);
+  flush b;
+  let rigs = Dynarray.to_list b.rigs in
+  let inputs = Dynarray.to_list b.inputs in
+  let words = Dynarray.to_array b.words in
+  let desc =
+    {
+      Rig_program.devices = Iarray.of_list (List.map Rig.arch rigs);
+      memory = Iarray.of_list (Dynarray.to_list b.memory);
+      images = Iarray.of_list (Dynarray.to_list b.images);
+      inputs = Iarray.of_list (List.map snd inputs);
+      ints = Array.length words;
+      steps = Iarray.of_list (List.rev b.steps);
+    }
+  in
+  let loaded =
+    match Rig_program.load desc (Iarray.of_list rigs) with
+    | Ok l -> l
+    | Error why -> failwith (b.fn ^ ": " ^ why)
+  in
+  let n = Hashtbl.length b.cells in
+  let inputs = Array.of_list (List.map fst inputs) in
+  {
+    lock = Mutex.create ();
+    loaded;
+    params = List.rev b.params;
+    starts = Hashtbl.fold (fun k v l -> (k, v) :: l) b.starts [];
+    cells = b.cells;
+    env = { values = Array.make n 0; set = Array.make n false };
+    words;
+    inputs;
+    frame =
+      {
+        inputs = Array.make (Array.length inputs) (Rig.Buffer.of_string "");
+        ints = Array.make (Array.length words) 0;
+        step_points = Rig_program.step_points loaded;
+      };
+    calls = List.length (Ops.src linear);
+    kernels = List.rev b.kernels;
+  }
+
+(* Ends the holds of the buffers bound in [b], whose link raised, so that a
+   donation right after the raise consumes their memory. *)
+let release_bound (b : builder) =
+  Dynarray.iter
+    (function Whole (Bound (_, h)), _ -> Rig.Claim.release h | _ -> ())
+    b.inputs
+
 let link_with ~separate ~devices ?(bound = []) linear =
   let fn = "Tolk_engine.link" in
   if Ops.op linear <> Op.Linear then fail fn "not a compiled schedule";
@@ -976,46 +1021,12 @@ let link_with ~separate ~devices ?(bound = []) linear =
       kernels = [];
     }
   in
-  List.iter (entry b) (Ops.src linear);
-  flush b;
-  let rigs = Dynarray.to_list b.rigs in
-  let inputs = Dynarray.to_list b.inputs in
-  let words = Dynarray.to_array b.words in
-  let desc =
-    {
-      Rig_program.devices = Iarray.of_list (List.map Rig.arch rigs);
-      memory = Iarray.of_list (Dynarray.to_list b.memory);
-      images = Iarray.of_list (Dynarray.to_list b.images);
-      inputs = Iarray.of_list (List.map snd inputs);
-      ints = Array.length words;
-      steps = Iarray.of_list (List.rev b.steps);
-    }
-  in
-  let loaded =
-    match Rig_program.load desc (Iarray.of_list rigs) with
-    | Ok l -> l
-    | Error why -> failwith (fn ^ ": " ^ why)
-  in
-  let n = Hashtbl.length b.cells in
-  let inputs = Array.of_list (List.map fst inputs) in
-  {
-    lock = Mutex.create ();
-    loaded;
-    params = List.rev b.params;
-    starts = Hashtbl.fold (fun k v l -> (k, v) :: l) b.starts [];
-    cells = b.cells;
-    env = { values = Array.make n 0; set = Array.make n false };
-    words;
-    inputs;
-    frame =
-      {
-        inputs = Array.make (Array.length inputs) (Rig.Buffer.of_string "");
-        ints = Array.make (Array.length words) 0;
-        step_points = Rig_program.step_points loaded;
-      };
-    calls = List.length (Ops.src linear);
-    kernels = List.rev b.kernels;
-  }
+  match assemble b linear with
+  | t -> t
+  | exception e ->
+      let bt = Printexc.get_raw_backtrace () in
+      release_bound b;
+      Printexc.raise_with_backtrace e bt
 
 let link ~devices ?bound linear =
   link_with ~separate:(Setting.value Setting.debug >= 2) ~devices ?bound linear
@@ -1224,21 +1235,12 @@ let time ?(vars = []) t slots =
     Array.iter Rig.Point.wait ends
   in
   let (), events = Rig.Profile.take run in
-  let ns = ref 0 and timed = ref [] in
+  let ns = ref 0 in
   List.iter
     (function
       | Rig.Profile.Work w as e when Array.mem w.point !steps && runs_kernel t e
         ->
-          ns := !ns + (w.stop - w.start);
-          timed := w.device :: !timed
+          ns := !ns + (w.stop - w.start)
       | _ -> ())
     events;
-  (* A kernel's device that recorded none of the run's work may be lost. *)
-  List.iter
-    (fun k ->
-      if not (List.exists (Rig.equal k.device) !timed) then
-        Option.iter
-          (fun why -> raise (Rig.Lost (k.device, why)))
-          (Rig.lost k.device))
-    t.kernels;
   Float.of_int !ns *. 1e-9

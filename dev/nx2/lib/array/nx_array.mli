@@ -149,7 +149,10 @@ val get : ('v, 's) t -> int array -> 'v
 (** [get a i] is [a]'s element at index [i].
 
     Raises [Invalid_argument] unless [i] has [Layout.rank (layout a)] entries,
-    each in [\[0, Layout.dim (layout a) j)] for entry [j]. *)
+    each in [\[0, Layout.dim (layout a) j)] for entry [j], and, as {!refused}
+    raises it, if [a]'s buffer is dead, its memory is held exclusive or the
+    host does not address it. Raises {!Rig.Lost} if its memory is a lost
+    device's or follows work a lost device did not finish. *)
 
 val set : ('v, 's) t -> int array -> 'v -> unit
 (** [set a i x] stores [x] at [a]'s index [i]. Stores to the other elements of a
@@ -224,8 +227,8 @@ val transfer : src:('v, 's) t -> dst:('v, 's) t -> unit
     The host blits where it addresses both arrays' memory ({!blit}). Otherwise
     [src]'s device copies where it computes and the host does not address
     [src]'s memory, one {!Rig.Submission.copy} per run of elements consecutive
-    in both, in submissions of at most {!Rig.most_parts}; for other memory and
-    for a sub-byte array, the host gathers each run, brought by its own
+    in both, in one submission; for other memory and for a sub-byte array,
+    the host gathers each run, brought by its own
     {!Rig.Buffer.copy} from memory it does not address. That device stores into
     [dst] where [dst] is on it, the host where it addresses [dst]'s memory.
     Otherwise, if [dst]'s own runs are longer, it stores into a buffer of
@@ -251,8 +254,8 @@ val borrow : Rig.t -> ('v, 's) t -> ('v, 's) t option
 
 (** {1:bigarrays Bigarrays}
 
-    {!bigarray} and {!of_bigarray} share bytes with the value they take, without
-    a copy. *)
+    {!bigarray}, {!read} and {!of_bigarray} share bytes with the value they
+    take, without a copy. *)
 
 val bigarray :
   ('v, 's) Bigarray.kind ->
@@ -275,6 +278,30 @@ val bigarray :
     Raises [Invalid_argument] if [a]'s buffer is dead, or its memory is held
     exclusive by claims that have not consumed it. *)
 
+val read :
+  ('v, 's) Bigarray.kind ->
+  ('v, 's) t ->
+  (('v, 's, Bigarray.c_layout) Bigarray.Genarray.t -> 'a) ->
+  'a
+(** [read k a f] is [f b], where [b] is a bigarray of [a]'s shape over [a]'s own
+    bytes; an [a] with no element gives an empty [b], whatever its memory. It
+    claims [a]'s memory for reading, waits for the device work a read must
+    follow ({!Rig.Buffer.wait}), and ends the claim when [f] returns or raises.
+    The memory stays inside the claims, so a donation can hold it exclusive once
+    [f] returns, which {!bigarray} prevents for good.
+
+    [f] must not write through [b], since work that reads the memory may still
+    run, and must not keep [b] after it returns: a donation or
+    {!Rig.Buffer.free} can then give the memory to another array. The claim
+    orders [b] only against donations: work another domain submits while [f]
+    runs needs the program's own synchronization.
+
+    Raises [Invalid_argument] naming [Nx_array.read] unless [a] is C-contiguous
+    ({!Layout.is_contiguous}) and of rank at most 16, the most axes a Bigarray
+    has, and, if it has an element, the host addresses its memory; or, as
+    {!refused} raises it, if [a]'s buffer is dead or its memory is held
+    exclusive. Raises {!Rig.Lost} as {!Rig.Buffer.wait} does. *)
+
 val of_bigarray :
   ('v, 's) Dtype.t ->
   ('v, 's, Bigarray.c_layout) Bigarray.Genarray.t ->
@@ -286,7 +313,17 @@ val of_bigarray :
     Raises [Invalid_argument] as {!v} does if [b]'s data is not aligned for its
     elements. *)
 
-(** {1:kernels Kernels} *)
+(** {1:kernels Kernels}
+
+    The door and the kernels that read through it keep other domains
+    waiting to collect for no longer than about one unloaded core's copy of
+    1 MiB at a time, however many arrays they claim and release. Past
+    {!max_operands} arrays, other threads of the calling domain may run
+    OCaml code while the door claims or releases them. *)
+
+val max_operands : int
+(** [max_operands] is [18], the most arrays one loop iterates: [nx_array.h]'s
+    [NX_MAX_OPERANDS], and the most layouts {!Layout.coalesce} takes. *)
 
 (** The type for what a kernel answers, and the door. A kernel answers [Done]
     once its work is done on the host or queued on the device's timeline,
@@ -309,10 +346,10 @@ type answer =
       (** The operands' shapes do not fit the operation: operands of one loop
           of different shapes, or shapes its descriptor refuses. *)
   | Bad_arity
-      (** No operand, more than a loop takes, or other destinations than an
-          operation names, as a reduction given other than its one or two: a
-          guard for C callers, which a call within a kernel library's
-          contract never meets. *)
+      (** No operand, more than {!max_operands} to a loop, or other
+          destinations than an operation names, as a reduction given other
+          than its one or two: a guard for C callers, which a call within a
+          kernel library's contract never meets. *)
 
 val door :
   written:any array -> read:any array -> ('a -> unit) -> 'a -> answer
@@ -326,12 +363,13 @@ val door :
     [Held_exclusive] and [Read_only] come before the others: a dead array is
     [Dead_buffer] whatever else is wrong with it.
 
-    Two arrays are {e identical} when they have one element width, lie in one
-    memory, and place every index at the same byte. A written array may share
-    bytes with read arrays identical to it, and with no other: [Overlapping]
-    for one that shares a byte with another written array, or with a read
-    array not identical to it, of another width or placing an index at another
-    byte.
+    Two arrays are {e identical} when they have one element width and place
+    every index at the same bits, which two memories may hold, as an io
+    memory and a bigarray over its pages do ({!Rig.Buffer.overlaps}). A
+    written array may share bytes with read arrays identical to it, and with
+    no other: [Overlapping] for one that shares a byte with another written
+    array, or with a read array not identical to it, of another width or
+    placing an index at other bits.
 
     It waits for no device work. [f] touches the arrays' elements only through
     work it submits with {!Rig.submit}, naming each array of [written] in its

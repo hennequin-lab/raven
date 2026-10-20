@@ -282,18 +282,42 @@ val capability : t -> Rig_amd_abi.Capability.t
     {- on ["COPY:0"], a copy between two GPU addresses, its handles, whose
        ranges do not overlap.}}
 
-    [room] returns [RIG_NEVER] if the parts exceed what the device holds
-    when it is idle, or if a part is one it does not run. An idle device
-    holds 512 parts, and the words and argument bytes that fit in the
-    compute ring, half the copy ring and half the argument segment, since a
-    submission's SDMA packets and argument bytes never wrap. The device's
-    [most_parts] ({!Rig_edge.type-facts}) is the most parts that an idle
-    device holds, each a launch whose arguments take at most 4352 bytes,
-    which every kernel of at most 4096 bytes of explicit arguments and code
-    object version 5's 256 bytes of implicit ones meets, or a copy of at
-    most {!Rig_amd_abi.Sdma.max_copy} bytes (1 GiB; 4 MiB on SDMA engines
-    before 4.4.2 and on 5.0 and 5.1). A launch of more arguments, a longer
-    copy and words take the room their sizes take. It does not run:
+    A submission takes fewer words than the compute ring holds, at most
+    half the copy ring and at most half the argument segment, since its SDMA
+    packets and argument bytes never wrap. The segment also holds 8 bytes
+    per part, the word through which a part of one queue orders a part of
+    the other. [room] returns [RIG_NEVER] for parts that exceed the largest
+    rings the path makes ([most_ring] of {!type-path}: 2 GiB through
+    [Rig_amd_amdgpu]; through [Rig_amd_pci] 16 GiB for the compute queue and
+    8 GiB for the copy queue, but 16 MiB on SDMA 4, whose one queue that
+    path programs keeps the ring the device opens with), or that the device
+    does not run, and [RIG_GROW] for parts that exceed its rings or its
+    segment. On SDMA 4 over [Rig_amd_pci], a submission of copies past half
+    that ring, about 170,000 copies of one packet, never fits: a strided
+    copy of that many runs raises [Invalid_argument] there.
+
+    {!val-grow} then makes, of [Pinned] memory of the first power of two
+    from 4096 bytes that holds twice what the parts need and at most
+    [most_ring], a segment, or for each ring they exceed a new queue of the
+    path's on a new ring, with read and write positions of its own at 0
+    ([queue] of {!type-path}). The next [room] that needs them installs them
+    once the device reached every value submitted, and every [room] answers
+    [RIG_LATER] until then, so the device's work ends while other threads
+    submit: later work goes to the new queue, whose doorbell is another,
+    and the replaced queue, which read every packet, runs beside it until
+    the next growth or {!val-stop} destroys it ([retire] of {!type-path})
+    and gives back its ring. A growth whose parts need more than a queue a
+    growth made and no [room] installed replaces that queue, which ran no
+    work. It makes the new queue first and then destroys the one it
+    replaces. Where the path answers [Full] for the new one, as over
+    [Rig_amd_pci], it destroys the old one first and makes the new one in
+    its slot, so over [Rig_amd_pci] a path holds at most two queues of a
+    kind. Segments and rings never shrink. {!val-grow} answers [Short n] if
+    the path lacks [n] bytes of memory, or another resource for a queue,
+    having made nothing that stays and kept what a growth handed, and
+    raises {!Fault} if the path refuses a queue for another reason. A copy
+    takes an SDMA copy packet for each 1 GiB it moves (4 MiB on SDMA
+    engines before 4.4.2 and on 5.0 and 5.1). The device does not run:
     {ul
     {- a copy of one byte or more on ["COMPUTE:0"];}
     {- words on an AQL queue that are not whole packets;}
@@ -317,9 +341,9 @@ val capability : t -> Rig_amd_abi.Capability.t
     {b Times.} While a profile is taken, each queue a value's work enters
     writes the GPU's clock after the value's waits, and the queue that
     releases the value writes it before the release: on ["COMPUTE:0"] once
-    the dispatches before it have completed ({!Rig_amd_abi.Pm4.copy_data}
-    of the clock), on ["COPY:0"] after a fence has waited for its copies
-    ({!Rig_amd_abi.Sdma.timestamp}). [settle], or a later [submit],
+    the dispatches before it have completed (PM4's [COPY_DATA] of the
+    clock), on ["COPY:0"] after a fence has waited for its copies (SDMA's
+    [TIMESTAMP]). [settle], or a later [submit],
     converts the earliest start and the end to the host's clock, in value
     order, with each no earlier than the end of the value converted before
     it, since a value's work starts once every earlier value's work has
@@ -334,15 +358,19 @@ val capability : t -> Rig_amd_abi.Capability.t
     whose readings lie more than 10 µs apart is dropped, and the measure at
     open keeps the first of sixteen reads within 10 µs, or the narrowest,
     which the first re-measure within 10 µs replaces. A time is thus within
-    half its measure's interval, 5 µs once a measure within the bound is
-    taken, plus the line's rate error over the time since the latest
-    measure, at most 62.5 ms. That rate error is at most 10 µs over the
-    measures' distance, 10 ppm, and the clock's own until they are a second
-    apart. Through KFD, KFD reads its clock right after the GPU's, and
-    the device maps that clock to the host's with a pair of readings of
-    its own. With {!Round_trip} the device measures at open only, and its
-    times drift from the host's clock at the clock's rate error since
-    open.
+    its measure's deviation plus the line's rate error over the time since
+    the latest measure, at most 62.5 ms. A measure's deviation is half its
+    interval, 5 µs once a measure within the bound is taken. The rate error
+    is at most the two measures' deviations over their distance, 10 µs over
+    a second (10 ppm) for deviations of 5 µs, and the clock's own until
+    they lie a second apart. Through KFD, KFD samples its host clock after
+    it reads the GPU's counter, and the device maps that sample to the
+    host's clock with a pair of readings of its own. A measure's deviation
+    is then half its interval plus KFD's gap between the counter read and
+    its host sample. That gap is one-sided, usually one register read, and
+    unbounded under preemption. With {!Round_trip} the device measures at
+    open only, and its times drift from the host's clock at the clock's
+    rate error since open.
 
     {2:stop Stop}
 
@@ -391,6 +419,16 @@ type clock =
       (** The device measures at open only, with a stamp its compute queue
           writes between two readings of the host's clock, the closest of
           eight. *)
+
+(** The type for a path's refusal of a call. *)
+type refusal =
+  | Lacking of string
+      (** The path, the kernel driver or the GPU lacked memory or another
+          resource for it, as the reason says. *)
+  | Full of string
+      (** The queues of the kind already hold every slot the path has for
+          them, as the reason says; a [retire] frees one. *)
+  | Refused of string  (** Any other refusal, as the reason says. *)
 
 type 'm path = {
   key : 'm Type.Id.t;
@@ -448,13 +486,30 @@ type 'm path = {
     bytes:int ->
     read:int ->
     write:int ->
-    (int, string) result;
+    (int, refusal) result;
       (** [queue k ~ring ~bytes ~read ~write] makes a hardware queue that
           reads packets of [k] from the [bytes] bytes of [Pinned] memory at
-          [ring], writes its read position to the 64-bit word at [read] and
-          reads its write position from the word at [write], all GPU
-          addresses. It is the host address of the queue's 64-bit doorbell, or
-          [Error msg]. *)
+          [ring], a power of two of at most [most_ring k], writes its read
+          position to the 64-bit word at [read] and reads its write position
+          from the word at [write], all GPU addresses. Its read and write
+          positions start at 0, and [write] holds 0. It is the host address
+          of the queue's 64-bit doorbell, or [Error r]. The device makes one
+          queue of each kind at open, and one more of a kind for each growth
+          of that queue's ring ({!section-c}), which runs beside the queue it
+          replaces until that one goes ([retire]). A path whose slots for
+          the kind all hold queues answers [Error (Full _)], and needs no
+          memory for a queue in a slot a [retire] freed; a path that never
+          answers [Full] holds three queues of a kind while a growth
+          replaces a queue no work ran on. *)
+  retire : int -> unit;
+      (** [retire bell] destroys the queue [queue] made whose doorbell is at
+          [bell], which has read every packet up to its write position. The
+          device then gives back its ring and positions. It raises {!Fault}
+          if the path could not destroy it. *)
+  most_ring : [ `Pm4 | `Aql | `Sdma ] -> int;
+      (** [most_ring k] is the most bytes of a ring of a queue of kind [k],
+          a power of two: the bound of the path's interface or of the queue's
+          registers. *)
   hdp : int option;
       (** The host address of the 32-bit register whose store flushes the
           GPU's host data path, after which host writes through the memory BAR
@@ -556,8 +611,8 @@ module Lock : sig
 
   val create : unit -> t
   (** [create ()] is a new lock. A thread may take it while it holds an
-      image's lock, a device's, or rig.pci's vendor lock or a hold's
-      ([Rig_pci.Gpus]), and may take rig.pci's memory locks while it holds
+      image's lock, a device's, or rig.pci's driver lock or a hold's
+      ([Rig_pci.Driver]), and may take rig.pci's memory locks while it holds
       it. *)
 
   val protect : t -> (unit -> 'a) -> 'a
@@ -584,17 +639,14 @@ end
 
 (**/**)
 
-(* [renumber ~age g v] makes [v] the value after [g]'s last one: the timeline
-   word and the last value given become [v - 1], and every slot word is as if
-   last written [age] (defaults to [0]) values earlier, at [v - 1 - age]. [g] is
-   idle: its word holds the last value it was given. Tests reach the values a
-   long run reaches, such as those past 2^31 and 2^32, and the slots' refresh
-   past 2^31 values of age, without making that many submissions.
+(* [renumber g v] makes [v] the value after [g]'s last one: the timeline word
+   and the last value given become [v - 1]. [g] is idle: its word holds the
+   last value it was given. Tests reach the values a long run reaches, such as
+   those past 2^31 and 2^32, without making that many submissions.
 
    Raises [Invalid_argument] if [g] has stopped or is not idle, if [v - 1] is
-   below its last value, if [age] is negative or above [v - 1], or from a
-   callback inside a lock ({!Lock.check}). *)
-val renumber : ?age:int -> t -> int -> unit
+   below its last value, or from a callback inside a lock ({!Lock.check}). *)
+val renumber : t -> int -> unit
 
 (* [ring g q] is [(n, size)]: the 32-bit words [g] placed on the ring of its
    queue [q] since it made the ring, and the ring's size in words. A word's

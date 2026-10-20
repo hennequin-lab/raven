@@ -88,6 +88,16 @@ val wait_write : memory -> unit
     stamps, for an access that follows every last write. [m]'s allocation
     stays reachable until it returns. *)
 
+val reached_points : memory -> bool
+(** [reached_points m] is [true] iff every point that {!wait_points}[ m]
+    waits for is done ({!Dev.reached_point}). It visits each point, so it
+    commits the work of each device that has one not done, and raises
+    {!Dev.Lost} for any a lost device did not reach. It allocates nothing. *)
+
+val reached_write : memory -> bool
+(** [reached_write m] is {!reached_points} for the points {!wait_write}[ m]
+    waits for. *)
+
 val check_points : int -> unit
 (** [check_points st] raises {!Dev.Lost} if a point of [st] is on a lost
     device and not done. *)
@@ -224,7 +234,9 @@ val no_hold : token
 val release_hold_now : token -> holds -> unit
 (** [release_hold_now t h] releases the holds of [h], whose token is [t],
     now, for a caller that gives them up: [t]'s record goes on the list of
-    holds with none left to release. *)
+    holds with none left to release. Each hold is released once, however many
+    calls on any domains run it, and [t]'s collection then does nothing. It
+    takes no lock. *)
 
 val release_early : alloc -> unit
 (** [release_early a] returns the memory of [a], whose buffers are dead, as
@@ -344,14 +356,21 @@ val of_io : device -> io_region -> access:access -> int -> memory
 (** {1:allocation Allocation and drains}
 
     An allocation that its budget or its driver refuses enters the
-    out-of-memory ladder ({!reclaiming}), which runs up to three rounds and
-    tries again after each. In a round, on every device whose lock is free,
-    cached memory that counts in the refusing budget returns once the work
-    submitted on the device until then is done, waiting for that work. A
-    device whose submitted work holds back the return of memory that counts
-    in the budget is waited for too. For the host's budget, the host's kept
-    buffers return as well. Then every device drains, and from the second
-    round a full major collection runs and every device drains again. *)
+    out-of-memory ladder ({!reclaiming}), whose rounds
+    {!Rig.section-reclaim} states. A round frees, on each device that is
+    live or Stopped, the cached memory that counts in the refusing budget,
+    and for the host's budget the host's kept buffers. Then every device
+    drains, and from the second round every device's free staging halves
+    return ({!return_half}), a full major collection runs and every device
+    drains again. *)
+
+val return_half : buffer -> unit
+(** [return_half b] returns [b], a staging half ({!Def.slot}) that its slot no
+    longer holds, as {!Rig.Buffer.free} returns memory: [b] is consumed, and
+    its memory goes back once the work that uses it is done, through its
+    device's retiring memory, so a leg still queued on it finishes first. A
+    half that a claim holds is left to its collection. The caller holds no
+    lock. *)
 
 val drain : device -> unit
 (** [drain d] releases the collected holds ({!hold_token}), moves [d]'s

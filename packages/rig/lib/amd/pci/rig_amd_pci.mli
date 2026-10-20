@@ -28,10 +28,10 @@
     {ul
     {- While [amdgpu] is bound, the kernel driver holds the GPU. {!detach}
        takes it from the kernel driver, and {!attach} gives it back.}
-    {- A detached GPU ({!Rig_pci.Gpus}) is bound to no kernel driver, or to
+    {- A detached GPU ({!Rig_pci.Driver}) is bound to no kernel driver, or to
        [vfio-pci], [amdgpu] has let go of it, and no process holds it.}
     {- A held GPU belongs to this process, from [Rig.open_] until its device
-       stops ({!Rig_pci.Gpus.type-hold}). Closing the device stops the
+       stops ({!Rig_pci.Driver.type-hold}). Closing the device stops the
        GPU's work and leaves it detached, marked clean, so that the next
        open boots it in part ({!section-opening}).}
     {- A GPU is lost when a fault or a hang ended its device, a boot failed
@@ -59,8 +59,7 @@
     MI300 and MI350 series, physical and virtual functions), 11.0.0 and
     11.0.2, and 12.0.0 and 12.0.1. It reads the GPU's discovery table
     without changing the GPU's state, and refuses a GPU with a block of
-    another version before the boot writes. {!val-report} tells, from a GPU's
-    discovery table, whether the library boots it.
+    another version before the boot writes.
 
     {b Firmware.} The images are files of linux-firmware's [amdgpu/]
     directory at commit [0a6871b1], each pinned by its BLAKE2b-256 digest.
@@ -92,16 +91,19 @@
     ["AMD-PCI:2"], …. {!buses}, {!gpu} and {!reset} also reach another
     machine ({!Rig_pci.Machine.t}). *)
 
-val buses : ?machine:Rig_pci.Machine.t -> unit -> string list
+val buses : ?machine:Rig_pci.Machine.t -> unit -> (string list, string) result
 (** [buses ~machine ()] is the bus addresses of the AMD GPUs of [machine]
     (defaults to {!Rig_pci.Machine.this}) ({!Rig_amd.is_gpu}), in bus order
     ({!Rig_pci.Machine.val-functions}): GPU [i] is the [i]th, whichever driver
-    holds it. It is [[]] for a machine that lists no PCI functions, such as
-    this one off Linux. Listing them changes nothing on the machine. *)
+    holds it. It is [Ok []] for a machine that lists no PCI functions, such
+    as this one off Linux. Listing them changes nothing on the machine.
 
-val count : ?machine:Rig_pci.Machine.t -> unit -> int
-(** [count ~machine ()] is [List.length (buses ~machine ())], so GPUs are
-    numbered [0] to [count ~machine () - 1]. *)
+    [Error why] if the machine's PCI functions cannot be listed. *)
+
+val count : ?machine:Rig_pci.Machine.t -> unit -> (int, string) result
+(** [count ~machine ()] is the number [n] of {!buses}, so GPUs are numbered
+    [0] to [n - 1], or their [Error]. A machine with no AMD GPU is
+    [Ok 0]. *)
 
 (** {1:opening Opening}
 
@@ -144,7 +146,7 @@ val count : ?machine:Rig_pci.Machine.t -> unit -> int
     faults with their address, shader errors, and fatal hardware errors with
     its machine-check banks. {!Rig_amd.val-sleep} raises them. No kernel
     bounds the GPU's work, so the device declares [hang_ms]
-    ({!Rig_edge.type-facts}) of {!Rig_pci.Gpus.hang_ms}. A device stopped
+    ({!Rig_edge.type-facts}) of {!Rig_pci.Driver.hang_ms}. A device stopped
     with the fault it was lost for, a hang included, leaves its GPU lost,
     since its stop does not wait for the queues to leave.
 
@@ -153,9 +155,9 @@ val count : ?machine:Rig_pci.Machine.t -> unit -> int
     others. Each holds a lock for its whole run, a boot included, so a call
     of rig's from a callback on its thread meanwhile is made inside a lock
     and raises [Invalid_argument] ([Rig]'s domains section). An opener's
-    [make], {!report}, {!detach}, {!attach} and {!reset}, called from a
-    callback inside a lock, raise [Invalid_argument], having changed
-    nothing ({!Rig_edge.section-drivers}). *)
+    [make], {!detach}, {!attach} and {!reset}, called from a callback
+    inside a lock, raise [Invalid_argument], having changed nothing
+    ({!Rig_edge.section-drivers}). *)
 
 val gpu :
   ?machine:Rig_pci.Machine.t ->
@@ -173,14 +175,23 @@ val gpu :
     [make ()] returns [Error msg], [msg] starting with the GPU's name.
     Before the boot writes to the GPU, it refuses:
     {ul
-    {- a GPU [i] the machine does not have, saying how many it has;}
+    {- a machine whose PCI functions cannot be listed, saying why;}
+    {- a GPU [i] the machine does not have, saying how many AMD GPUs it
+       has;}
     {- a GPU this process holds, or one [amdgpu] has not let go of;}
     {- a function the process cannot take, with
        {!Rig_pci.Function.take}'s reason;}
-    {- a GPU whose {!val-report} is [Error] or lacks an image, with the report's
-       reason;}
-    {- a GPU in a fabric left running, or one whose memory its memory
-       controller cannot place whole;}
+    {- a GPU whose discovery table is malformed, or lacks a block the boot
+       programs, naming the block;}
+    {- a GPU one of whose blocks has a version this library does not boot
+       or has no pinned image for, naming the block and its version;}
+    {- a GPU one of whose images is in none of the directories with its
+       pinned digest, naming the image, the directories searched and the
+       files of another digest;}
+    {- a GPU one of whose images is not laid out as its format says;}
+    {- a GPU in a fabric left running, one of a fabric whose machine's AMD
+       GPUs cannot be listed, or one whose memory its memory controller
+       cannot place whole;}
     {- a machine whose windows ({!Rig_pci.Window}) are not mapped into the
        process.}}
     A reset the open needs that fails returns its reason. After the boot's
@@ -190,11 +201,76 @@ val gpu :
 
     Raises [Invalid_argument] if [i < 0]. *)
 
-(** {1:reports Boot reports}
+(** {1:changes Changes to the machine}
 
-    A report says what an open loads to boot a GPU, and whether it refuses
-    the GPU for its blocks or its firmware, from the GPU's discovery table.
-    A report needs no GPU and writes nothing. *)
+    {!detach}, {!attach} and {!reset} change the machine as
+    {!Rig_pci.Driver} describes, and their changes persist after the process.
+    Each refuses a GPU that a process holds, this one included, over PCI or
+    through a file of its kernel driver, such as the GPU's render node.
+    {!detach} and {!attach} act on this machine alone, and need
+    [CAP_SYS_ADMIN] and write access to the files under [/sys/bus/pci] they
+    write, which root has. Each returns [Error msg] if the machine's PCI
+    functions cannot be listed. An [Error] or a [Part_way] for a file names
+    it. *)
+
+val detach : int -> (Rig_pci.Driver.progress, string) result
+(** [detach i] takes GPU [i] of this machine from [amdgpu] as
+    {!Rig_pci.Driver.detach} does, and makes its memory BAR as large as the
+    BAR and its bridge allow. It waits up to 30 s for KFD to drop the files
+    of the GPU's DRM nodes that it holds for processes that have exited,
+    reading them in debugfs, which must be mounted at [/sys/kernel/debug].
+    Once [detach] returns [Ok Detached], [amdgpu]'s last write to the GPU is
+    done.
+
+    The result is as {!Rig_pci.Driver.detach} returns it. While KFD's
+    topology still lists the GPU or its [ip_discovery] directory stays after
+    the unbind, [amdgpu] has not let go of the GPU. [detach] then returns
+    [Ok (Unreleased msg)], and a later [detach] waits up to 30 s for both
+    to go and finishes, or returns [Error msg] if they stay.
+
+    Raises [Invalid_argument] if [i < 0]. *)
+
+val attach : int -> (unit, string) result
+(** [attach i] gives GPU [i] of this machine back to [amdgpu] as
+    {!Rig_pci.Driver.attach} does, resetting it first as {!reset} does if it
+    is detached. The result is [Error msg] as {!Rig_pci.Driver.attach}
+    returns it.
+
+    After a detach, [amdgpu] serves the GPU's render node again, but KFD
+    refuses every process until the [amdgpu] module is reloaded, so
+    [Rig_amd_amdgpu] opens the GPU only after that.
+
+    Raises [Invalid_argument] if [i < 0]. *)
+
+val reset : ?machine:Rig_pci.Machine.t -> int -> (unit, string) result
+(** [reset ~machine i] stops whatever runs on GPU [i] of [machine] (defaults
+    to {!Rig_pci.Machine.this}) and, if its security processor's OS runs,
+    resets the GPU whole (mode 1), which clears what any driver left. A GPU
+    no OS runs on keeps its state, but for its interrupt rings, which
+    [reset] turns off. A GPU of a fabric is only stopped ({!section-opening}),
+    and a virtual function gives back its access for its physical function
+    to reset. Afterwards the GPU opens with a full boot.
+
+    The result is [Error msg] if [machine] has no GPU [i] ({!count}), if a
+    process holds the GPU, if its function cannot be taken, or if after the
+    reset the GPU does not respond, its configuration differs, its security
+    processor or interrupt rings still run, or its bootloader is not ready with
+    no OS running. Only a power cycle recovers a GPU that does not respond or
+    whose bootloader is not ready.
+
+    Raises [Invalid_argument] if [i < 0]. *)
+
+(** {1:references References}
+
+    {ul
+    {- PCI-SIG. {e PCI Express Base Specification}, 7.5.3.7 "Link Control
+       Register": ASPM.}} *)
+
+(**/**)
+
+(* Boot reports, for the suites and the bench that check, without a GPU,
+   what an open loads to boot a GPU and whether it refuses the GPU for its
+   blocks or its firmware. A report needs no GPU and writes nothing. *)
 
 type block = {
   name : string;  (** As the kernel names it, such as ["GC"]. *)
@@ -240,71 +316,6 @@ val report : firmware:string list -> string -> (report, string) result
     block a boot programs is missing or has a version this library does not
     boot or no pinned image for, naming the block and its version, or if a
     file found with its pinned digest is not laid out as its format says. *)
-
-(** {1:changes Changes to the machine}
-
-    {!detach}, {!attach} and {!reset} change the machine as
-    {!Rig_pci.Gpus} describes, and their changes persist after the process.
-    Each refuses a GPU that a process holds, this one included, over PCI or
-    through a file of its kernel driver, such as the GPU's render node.
-    {!detach} and {!attach} act on this machine alone, and need
-    [CAP_SYS_ADMIN] and write access to the files under [/sys/bus/pci] they
-    write, which root has. An [Error] or a [Part_way] for a file names it. *)
-
-val detach : int -> (Rig_pci.Gpus.progress, string) result
-(** [detach i] takes GPU [i] of this machine from [amdgpu] as
-    {!Rig_pci.Gpus.detach} does, and makes its memory BAR as large as the
-    BAR and its bridge allow. It waits up to 30 s for KFD to drop the files
-    of the GPU's DRM nodes that it holds for processes that have exited,
-    reading them in debugfs, which must be mounted at [/sys/kernel/debug].
-    Once [detach] returns [Ok Detached], [amdgpu]'s last write to the GPU is
-    done.
-
-    The result is as {!Rig_pci.Gpus.detach} returns it. While KFD's
-    topology still lists the GPU or its [ip_discovery] directory stays after
-    the unbind, [amdgpu] has not let go of the GPU. [detach] then returns
-    [Ok (Unreleased msg)], and a later [detach] waits up to 30 s for both
-    to go and finishes, or returns [Error msg] if they stay.
-
-    Raises [Invalid_argument] if [i < 0]. *)
-
-val attach : int -> (unit, string) result
-(** [attach i] gives GPU [i] of this machine back to [amdgpu] as
-    {!Rig_pci.Gpus.attach} does, resetting it first as {!reset} does if it
-    is detached. The result is [Error msg] as {!Rig_pci.Gpus.attach}
-    returns it.
-
-    After a detach, [amdgpu] serves the GPU's render node again, but KFD
-    refuses every process until the [amdgpu] module is reloaded, so
-    [Rig_amd_amdgpu] opens the GPU only after that.
-
-    Raises [Invalid_argument] if [i < 0]. *)
-
-val reset : ?machine:Rig_pci.Machine.t -> int -> (unit, string) result
-(** [reset ~machine i] stops whatever runs on GPU [i] of [machine] (defaults
-    to {!Rig_pci.Machine.this}) and, if its security processor's OS runs,
-    resets the GPU whole (mode 1), which clears what any driver left. A GPU
-    no OS runs on keeps its state, but for its interrupt rings, which
-    [reset] turns off. A GPU of a fabric is only stopped ({!section-opening}),
-    and a virtual function gives back its access for its physical function
-    to reset. Afterwards the GPU opens with a full boot.
-
-    The result is [Error msg] if [i >= count ~machine ()], if a process
-    holds the GPU, if its function cannot be taken, or if after the reset
-    the GPU does not respond, its configuration differs, its security
-    processor or interrupt rings still run, or its bootloader is not ready
-    with no OS running. Only a power cycle recovers a GPU that does not
-    respond or whose bootloader is not ready.
-
-    Raises [Invalid_argument] if [i < 0]. *)
-
-(** {1:references References}
-
-    {ul
-    {- PCI-SIG. {e PCI Express Base Specification}, 7.5.3.7 "Link Control
-       Register": ASPM.}} *)
-
-(**/**)
 
 (* What a driver that boots the GPU itself reads from the GPU and its
    firmware, and writes for the GPU's blocks. Tests check them without a

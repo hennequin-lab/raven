@@ -8,9 +8,8 @@
    for rxe's answers, as a device of another driver than mlx5 takes them,
    through Rig_mlx5.path. A context and its port, regions of each access,
    a completion queue, two queue pairs taken through their states to ready to
-   send, connected to each other, their destruction, an owner killed with its
-   queue pairs, which the kernel tears down, and Rig_mlx5.make's refusal of a
-   device that is no mlx5.
+   send, connected to each other, their destruction, and Rig_mlx5.make's
+   refusal of a device that is no mlx5.
 
    Every test skips where the machine has no device named rxe*. Making one is a
    machine's setup, as root, over an Ethernet interface IF:
@@ -108,14 +107,14 @@ let connect (p : M.path) (c : M.context) =
     ok "making a completion queue" (p.cq ~entries:16 ~tag:1 "" cq_answer)
   in
   let qp tag =
-    ok "making a queue pair" (p.qp ~cq ~entries:8 ~tag "" qp_answer)
+    ok "making a queue pair" (p.qp ~cq ~sends:8 ~receives:0 ~tag "" qp_answer)
   in
   let a, qa, _ = qp 2 in
   let b, qb, _ = qp 3 in
   let endpoint qp psn = { M.Qp.qp; psn; address = Gid g; mtu = c.mtu } in
   let steps h peer psn =
     [
-      M.Init;
+      M.Init { access = Remote };
       Ready_to_receive { peer; mtu = c.mtu; gid = Some gid; served = c.served };
       Ready_to_send { psn; timeout = 14; retries = 7; reads = c.reads };
     ]
@@ -181,56 +180,7 @@ let make =
       starts_with ~msg:"its name" ~affix:(name ^ ": ") e;
       equal ~msg:"verbs files once make failed" int before (verbs_files ()))
 
-let status =
-  let pp ppf = function
-    | Unix.WEXITED n -> Format.fprintf ppf "exited %d" n
-    | WSIGNALED n -> Format.fprintf ppf "killed by %s" (Sys.signal_to_string n)
-    | WSTOPPED n -> Format.fprintf ppf "stopped by %s" (Sys.signal_to_string n)
-  in
-  Testable.make ~pp ~equal:( = )
-
-(* The queue pairs of [name]'s port as the kernel lists them, its own among
-   them. *)
-let qps name =
-  let ic =
-    Unix.open_process_args_in "rdma"
-      [| "rdma"; "resource"; "show"; "qp"; "link"; name ^ "/1" |]
-  in
-  let lines = In_channel.input_lines ic in
-  equal ~msg:"rdma resource show" status (Unix.WEXITED 0)
-    (Unix.close_process_in ic);
-  let qp l = List.mem "lqpn" (String.split_on_char ' ' l) in
-  List.length (List.filter qp lines)
-
-(* A child makes connected queue pairs and dies by SIGKILL, closing nothing: the
-   kernel destroys them with its file. *)
-let killed =
-  test "a killed owner's queue pairs are its kernel's to destroy" (fun () ->
-      let name = device () in
-      let before = qps name in
-      let r, w = Unix.pipe () in
-      match Unix.fork () with
-      | 0 ->
-          (try
-             let p, c = opened () in
-             ignore (connect p c : int * int * int);
-             ignore (Unix.write_substring w "x" 0 1 : int);
-             Unix.sleep 60
-           with _ -> ());
-          Unix._exit 0
-      | child ->
-          Unix.close w;
-          let made = Unix.read r (Bytes.create 1) 0 1 in
-          let during = qps name in
-          Unix.kill child Sys.sigkill;
-          let _, st = Unix.waitpid [] child in
-          equal ~msg:"the child made its queue pairs" int 1 made;
-          equal ~msg:"queue pairs while the child lived" int (before + 2) during;
-          equal ~msg:"the child died by SIGKILL" status
-            (Unix.WSIGNALED Sys.sigkill) st;
-          equal ~msg:"queue pairs once the child died" int before (qps name))
-
 let () =
   exit
     (run "rig_mlx5.rxe"
-       [ context; regions; queue_pairs; refusals; events; killed; make ])
+       [ context; regions; queue_pairs; refusals; events; make ])

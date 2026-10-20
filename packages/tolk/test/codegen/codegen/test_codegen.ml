@@ -728,9 +728,43 @@ let makes_anew_after_a_failure () =
   ignore (Codegen.to_program k r);
   equal int ~msg:"compilations" 2 (Atomic.get calls)
 
+(* [made] waits for no program being made: a compiler that starts compiling,
+   then holds the compilation, and with it the program's entry, until [made]
+   has answered. *)
+let made_waits_for_none () =
+  let started = Atomic.make false and answered = Atomic.make false in
+  let compiler =
+    Renderer.Compiler.v (fun src ->
+        Atomic.set started true;
+        while not (Atomic.get answered) do
+          Domain.cpu_relax ()
+        done;
+        src)
+  in
+  let r = renderer_for ~compiler clang_target and k = fresh_kernel () in
+  let making = Domain.spawn (fun () -> Codegen.to_program k r) in
+  while not (Atomic.get started) do
+    Domain.cpu_relax ()
+  done;
+  is_none ~msg:"while it is made" (Codegen.made k r);
+  Atomic.set answered true;
+  let p = Domain.join making in
+  match Codegen.made k r with
+  | Some q -> same_graph p q
+  | None -> fail "the made program is not returned"
+
 let caching =
   group "programs are kept"
     [
+      test "made is no program before to_program, then its program" (fun () ->
+          let _, r = counting () in
+          let k = fresh_kernel () in
+          is_none ~msg:"before" (Codegen.made k r);
+          let p = Codegen.to_program k r in
+          match Codegen.made k r with
+          | Some q -> same_graph p q
+          | None -> fail "the made program is not returned");
+      test "made waits for no program being made" made_waits_for_none;
       test "a second call with an equal kernel compiles nothing"
         keeps_its_programs;
       test "calls from several domains at once make one program, compiled once"
@@ -866,6 +900,16 @@ let recovers damage () =
   equal outcome ~msg:"made again" (the_program ()) (made db);
   equal outcome ~msg:"then read back" (the_program ()) (read_from_disk db)
 
+(* A program read back takes its binary from its compiler's table: with the
+   binaries removed, it is compiled again. *)
+let takes_its_binary () =
+  let db = Disk_cache.fresh () in
+  equal outcome ~msg:"made" (the_program ()) (made db);
+  List.iter Sys.remove (Disk_cache.entries ~table:"test_codegen_bytes" db);
+  equal outcome ~msg:"binaries removed" compiled (read_from_disk db);
+  equal outcome ~msg:"made again" (the_program ()) (made db);
+  equal outcome ~msg:"then read back" (the_program ()) (read_from_disk db)
+
 let shows_its_source () =
   let db = Disk_cache.fresh () in
   equal outcome ~msg:"made" (the_program ()) (made db);
@@ -945,6 +989,8 @@ let on_disk =
            (fun (name, value) -> test name (misses_on [ (name, value) ]))
            (other_values ()));
       test "a program read back shows its source at DEBUG 4" shows_its_source;
+      test "a program read back takes its binary from its compiler's table"
+        takes_its_binary;
       group "a damaged entry is made anew, and replaced"
         [
           test "truncated" (recovers Disk_cache.truncated);
@@ -1913,6 +1959,104 @@ let accumulators =
         keeps_a_zero_accumulator_value;
     ]
 
+(* Reductions over a variable size
+
+   A kernel reduces [x], of [hi] floats, over a range whose size is a variable
+   [n] from 0 to [hi]: over [x.(k)] for each [k] below [n], or over [x.(k / 2)],
+   whose index the range's bounds fold to 0 when [hi] is 1, so that the reduced
+   value then ignores the range. [x.(0)] is an infinity. *)
+
+type index = Each | Halved
+
+let reduction_by_size rop index hi =
+  let out = Call.param ~shape:[ Int 1 ] 0 Float32 in
+  let x = Call.param ~shape:[ Int hi ] 1 Float32 in
+  let n = Ops.variable "n" (`Int Bigint.zero) (`Int (Bigint.of_int hi)) in
+  let r = Ops.range ~axis_type:Reduce (Sym n) [ 0 ] in
+  let at = match index with Each -> r | Halved -> Ops.O.(r // int 2) in
+  let reduced = Ops.reduce (Ops.index x [ at ]) rop [ r ] in
+  Ops.sink ~kernel:(Ops.kernel_info ())
+    [ Ops.store (Ops.index out [ Ops.int 0 ]) reduced ]
+
+(* The reduction from its identity, as Tolk.Op.Reduce defines it. *)
+let reduced_by_size rop index x n =
+  let identity, f =
+    match rop with
+    | Op.Add -> (0., ( +. ))
+    | _ -> (Float.neg_infinity, Float.max)
+  in
+  let at k = match index with Each -> k | Halved -> k / 2 in
+  List.fold_left (fun acc k -> f acc x.(at k)) identity (List.init n Fun.id)
+
+let reduces_by_size (rop, index, hi) =
+  let x =
+    Array.init hi (fun j ->
+        if j = 0 then Float.infinity else 1. +. float_of_int j)
+  in
+  let prg =
+    Codegen.to_program (reduction_by_size rop index hi) (Lazy.force host)
+  in
+  let run n =
+    let inputs = [ (1, Array.map (fun f -> `Float f) x) ] in
+    List.assoc 0 (Run.on_host ~vars:[ ("n", n) ] prg inputs)
+  in
+  List.iter
+    (fun n ->
+      equal
+        ~msg:(Printf.sprintf "at n = %d" n)
+        (array Dtypes.value)
+        [| `Float (reduced_by_size rop index x n) |]
+        (run n))
+    (List.init (hi + 1) Fun.id)
+
+(* The int32 maximum of [2 k] for [k] below a variable [n] of at most [hi]: a
+   factor that ignores the range moves out of the maximum. *)
+let max_of_a_product hi =
+  let out = Call.param ~shape:[ Int 1 ] 0 Int32 in
+  let n = Ops.variable "n" (`Int Bigint.zero) (`Int (Bigint.of_int hi)) in
+  let r = Ops.range ~axis_type:Reduce (Sym n) [ 0 ] in
+  let doubled = Ops.O.(Ops.cast r Int32 * Ops.int ~dtype:Int32 2) in
+  Ops.sink ~kernel:(Ops.kernel_info ())
+    [
+      Ops.store (Ops.index out [ Ops.int 0 ]) (Ops.reduce doubled Op.Max [ r ]);
+    ]
+
+let maximum_of_a_product hi =
+  let prg = Codegen.to_program (max_of_a_product hi) (Lazy.force host) in
+  let at n =
+    if n = 0 then `Int (Bigint.of_int32 Int32.min_int)
+    else `Int (Bigint.of_int (2 * (n - 1)))
+  in
+  List.iter
+    (fun n ->
+      equal
+        ~msg:(Printf.sprintf "at n = %d" n)
+        (array Dtypes.value)
+        [| at n |]
+        (List.assoc 0 (Run.on_host ~vars:[ ("n", n) ] prg [])))
+    (List.init (hi + 1) Fun.id)
+
+let variable_sizes =
+  let name (rop, index, hi) =
+    Format.asprintf "%a of x.(%s) below n <= %d" Op.pp rop
+      (match index with Each -> "k" | Halved -> "k / 2")
+      hi
+  in
+  group "reductions over a variable size"
+    [
+      cases ~name "are their identity where the size is 0, and reduce elsewhere"
+        (List.concat_map
+           (fun rop ->
+             List.concat_map
+               (fun index -> List.map (fun hi -> (rop, index, hi)) [ 1; 3 ])
+               [ Each; Halved ])
+           [ Op.Add; Op.Max ])
+        reduces_by_size;
+      cases ~name:(Printf.sprintf "n <= %d")
+        "a maximum of a product is the identity where the size is 0" [ 1; 3 ]
+        maximum_of_a_product;
+    ]
+
 (* Multiply-adds
 
    A sum adds each product of its source into its running sum as one
@@ -2015,6 +2159,37 @@ let multiply_adds =
       test "a product and a sum outside a reduction are not fused" (fun () ->
           let prg = Codegen.to_program (muladd 4) (Lazy.force host) in
           is_false ~msg:"fma" (mentions "fma" (source prg)));
+    ]
+
+(* Reductions that share a range
+
+   [out[0] = max_{i,k} (a[k] + i) + sum_k a[k]] for [i] below 3 and [k] below
+   5: the two reductions close the range [k], the maximum within [i]'s loop and
+   the sum alone, as a sum over [i] of a source that does not read [i] leaves
+   it. No optimisation applies, so both stay loops. With [a[k] = k + 1], it is
+   [(5 + 2) + 15]. *)
+
+let max_and_sum () =
+  let out = Call.param ~shape:[ Int 1 ] 0 Float32 in
+  let a = Call.param ~shape:[ Int 5 ] 1 Float32 in
+  let i = Ops.range ~axis_type:Reduce (Int 3) [ 0 ] in
+  let k = Ops.range ~axis_type:Reduce (Int 5) [ 1 ] in
+  let a_k = Ops.index a [ k ] in
+  let max = Ops.reduce (Ops.add a_k (Ops.cast i Float32)) Op.Max [ i; k ] in
+  let sum = Ops.reduce a_k Op.Add [ k ] in
+  Ops.sink
+    ~kernel:(Ops.kernel_info ~opts_to_apply:[] ())
+    [ Ops.store (Ops.index out [ Ops.int 0 ]) (Ops.add max sum) ]
+
+let shared_ranges =
+  group "reductions that share a range"
+    [
+      test "a range two reductions close at two depths runs as two loops"
+        (fun () ->
+          let prg = Codegen.to_program (max_and_sum ()) (Lazy.force host) in
+          let a = Array.init 5 (fun k -> `Float (float_of_int (k + 1))) in
+          let out = Run.on_host prg [ (1, a) ] in
+          equal (array Dtypes.value) [| `Float 22. |] (List.assoc 0 out));
     ]
 
 (* Lanes of an unrolled reduce
@@ -2246,10 +2421,70 @@ let signed_zeros =
           equal (array Dtypes.value)
             (floats [| -0.; 1.; 2.; -0. |])
             (List.assoc (parameter slots 0) results));
+      test "Shape.pad by -0. computes -0. on the padding" (fun () ->
+          let x = Ops.new_buffer ~slot:1 (Single "CPU") 2 Float32 in
+          let value =
+            Shape.pad ~value:(`Float (-0.)) x [ Some (Ops.Int 1, Ops.Int 1) ]
+          in
+          let out = Ops.new_buffer ~slot:0 (Single "CPU") 4 Float32 in
+          let kernel, slots =
+            scheduled (Ops.sink [ Ops.after out [ Ops.store out value ] ])
+          in
+          let prg = Codegen.to_program kernel (Lazy.force host) in
+          let results = Run.on_host prg (input slots [| 1.; 2. |]) in
+          equal (array Dtypes.value)
+            (floats [| -0.; 1.; 2.; -0. |])
+            (List.assoc (parameter slots 0) results));
       prop "a pad and a selection of signed zeros keep the interpreter's bits"
         signed_zero_pads (fun (flip, fill, before, after, xs) ->
           padding_computed ~flip fill before after xs);
     ]
+
+(* NaN constants
+
+   A NaN constant is stored with its bits: its sign and its payload, a
+   signalling NaN staying one. *)
+
+let word w = `Int (Bigint.of_int64_unsigned w)
+
+let unsigned dt =
+  List.find (fun u -> Dtype.itemsize u = Dtype.itemsize dt) Dtype.uints
+
+(* The bits [dt] stores into each element of a kernel that stores the NaN of
+   each word of [words]. *)
+let stored_nans dt words =
+  let out = Call.param ~shape:[ Int (List.length words) ] 0 dt in
+  let store i w =
+    let nan = Dtype.bitcast (unsigned dt) dt (word w) in
+    Ops.store
+      (Ops.index out [ Ops.int i ])
+      (Ops.const ~dtype:dt (nan :> Dtype.const))
+  in
+  let sink = Ops.sink ~kernel:(Ops.kernel_info ()) (List.mapi store words) in
+  let prg = Codegen.to_program sink (Lazy.force host) in
+  Array.map (Dtype.bitcast dt (unsigned dt)) (List.assoc 0 (Run.on_host prg []))
+
+let keeps_nan_bits (dt, words) =
+  equal (array Dtypes.value)
+    (Array.of_list (List.map word words))
+    (stored_nans dt words)
+
+let nan_constants =
+  cases
+    ~name:(fun (dt, _) -> Dtype.name dt)
+    "a NaN constant is stored with its sign and payload"
+    [
+      (Dtype.Float16, [ 0x7e00L; 0xfe05L; 0x7d01L; 0xfc01L ]);
+      (Float32, [ 0x7fc00000L; 0xffc00005L; 0x7f800001L; 0xff800003L ]);
+      ( Float64,
+        [
+          0x7ff8000000000000L;
+          0x7ff0000020000000L;
+          0xfff8000000000001L;
+          0xfff0000000000003L;
+        ] );
+    ]
+    keeps_nan_bits
 
 (* Casts to bfloat16
 
@@ -2861,7 +3096,9 @@ let () =
          lowering_claims;
          whole_graphs;
          accumulators;
+         variable_sizes;
          multiply_adds;
+         shared_ranges;
          lanes;
          bfloat16_casts;
          test "a selection between bfloat16 vectors takes each lane's arm"
@@ -2871,6 +3108,7 @@ let () =
            takes_bfloat16;
          vectors;
          signed_zeros;
+         nan_constants;
          invalid_lanes;
          gated_stores;
          divisions;

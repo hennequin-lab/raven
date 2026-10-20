@@ -77,6 +77,31 @@ let wait_all (a : alloc) every =
 let wait_points m = wait_all m.alloc true
 let wait_write m = wait_all m.alloc false
 
+(* Whether the points [wait_from] waits for are done, from the chunk [c]'s
+   [i]th word on, and [ok]: each point is asked, so that each device's work is
+   committed and a point a lost device did not reach raises whatever point
+   comes before it. *)
+let rec reached_from (a : alloc) every c i ok =
+  if c = 0 then ok
+  else if i = uses then reached_from a every (stamps_next c) 0 ok
+  else
+    let p = stamps_followed c i every in
+    if p = ended then ok
+    else
+      let ok = (p = 0 || Dev.reached_point p) && ok in
+      reached_from a every c (i + 1) ok
+
+let reached_all (a : alloc) every =
+  let st = a.entry.stamps in
+  let ok = reached_from a every st 0 true in
+  let p = stamps_folded st every in
+  let ok = (p = 0 || Dev.reached_point p) && ok in
+  ignore (Sys.opaque_identity a);
+  ok
+
+let reached_points m = reached_all m.alloc true
+let reached_write m = reached_all m.alloc false
+
 (* Visit every point even after a refusal: reading a later transport word may
    discover its device's loss. The walk carries no allocated state. *)
 let rec all_from f c i ok =
@@ -665,12 +690,39 @@ let viewed (e : entry) =
   end
   else true
 
-(* Puts [e] in its owner's cache, for reuse. The owner's lock is held. *)
+(* Puts [e] in its owner's cache, for reuse. A key's array allocates only as
+   it grows past the most entries it held, so a drain of a size cached before
+   allocates nothing. Each step allocates before it stores. The owner's lock
+   is held. *)
 let cache (e : entry) =
   let l = e.owner.live and k = cache_key e in
-  let es = try Cache.find l.cache k with Not_found -> [] in
-  Cache.replace l.cache k (e :: es);
+  let c =
+    match Cache.find l.cache k with
+    | c -> c
+    | exception Not_found ->
+        let c = { entries = [||]; n = 0 } in
+        Cache.replace l.cache k c;
+        c
+  in
+  let n = c.n in
+  if n = Array.length c.entries then begin
+    let a = Array.make (Int.max 8 (2 * n)) no_entry in
+    Array.blit c.entries 0 a 0 n;
+    c.entries <- a
+  end;
+  c.entries.(n) <- e;
+  c.n <- n + 1;
   l.cached <- l.cached + e.bytes
+
+(* Under the owner's lock: the latest entry of [c], which holds one, taken
+   out of the cache. Its key stays bound. *)
+let uncache l (c : cached) =
+  let n = c.n - 1 in
+  let e = c.entries.(n) in
+  c.entries.(n) <- no_entry;
+  c.n <- n;
+  l.cached <- l.cached - e.bytes;
+  e
 
 (* Puts [e] among its owner's retiring memory. The owner's lock is held. *)
 let retire_entry (e : entry) =
@@ -744,8 +796,10 @@ external hold_token : int -> holds -> int -> int -> int -> token
 external hold_record : int -> holds = "caml_rig_node_record" [@@noalloc]
 
 (* Releases the hold [i] of [taken] on [a]'s memory if it is taken, in one
-   step, so a release that an asynchronous exception interrupts and a later
-   drain runs again releases each hold once. *)
+   step, so releases that run concurrently, on several domains or in a
+   callback that interrupts another at [Weak.get]'s allocation, and a release
+   that an asynchronous exception interrupts and a later drain runs again,
+   release each hold once. *)
 external unhold : Bytes.t -> int -> alloc -> unit = "caml_rig_claim_unhold"
 [@@noalloc]
 
@@ -764,7 +818,8 @@ let unhold_all (h : holds) =
 external token_link : token -> unit = "caml_rig_token_link" [@@noalloc]
 
 (* The holds released, the token's record goes on the list now, and the
-   next drain only frees its node. *)
+   next drain only frees its node. It takes no lock, so a callback may run it
+   inside one. *)
 let release_hold_now t h =
   unhold_all h;
   token_link t
@@ -807,6 +862,47 @@ let release_early (a : alloc) =
   else
     let kept = stamps_token a st in
     if kept != no_token then Dev.protect a.owner release_locked (a, kept)
+
+(* Staging memory
+
+   A device's staging slots are copy's, in its [live]; memory returns their
+   free halves where it returns cached memory, as collected memory returns. *)
+
+external buffer_free : buffer -> string -> int = "caml_rig_buffer_free"
+
+let rec halves_of hs h (s : slot) =
+  if h = 2 then hs
+  else
+    match s.halves.(h) with
+    | Some b -> halves_of (b :: hs) (h + 1) s
+    | None -> halves_of hs (h + 1) s
+
+(* Under [l]'s lock: the halves of [l]'s free slots, taken out of them, each
+   slot's list made before its stores. *)
+let take_free_halves l =
+  Array.fold_left
+    (fun hs (s : slot) ->
+      if s.held then hs
+      else
+        let hs = halves_of hs 0 s in
+        s.halves.(0) <- None;
+        s.halves.(1) <- None;
+        hs)
+    [] l.slots
+
+(* Whether a slot of [l] has a half, which keeps [l]'s device's slot. *)
+let has_halves l =
+  let some = function Some _ -> true | None -> false in
+  Array.exists
+    (fun (s : slot) -> some s.halves.(0) || some s.halves.(1))
+    l.slots
+
+let return_half b = if buffer_free b "freed" = 1 then release_early b.mem.alloc
+
+(* Returns [d]'s free staging halves ([return_half]). *)
+let release_staging d =
+  if Array.length d.live.slots > 0 then
+    List.iter return_half (Dev.protect d take_free_halves d.live)
 
 (* Under [hold_lock]: releases the holds at the front of the list's hand whose
    memory is live and pops them: whether there were any. *)
@@ -884,12 +980,10 @@ let cache_keys l = Cache.fold (fun k _ ks -> k :: ks) l.cache []
    kind of memory, so [pick] answers alike for each. *)
 let take_picked (l, k, pick) =
   match Cache.find l.cache k with
-  | e :: rest when pick e ->
-      (match rest with
-      | [] -> Cache.remove l.cache k
-      | _ -> Cache.replace l.cache k rest);
-      l.cached <- l.cached - e.bytes;
-      Some e
+  | c when c.n = 0 ->
+      Cache.remove l.cache k;
+      None
+  | c when pick c.entries.(c.n - 1) -> Some (uncache l c)
   | _ | (exception Not_found) -> None
 
 (* Waits for [d]'s value [v] on behalf of memory, never of [d]'s caller: a loss
@@ -918,8 +1012,11 @@ let release_picked d pick v =
   in
   List.iter take (Dev.protect d cache_keys l)
 
+let rec picked pick (c : cached) i =
+  i < c.n && (pick c.entries.(i) || picked pick c (i + 1))
+
 let any_picked (l, pick) =
-  Cache.fold (fun _ es found -> found || List.exists pick es) l.cache false
+  Cache.fold (fun _ c found -> found || picked pick c 0) l.cache false
 
 (* Frees what [pick] holds of in [d]'s cache once the work [d] was handed
    until now is done: at once if it is, after waiting for it when [wait] and
@@ -1175,6 +1272,7 @@ let kept_locked l =
   l.cached > 0 || l.word_maps != [] || l.retired != []
   || Cache.length l.mapped > 0
   || first_mapped l.pairs 0 >= 0
+  || has_halves l
 
 (* Whether the lost [d] keeps what returns once it is Stopped: its cache and
    its mappings. Read under the lock: a pair's mapping that a decision
@@ -1191,6 +1289,7 @@ let drain d =
   if Dev.orphaned d then forget d
   else begin
     if Dev.is_lost d then Dev.run_own d;
+    if Dev.is_lost d && Dev.stopped d then release_staging d;
     if (not (idle d.live)) || (Dev.is_lost d && kept d) then drain_own d;
     if Dev.stop_returned d && (not (kept d)) && Dev.free_slot d then
       let_go_word d;
@@ -1203,16 +1302,14 @@ let () = Dev.answered := drain
 
 let take_cached_key (l, k) =
   match Cache.find l.cache k with
-  | e :: rest ->
-      (match rest with
-      | [] -> Cache.remove l.cache k
-      | _ -> Cache.replace l.cache k rest);
-      l.cached <- l.cached - e.bytes;
+  | c when c.n = 0 -> None
+  | c ->
+      let e = uncache l c in
       (* Every old use has settled. The new buffer has no dependencies on
          its memory's previous lifetime, an unordered use included. *)
       stamps_clear e.stamps;
       Some e
-  | [] | (exception Not_found) -> None
+  | exception Not_found -> None
 
 let take_cached d kind n =
   let l = d.live in
@@ -1272,6 +1369,8 @@ let reclaim_round pool round =
       release_cache_if ~wait:true d (charged pool));
   drain_all ();
   if round >= 2 then begin
+    release_staging Dev.host;
+    Dev.iter release_staging;
     Gc.full_major ();
     drain_all ()
   end
@@ -1733,11 +1832,14 @@ let set_budget d n =
   Dev.check_held "set_budget";
   if n < 0 then invalid_argf "Rig.set_budget: budget %d is negative" n;
   Dev.protect d set_device_budget (d, n);
-  if Dev.is_host d then heap_trim n else release_cache ~upto:n ~wait:false d
+  if Dev.is_host d then heap_trim n else release_cache ~upto:n ~wait:false d;
+  if allocated d > n then release_staging d
 
-(* [d]'s drain first returns what was collected since its last call, and a
-   Stopped device's cache with it. *)
+(* [d]'s free staging halves go first, then its drain returns what was
+   collected since its last call, the halves among it once their legs are
+   done, and a Stopped device's cache with it. *)
 let free_cache d =
   Dev.check_held "free_cache";
+  release_staging d;
   drain d;
   if Dev.is_host d then heap_drop () else release_cache ~wait:false d

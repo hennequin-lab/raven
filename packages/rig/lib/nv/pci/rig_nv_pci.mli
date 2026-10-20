@@ -56,7 +56,7 @@
     GA106 and GA107 (Ampere), AD102, AD103, AD104, AD106 and AD107 (Ada),
     and GB202, GB203, GB205, GB206 and GB207 (Blackwell), as the GPU's
     [NV_PMC_BOOT_42] register names them. An open needs the firmware files
-    {!section-reports} lists.
+    {!section-firmware} lists.
 
     [Mapped] memory ({!Rig_nv.section-regions}) is the GPU's, through its
     memory BAR (BAR 1), the range of the GPU's memory that the host
@@ -77,7 +77,14 @@
     A boot also takes system memory for the GSP, most of it for the
     firmware's image, and it counts against the same limit. The GSP's logs
     and bootloader, and on Blackwell the FMC, each lie in one run of bus
-    addresses. *)
+    addresses.
+
+    The GSP's objects live as long as the GSP: its RM frees none
+    ([Rig_nv.rm]'s [free] is [None]), so a device of this path keeps the
+    channels a growth replaces as {!Rig_nv.section-submitting} states. Each
+    set it keeps holds, in the GPU's memory, the instance blocks and method
+    buffers of its two channels and the compute engine's context
+    buffers. *)
 
 (** {1:gpus GPUs}
 
@@ -86,16 +93,19 @@
     {!Rig_pci.Machine.t} transport, which an open refuses. Listing GPUs
     changes nothing on the machine. *)
 
-val buses : ?machine:Rig_pci.Machine.t -> unit -> string list
+val buses : ?machine:Rig_pci.Machine.t -> unit -> (string list, string) result
 (** [buses ~machine ()] is the bus addresses of the NVIDIA GPUs of
     [machine] (defaults to {!Rig_pci.Machine.this}), in bus order
-    ({!Rig_pci.Machine.val-functions}): GPU [i] is the [i]th. It is [[]] where
-    the machine lists no PCI functions, as off Linux. *)
+    ({!Rig_pci.Machine.val-functions}): GPU [i] is the [i]th. It is [Ok []]
+    where the machine lists no PCI functions, as off Linux.
 
-val count : ?machine:Rig_pci.Machine.t -> unit -> int
-(** [count ~machine ()] is the number of {!buses}. *)
+    [Error why] if the machine's PCI functions cannot be listed. *)
 
-(** {1:reports Boot reports}
+val count : ?machine:Rig_pci.Machine.t -> unit -> (int, string) result
+(** [count ~machine ()] is the number of {!buses}, or their [Error]. A
+    machine with no NVIDIA GPU is [Ok 0]. *)
+
+(** {1:firmware Firmware}
 
     A boot loads three files of linux-firmware's [nvidia/] directory at
     commit [0a6871b1], each pinned by its BLAKE2b-256 digest: the GSP's
@@ -114,15 +124,127 @@ val count : ?machine:Rig_pci.Machine.t -> unit -> int
     {v rig firmware nv v}
     Keep a directory of the caller's apart from [/lib/firmware]
     ({!Rig_pci.section-needs}). On Ampere and Ada the boot also runs the
-    FWSEC ucode of the GPU's VBIOS, which it reads from the GPU.
+    FWSEC ucode of the GPU's VBIOS, which it reads from the GPU. *)
 
-    A report says what an open loads to boot a GPU, and whether the open
-    refuses the GPU for its chip, its VBIOS or its firmware, from what the
-    open reads before the boot writes. Making one needs no GPU and writes
-    nothing. If {!val-report} returns [Error why], an open of that GPU
-    returns [Error] with [why] after the GPU's name; if an image is not
-    [found], the open returns [Error] naming it. Otherwise none of the
-    open's refusals is about the chip, the VBIOS or the firmware. *)
+(** {1:opening Opening}
+
+    The GSP reports a channel it stopped and a fault its MMU queued, and the
+    device raises them from {!Rig_nv.sleep}, keeping a report through an
+    exception in a sleep as {!Rig_edge.Driver.sleep} requires. The GSP may
+    also ask the process to run a sequence of register operations, which
+    runs once, front to back: one an exception cuts short is a fault, which
+    loses the GPU. Only the process uses a GPU it has booted, so the GPU's
+    work waits for nobody else's, and rig loses the device once its timeline
+    makes no progress for {!Rig_pci.Driver.hang_ms} (the device's
+    [hang_ms]).
+
+    Two GPUs map each other's memory only if both are taken physically, on
+    one machine, each BAR reaches all of its GPU's memory, and the bus carries
+    requests between them ({!Rig_pci.Memory.reaches}).
+
+    A device reads the GPU's timer registers through BAR 0
+    ({!Rig_nv.Registers}), so its profiles' times drift from the host's
+    clock as {!Rig_nv.section-submitting} states.
+
+    Any domain may call any function. Opens and changes of NVIDIA GPUs run
+    one at a time, so a boot delays the others. {!gpu}'s [make], {!detach},
+    {!attach} and {!reset}, called from a callback inside a lock ([Rig]'s
+    domains section), raise [Invalid_argument], having changed nothing
+    ({!Rig_edge.section-drivers}). *)
+
+val gpu :
+  ?machine:Rig_pci.Machine.t ->
+  ?firmware:string list ->
+  int ->
+  Rig_nv.t Rig_edge.opener
+(** [gpu ~machine ~firmware i] is the opener of GPU [i] of [machine]
+    (defaults to {!Rig_pci.Machine.this}), named ["NV-PCI"] for [0] and
+    ["NV-PCI:i"] otherwise. Its [make] boots the GPU that is [i]th when it
+    runs, reading each image from the first of the directories [firmware]
+    (defaults to [[]]), then {!Rig_pci.Firmware.directory}, then
+    ["/lib/firmware"], that holds it with its pinned digest
+    ({!Rig_pci.Firmware.find}). Run as root, an open searches root's home.
+
+    Each [Error] names the GPU, then the reason. [make] gives back what it
+    took and leaves the GPU as the open found it if:
+    - [machine]'s PCI functions cannot be listed, saying why;
+    - [machine] has no GPU [i] ({!count}), saying how many there are;
+    - a kernel driver holds GPU [i], or the process holds it already;
+    - its function cannot be taken, with {!Rig_pci.Function.take}'s reason;
+    - [machine]'s windows are not mapped into the process, as through a
+      transport;
+    - its chip is outside the chips {!section-requirements} lists, naming
+      it;
+    - on Ampere and Ada, its VBIOS lacks a FWSEC this library runs, naming
+      what it lacks;
+    - an image is missing, naming the directories and the files found with
+      another digest, or one found is not laid out as its format says;
+    - its GSP still runs after its reset;
+    - the machine refuses the addresses or the GSP's memory.
+
+    A GPU reset first stays reset. Once the GSP's memory is taken, a
+    failure loses the GPU, which its next open resets, as does a failed
+    reset.
+
+    Raises [Invalid_argument] if [i < 0]. *)
+
+(** {1:changes Changes to the machine}
+
+    These changes persist after the process, and each refuses a GPU this
+    process holds. Each returns [Error why] if the machine's PCI functions
+    cannot be listed. {!detach} and {!attach} act on this machine: they write
+    its [/sys/bus/pci] files, and need [CAP_SYS_ADMIN] and write access to
+    those files, which root has. Detaching or attaching another machine's
+    GPUs needs a program there. *)
+
+val detach : int -> (Rig_pci.Driver.progress, string) result
+(** [detach i] detaches GPU [i] of this machine from its kernel driver, so
+    that its opener can take it, unless it is detached already
+    ({!Rig_pci.Driver.detach}). The kernel driver's users, a display among
+    them, lose the GPU until {!attach} or a reboot. It refuses a GPU while a
+    process holds its [/dev/nvidiaN] or nvidia-drm's DRM nodes open or
+    mapped, and with nvidia-drm loaded it needs debugfs mounted at
+    [/sys/kernel/debug].
+
+    It returns [Error why] only before its first write to the machine, and
+    after that write [Ok Detached] or [Ok (Part_way why)]
+    ({!Rig_pci.Driver.type-progress}). It is [Error why], changing nothing, if
+    there is no GPU [i], if this process holds it over PCI, if a process
+    holds a file of its devices, naming it, or as {!Rig_pci.Driver.detach}.
+
+    Raises [Invalid_argument] if [i < 0]. *)
+
+val attach : int -> (unit, string) result
+(** [attach i] gives GPU [i] of this machine back to its kernel driver,
+    resetting it first as {!reset} does if no kernel driver has it
+    ({!Rig_pci.Driver.attach}).
+
+    [Error why] if there is no GPU [i], if this process holds it, or as
+    {!Rig_pci.Driver.attach}.
+
+    Raises [Invalid_argument] if [i < 0]. *)
+
+val reset : ?machine:Rig_pci.Machine.t -> int -> (unit, string) result
+(** [reset ~machine i] resets GPU [i] of [machine] (defaults to
+    {!Rig_pci.Machine.this}), which ends what an earlier boot left running:
+    it takes the GPU's function, turns its bus mastering off and resets the
+    function ({!Rig_pci.Function.reset}).
+
+    [Error why] if there is no GPU [i], if this process holds it, if its
+    function cannot be taken, or if Linux has no reset for it or it does not
+    respond after one.
+
+    Raises [Invalid_argument] if [i < 0]. *)
+
+(**/**)
+
+(* Boot reports, for the suites that check, without a GPU, what an open
+   loads to boot a GPU and whether it refuses the GPU for its chip, its VBIOS
+   or its firmware, from what the open reads before the boot writes. Making
+   one needs no GPU and writes nothing. If [report] returns [Error why], an
+   open of that GPU returns [Error] with [why] after the GPU's name; if an
+   image is not [found], the open returns [Error] naming it. Otherwise none
+   of the open's refusals is about the chip, the VBIOS or the firmware. *)
 
 type image = {
   file : string;
@@ -156,112 +278,6 @@ val report :
     it; on Ampere and Ada, if [vbios] lacks a FWSEC this library runs,
     naming what it lacks; or if a file found with its pinned digest is not
     laid out as its format says. *)
-
-(** {1:opening Opening}
-
-    The GSP reports a channel it stopped and a fault its MMU queued, and the
-    device raises them from {!Rig_nv.sleep}. An exception in a sleep, such
-    as [Sys.Break], drops no report: the next sleep raises it. The GSP may
-    also ask the process to run a sequence of register operations, which
-    runs once, front to back: one an exception cuts short is a fault, which
-    loses the GPU. Only the process uses a GPU it has booted, so the GPU's
-    work waits for nobody else's, and rig loses the device once its timeline
-    makes no progress for {!Rig_pci.Gpus.hang_ms} (the device's
-    [hang_ms]).
-
-    Two GPUs map each other's memory only if both are taken physically, on
-    one machine, each BAR reaches all of its GPU's memory, and the bus carries
-    requests between them ({!Rig_pci.Memory.reaches}).
-
-    A device reads the GPU's timer registers through BAR 0
-    ({!Rig_nv.Registers}) at open only, so the times of its profiles drift
-    from the host's clock at the timer's rate error since open.
-
-    Any domain may call any function. Opens and changes of NVIDIA GPUs run
-    one at a time, so a boot delays the others. {!val-report}, {!gpu}'s
-    [make], {!detach}, {!attach} and {!reset}, called from a callback
-    inside a lock ([Rig]'s domains section), raise [Invalid_argument],
-    having changed nothing ({!Rig_edge.section-drivers}). *)
-
-val gpu :
-  ?machine:Rig_pci.Machine.t ->
-  ?firmware:string list ->
-  int ->
-  Rig_nv.t Rig_edge.opener
-(** [gpu ~machine ~firmware i] is the opener of GPU [i] of [machine]
-    (defaults to {!Rig_pci.Machine.this}), named ["NV-PCI"] for [0] and
-    ["NV-PCI:i"] otherwise. Its [make] boots the GPU that is [i]th when it
-    runs, reading each image from the first of the directories [firmware]
-    (defaults to [[]]), then {!Rig_pci.Firmware.directory}, then
-    ["/lib/firmware"], that holds it with its pinned digest
-    ({!Rig_pci.Firmware.find}). Run as root, an open searches root's home.
-
-    Each [Error] names the GPU, then the reason. [make] gives back what it
-    took and leaves the GPU as the open found it if:
-    - [i >= count ~machine ()], saying how many GPUs there are;
-    - a kernel driver holds GPU [i], or the process holds it already;
-    - its function cannot be taken, with {!Rig_pci.Function.take}'s reason;
-    - [machine]'s windows are not mapped into the process, as through a
-      transport;
-    - {!val-report} of it returns [Error], or finds an image missing, naming
-      the directories and the files found with another digest;
-    - its GSP still runs after its reset;
-    - the machine refuses the addresses or the GSP's memory.
-
-    A GPU reset first stays reset. Once the GSP's memory is taken, a
-    failure loses the GPU, which its next open resets, as does a failed
-    reset.
-
-    Raises [Invalid_argument] if [i < 0]. *)
-
-(** {1:changes Changes to the machine}
-
-    These changes persist after the process, and each refuses a GPU this
-    process holds. {!detach} and {!attach} act on this machine: they write
-    its [/sys/bus/pci] files, and need [CAP_SYS_ADMIN] and write access to
-    those files, which root has. Detaching or attaching another machine's
-    GPUs needs a program there. *)
-
-val detach : int -> (Rig_pci.Gpus.progress, string) result
-(** [detach i] detaches GPU [i] of this machine from its kernel driver, so
-    that its opener can take it, unless it is detached already
-    ({!Rig_pci.Gpus.detach}). The kernel driver's users, a display among
-    them, lose the GPU until {!attach} or a reboot. It refuses a GPU while a
-    process holds its [/dev/nvidiaN] or nvidia-drm's DRM nodes open or
-    mapped, and with nvidia-drm loaded it needs debugfs mounted at
-    [/sys/kernel/debug].
-
-    It returns [Error why] only before its first write to the machine, and
-    after that write [Ok Detached] or [Ok (Part_way why)]
-    ({!Rig_pci.Gpus.type-progress}). It is [Error why], changing nothing, if
-    there is no GPU [i], if this process holds it over PCI, if a process
-    holds a file of its devices, naming it, or as {!Rig_pci.Gpus.detach}.
-
-    Raises [Invalid_argument] if [i < 0]. *)
-
-val attach : int -> (unit, string) result
-(** [attach i] gives GPU [i] of this machine back to its kernel driver,
-    resetting it first as {!reset} does if no kernel driver has it
-    ({!Rig_pci.Gpus.attach}).
-
-    [Error why] if there is no GPU [i], if this process holds it, or as
-    {!Rig_pci.Gpus.attach}.
-
-    Raises [Invalid_argument] if [i < 0]. *)
-
-val reset : ?machine:Rig_pci.Machine.t -> int -> (unit, string) result
-(** [reset ~machine i] resets GPU [i] of [machine] (defaults to
-    {!Rig_pci.Machine.this}), which ends what an earlier boot left running:
-    it takes the GPU's function, turns its bus mastering off and resets the
-    function ({!Rig_pci.Function.reset}).
-
-    [Error why] if there is no GPU [i], if this process holds it, if its
-    function cannot be taken, or if Linux has no reset for it or it does not
-    respond after one.
-
-    Raises [Invalid_argument] if [i < 0]. *)
-
-(**/**)
 
 (* The GSP's firmware, the same for every family: its path under a firmware
    directory and its pinned digest, for the suites that look for it as an

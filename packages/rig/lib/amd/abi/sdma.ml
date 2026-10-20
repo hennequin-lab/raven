@@ -5,8 +5,6 @@
 
 open Packet
 
-let invalid_argf fmt = Printf.ksprintf invalid_arg fmt
-
 (* A field's value, from its (mask, shift). *)
 let field (mask, shift) v = (v land mask) lsl shift
 
@@ -24,34 +22,14 @@ let copy_header =
   Defs.sdma_op_copy
   lor field Defs.sdma_pkt_copy_linear_header_sub_op Defs.sdma_subop_copy_linear
 
-(* The longest copy: what a GPU's 48-bit virtual addresses reach. *)
-let max_bytes = 1 lsl 48
-
 let copy_linear ~dst ~src ~bytes =
   [
     Dword copy_header;
-    W32 (Add (Value bytes, -1L));
+    W32 { (value bytes) with add = -1L };
     Dword 0;
-    W64 (Value src);
-    W64 (Value dst);
+    W64 (value src);
+    W64 (value dst);
   ]
-
-let copy g ~dst ~src n =
-  if n < 0 || n > max_bytes then
-    invalid_argf "Sdma.copy: %d bytes, expected 0 to 2^48" n;
-  let max = max_copy g in
-  let piece i =
-    let off = i * max in
-    let at v = if off = 0 then Value v else Add (Value v, Int64.of_int off) in
-    [
-      Dword copy_header;
-      Dword (Int.min max (n - off) - 1);
-      Dword 0;
-      W64 (at src);
-      W64 (at dst);
-    ]
-  in
-  List.concat_map piece (List.init ((n + max - 1) / max) Fun.id)
 
 (* The interval and retries of a poll, as the kernel driver sets them. *)
 let interval = 0x04
@@ -69,8 +47,8 @@ let poll addr cmp v ?(mask = 0xffff_ffff) () =
       (Defs.sdma_op_poll_regmem
       lor field Defs.sdma_pkt_poll_regmem_header_func (function_of cmp)
       lor field Defs.sdma_pkt_poll_regmem_header_mem_poll 1);
-    W64 (Value addr);
-    W32 (Value v);
+    W64 (value addr);
+    W32 (value v);
     Dword mask;
     Dword
       (field Defs.sdma_pkt_poll_regmem_dw5_interval interval
@@ -86,7 +64,7 @@ let fence (g : Gpu.t) addr v =
       field Defs.sdma_pkt_fence_header_mtype mtype_uc
     else 0
   in
-  [ Dword (Defs.sdma_op_fence lor mtype); W64 (Value addr); W32 (Value v) ]
+  [ Dword (Defs.sdma_op_fence lor mtype); W64 (value addr); W32 (value v) ]
 
 let trap = Defs.sdma_trap
 
@@ -96,5 +74,5 @@ let timestamp addr =
       (Defs.sdma_op_timestamp
       lor field Defs.sdma_pkt_timestamp_get_global_header_sub_op
             Defs.sdma_subop_timestamp_get_global);
-    W64 (Value addr);
+    W64 (value addr);
   ]

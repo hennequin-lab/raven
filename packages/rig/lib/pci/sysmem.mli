@@ -32,12 +32,10 @@ val unmap : Window.t -> unit
 
 (** {1:store Memory that outlives the process}
 
-    A function taken physically writes physical pages, and keeps writing after
-    its process dies. Its memory lies in huge pages of a file of the process
-    under the machine's root, in [dev/hugepages]. The file keeps its pages when
-    the process dies, and the kernel neither swaps nor compacts them. Each
-    2 MiB block of addresses that holds memory maps one huge page, which the
-    allocations of every function of the machine in that block share. *)
+    The memory of functions taken physically, which outlives the process as
+    {{!Function.dma}system memory} states. It lies in huge pages of a file of
+    the process under the machine's root, in [dev/hugepages], laid out as
+    [sysmem.ml] comments. *)
 
 type store
 (** The type for the memory of one function taken physically. *)
@@ -67,8 +65,8 @@ val alloc :
     another root, or if the root's [proc/self/mounts] shows its [dev/hugepages]
     on no hugetlbfs of 2 MiB pages. *)
 
-val free : store -> Window.t -> unit
-(** [free s w] unmaps {!alloc}'s memory [w]. A huge page goes back once no
+val free : Window.t -> unit
+(** [free w] unmaps {!alloc}'s live memory [w]. A huge page goes back once no
     allocation holds it and no function maps it as a peer's ({!reach}). *)
 
 val close : store -> unit

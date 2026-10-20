@@ -4,7 +4,8 @@
   ---------------------------------------------------------------------------*)
 
 (* The code objects the library carries: the archive kernels/tools/pack.ml
-   writes, embedded by the assembler (nx_amd_stubs.c). Its index is read once; a
+   writes, embedded by the assembler (nx_amd_stubs.c). Its index and targets are
+   read when the module initialises, so that no domain forces a shared lazy; a
    member's bytes are copied out once, when a device first needs them, so that a
    device finds its load of them again as the same string. *)
 
@@ -13,27 +14,39 @@ external sub : int -> int -> string = "caml_nx_amd_kernels_sub"
 
 let u64 s at = Int64.to_int (String.get_int64_le s at)
 
-(* The members by key, as their offset and length. *)
+let malformed () = failwith "nx.amd: a malformed kernel archive"
+
+(* Whether the [len] bytes from [off] lie in the archive. Offsets and lengths
+   past [max_int] read as negative, so both are checked. *)
+let inside off len = 0 <= off && 0 <= len && len <= length () - off
+
+let slice off len = if inside off len then sub off len else malformed ()
+
+(* The members by key, as their offset and length, each checked to lie in the
+   archive so that [sub] copies only its bytes. *)
 let index =
-  lazy
-    (let n = u64 (sub 0 8) 0 in
-     let t = Hashtbl.create n in
-     let at = ref 8 in
-     for _ = 1 to n do
-       let k = u64 (sub !at 8) 0 in
-       let entry = sub (!at + 8) (k + 16) in
-       Hashtbl.replace t (String.sub entry 0 k) (u64 entry k, u64 entry (k + 8));
-       at := !at + 24 + k
-     done;
-     if length () < !at then failwith "nx.amd: a truncated kernel archive";
-     t)
+  let n = u64 (slice 0 8) 0 in
+  (* Each entry of the index takes at least 24 bytes. *)
+  if n < 0 || n > (length () - 8) / 24 then malformed ();
+  let t = Hashtbl.create n in
+  let at = ref 8 in
+  for _ = 1 to n do
+    let k = u64 (slice !at 8) 0 in
+    if k < 0 then malformed ();
+    let entry = slice (!at + 8) (k + 16) in
+    let off = u64 entry k and len = u64 entry (k + 8) in
+    if not (inside off len) then malformed ();
+    Hashtbl.replace t (String.sub entry 0 k) (off, len);
+    at := !at + 24 + k
+  done;
+  t
 
 (* The code object of [key], ["gfx12-generic/cast.float32"], if the library
    carries it. *)
 let find key =
   Option.map
     (fun (off, len) -> sub off len)
-    (Hashtbl.find_opt (Lazy.force index) key)
+    (Hashtbl.find_opt index key)
 
 (* A code object the library carries: its bytes and the names of its kernels. *)
 type member = { binary : string; kernels : string list }
@@ -60,12 +73,11 @@ let member =
 (* The targets the library carries code objects for, and one code object of
    each. *)
 let targets =
-  lazy
-    (Hashtbl.fold
-       (fun key _ acc ->
-         match String.index_opt key '/' with
-         | Some i when not (List.mem_assoc (String.sub key 0 i) acc) ->
-             (String.sub key 0 i, Option.get (find key)) :: acc
-         | Some _ | None -> acc)
-       (Lazy.force index) []
-    |> List.sort compare)
+  Hashtbl.fold
+    (fun key _ acc ->
+      match String.index_opt key '/' with
+      | Some i when not (List.mem_assoc (String.sub key 0 i) acc) ->
+          (String.sub key 0 i, Option.get (find key)) :: acc
+      | Some _ | None -> acc)
+    index []
+  |> List.sort compare

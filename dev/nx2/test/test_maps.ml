@@ -43,6 +43,9 @@ let elements (type v s) (x : (v, s, b) Value.t) : v array =
 
 let first (x, ()) = x
 
+(* [op]'s expansion computed now, its loops folded. *)
+let expand op = Expand.folded Exec.run ~by:"t" op
+
 let maps =
   group "maps"
     [
@@ -108,10 +111,11 @@ let checks =
               }
           in
           Exec.run ~by:"t"
-            (Value.Check { ok; data = []; fail = (fun _ _ -> Exit) }));
+            (Value.Check { ok; data = []; fail = (fun _ _ -> Exit) });
+          Exec.wait ~by:"t" ok);
       test
-        "a check raises its exception at the first failing index, with the \
-         data there" (fun () ->
+        "a check off the host raises its exception at the next wait, at the \
+         first failing index, with the data there" (fun () ->
           let ok =
             Value.Array
               {
@@ -123,12 +127,9 @@ let checks =
               }
           in
           let fail i (x, ()) = Failed (i, x) in
-          raises
-            (Failed ([| 1 |], 20.))
-            (fun () ->
-              Exec.run ~by:"t"
-                (Value.Check
-                   { ok; data = [ f32 [| 10.; 20.; 30. |] ]; fail })));
+          Exec.run ~by:"t"
+            (Value.Check { ok; data = [ f32 [| 10.; 20.; 30. |] ]; fail });
+          raises (Failed ([| 1 |], 20.)) (fun () -> Exec.wait ~by:"t" ok));
     ]
 
 (* A fresh constant [1.]: a node of its own. *)
@@ -560,9 +561,9 @@ let test_reuse_after_view () =
     (Rig.Buffer.overlaps (A.buffer (array_of x)) (A.buffer (array_of y)));
   equal ~msg:"the result" (array bits) [| 2.; 3. |] (elements y)
 
-(* A contraction consumes its donated [init] and computes into fresh memory:
-   here [y = init + a · b] elementwise, as a contraction with one batch pair and
-   no sum. *)
+(* A contraction consumes its donated [init] and writes into its memory: here
+   [y = init + a · b] elementwise, as a contraction with one batch pair and no
+   sum. *)
 let test_contract_consumes () =
   let init = f32 [| 10.; 20. |] in
   let d = Exec.donate ~by:"t" init in
@@ -581,7 +582,7 @@ let test_contract_consumes () =
          })
   in
   equal ~msg:"the result" (array bits) [| 13.; 28. |] (elements y);
-  equal ~msg:"fresh memory" bool false
+  equal ~msg:"written in place" bool true
     (Rig.Buffer.overlaps (A.buffer (array_of init)) (A.buffer (array_of y)));
   raises_match (Exn.invalid_arg ~substring:"t: operand 1 was donated to t")
     (fun () -> Exec.run ~by:"t" (Value.Copy init))
@@ -591,7 +592,7 @@ let donation =
     [
       test "a handle passed on by a view is written in place"
         test_reuse_after_view;
-      test "a contraction consumes its donated init" test_contract_consumes;
+      test "a contraction writes into its donated init" test_contract_consumes;
       test "an elementwise operation writes into a donated operand" test_reuse;
       test "the fast path writes into a donated operand too" test_reuse_fast;
       test "the fast path of one operand writes into it" test_reuse_fast1;
@@ -630,7 +631,7 @@ let expansions =
                 loads = [| Plain x |];
               }
           in
-          let y, _ = Option.get (Expand.run Exec.run ~by:"t" op) in
+          let y, _ = Option.get (expand op) in
           own_memory x y;
           equal (array bits) [| 1.; 2. |] (elements y));
       test "a scatter of no update is a copy" (fun () ->
@@ -654,7 +655,7 @@ let expansions =
                 into;
               }
           in
-          let y = Option.get (Expand.run Exec.run ~by:"t" op) in
+          let y = Option.get (expand op) in
           own_memory into y;
           equal (array bits) [| 1.; 2. |] (elements y));
     ]
@@ -910,7 +911,7 @@ let law_logsumexp (Lse (dt, shape, axes, xs, sn)) =
       }
   in
   let want = first (Exec.run ~by:"t" op) in
-  let got = first (Option.get (Expand.run Exec.run ~by:"t" op)) in
+  let got = first (Option.get (expand op)) in
   equal (array int) (bytes want) (bytes got)
 
 let arithmetic =

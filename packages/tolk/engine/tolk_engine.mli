@@ -62,7 +62,7 @@ val link :
       otherwise, in its device's memory, which the runs share, starting at its
       phase ({!run}). The schedule holds the memory of every bound buffer a
       kernel or copy accesses ({!Rig.Claim.hold}) while it is reachable, so
-      no call consumes it.
+      no call consumes it. A link that raises holds none of them.
     - A kernel's lanes are the devices of its first argument: it is launched on
       each, with the lane's shard of each argument and ["_device_num"] bound to
       the lane's index. A host program is launched on its device's host, which
@@ -74,8 +74,7 @@ val link :
       ({!Rig.runs_on_host}); otherwise it is a copy of the host's
       ({!Rig.Buffer.copy}), which returns once done.
     - Consecutive kernels and copies of one device are one submission
-      ({!Rig.Submission}) of at most the parts the device always runs
-      ({!Rig.most_parts}), and each of them is a submission of its own while
+      ({!Rig.Submission}), and each of them is a submission of its own while
       {!Tolk.Setting.debug} is [2] or more, so that a submission's work in a
       profile ({!Rig.Profile.Work}) is one kernel's.
     - A range around calls is a loop of the program, and so is a back edge,
@@ -174,4 +173,6 @@ val time : ?vars:(string * int) list -> t -> Rig.Buffer.t list array -> float
     allocates no device memory and loads nothing.
 
     Raises as {!run} does, and {!Rig.Lost} if a device that runs a kernel of [s]
-    is lost during the run. *)
+    is lost during the run, or if another domain's device whose work the
+    run's profile recorded is lost before the profile reads it
+    ({!Rig.Profile.take}). *)

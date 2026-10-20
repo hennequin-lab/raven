@@ -5,22 +5,33 @@
 
 open Value
 
-(* The next start, and the live [Extent] interpretations, of the process. *)
-let next = Atomic.make 0
+(* The live [Extent] interpretations of the process. *)
 let extents = Atomic.make 0
 let quiet () = Atomic.get extents = 0
+
+(* The nodes of the formulas [i]'s rule returned. *)
+let add_formula i id =
+  match i.formulas with
+  | Some t -> Hashtbl.replace t id ()
+  | None ->
+      let t = Hashtbl.create 16 in
+      Hashtbl.replace t id ();
+      i.formulas <- Some t
+
+let is_formula i id =
+  match i.formulas with Some t -> Hashtbl.mem t id | None -> false
 
 (* [i]'s rule on [op]. The formulas it returns are [i]'s own: an operation
    reads them as they are. *)
 let applied i ~by op =
   let r = i.rule i ~by op in
   (match i.reach with
-  | Values -> ()
+  | Values | Adopting _ -> ()
   | Extent ->
       Prim.iter_results
         (fun y ->
           match y with
-          | Deferred { node = Node n; _ } -> Interp.add_formula i n.id
+          | Deferred { node = Node n; _ } -> add_formula i n.id
           | Array _ | Shards _ | Donated _ | Traced _ -> ())
         op r);
   r
@@ -164,10 +175,10 @@ let replayed : type r d.
    is. *)
 let replay (type v s d) i (x : (v, s, d) t) : (v, s, d) t =
   let results : (int, d any array) Hashtbl.t = Hashtbl.create 8 in
-  let known id = Interp.is_formula i id || Hashtbl.mem results id in
+  let known id = is_formula i id || Hashtbl.mem results id in
   let sub : type w q e. (w, q, e) t -> (w, q, d) t = function
     | Deferred { form; node = Node n as node; k } ->
-        if Interp.is_formula i n.id then
+        if is_formula i n.id then
           Deferred { form = { form with placement = None }; node; k }
         else Prim.expect form.dtype (Hashtbl.find results n.id).(k)
     | Array _ | Shards _ | Donated _ | Traced _ ->
@@ -200,31 +211,35 @@ let replay (type v s d) i (x : (v, s, d) t) : (v, s, d) t =
   done;
   sub x
 
-(* Whether [i]'s rule receives [x] changed: a handle as its arrays, and for an
-   [Extent], a formula its rule did not return replayed. *)
+(* Whether [i]'s rule receives [x] changed: for an [Extent], a formula its
+   rule did not return replayed. *)
 let changes (type v s d) i (x : (v, s, d) t) =
   match x with
-  | Donated _ -> true
   | Deferred { node = Node n; _ } -> (
       match i.reach with
-      | Extent -> not (Interp.is_formula i n.id)
-      | Values -> false)
-  | Array _ | Shards _ | Traced _ -> false
+      | Extent -> not (is_formula i n.id)
+      | Values | Adopting _ -> false)
+  | Array _ | Shards _ | Donated _ | Traced _ -> false
 
 let received (type v s d) i (x : (v, s, d) t) : (v, s, d) t =
   match x with
-  | Donated _ -> Exec.live x
   | Deferred _ when changes i x -> replay i x
-  | Deferred _ | Array _ | Shards _ | Traced _ -> x
+  | Deferred _ | Array _ | Shards _ | Donated _ | Traced _ -> x
 
 let is_traced (type v s d) (x : (v, s, d) t) =
   match x with
   | Traced _ -> true
   | Array _ | Shards _ | Donated _ | Deferred _ -> false
 
+(* Whether [i] receives [o]'s values as its own: [o] is [i] or what [i]
+   adopts. *)
+let rec adopts i o =
+  o == i
+  || match i.reach with Adopting p -> adopts p o | Values | Extent -> false
+
 let owns i (type v s d) (x : (v, s, d) t) =
   match x with
-  | Traced { owner; _ } -> owner == i
+  | Traced { owner; _ } -> adopts i owner
   | Array _ | Shards _ | Donated _ | Deferred _ -> false
 
 let refuse ~by o =
@@ -256,20 +271,22 @@ let around o =
 
 (* [i]'s rule on [op], in [i]'s clause. Another interpretation's traced operand
    is refused unless its interpretation is around [i], which is asked once per
-   interpretation. An operation the rule receives consumes its handles, a
-   movement too: the rule's results hold none to pass on. *)
+   interpretation; one [i] adopts is around by construction ({!interpret}). An
+   operation the rule receives consumes its handles, a movement too: the rule's
+   results hold none to pass on. The rule reads it as it was called
+   ({!Exec.consume}). *)
 let deliver i ~by op =
   let checked = ref ([] : interpretation list) in
   Prim.iteri
     (fun _ x ->
       match x with
-      | Traced { owner; _ } when owner != i && not (List.memq owner !checked)
-        ->
+      | Traced { owner; _ }
+        when (not (adopts i owner)) && not (List.memq owner !checked) ->
           if not (around owner) then refuse ~by owner;
           checked := List.cons owner !checked
       | Traced _ | Array _ | Shards _ | Donated _ | Deferred _ -> ())
     op;
-  Exec.consume ~by op;
+  let op = Exec.consume ~by op in
   let op =
     if Prim.exists (fun x -> changes i x) op then
       Prim.map (fun x -> received i x) op
@@ -280,9 +297,32 @@ let deliver i ~by op =
 let reaches i op =
   match i.reach with
   | Extent -> true
-  | Values -> Prim.exists (fun x -> owns i x) op
+  | Values | Adopting _ -> Prim.exists (fun x -> owns i x) op
+
+(* Whether [i], whose handler was installed on the domain [here], answers on
+   the calling domain, asked by its handler once it has taken an effect. An
+   adopting interpretation's rule may share its parent's state, which no lock
+   guards: on another domain it answers only where its parent is around too,
+   so that the parent's extent moved with it and no rule of theirs runs
+   elsewhere. *)
+let present i here =
+  match i.reach with
+  | Values | Extent -> true
+  | Adopting p -> (Domain.self () :> int) = here || around p
+
+(* Refuses [op], which [i] reaches where it is not present: names the first
+   operand's owner that [i] adopts. *)
+let absent i ~by op =
+  Prim.iteri
+    (fun _ x ->
+      match x with
+      | Traced { owner; _ } when adopts i owner -> refuse ~by owner
+      | Traced _ | Array _ | Shards _ | Donated _ | Deferred _ -> ())
+    op;
+  invalid_arg "Eval.absent: an operation its interpretation does not reach"
 
 let handler i =
+  let here = (Domain.self () :> int) in
   {
     Effect.Deep.effc =
       (fun (type a) (e : a Effect.t) ->
@@ -290,7 +330,9 @@ let handler i =
         | Receive { by; op = Some op } when reaches i op ->
             Some
               (fun (k : (a, _) Effect.Deep.continuation) ->
-                match deliver i ~by op with
+                match
+                  if present i here then deliver i ~by op else absent i ~by op
+                with
                 | r -> Effect.Deep.continue k r
                 | exception x ->
                     let bt = Printexc.get_raw_backtrace () in
@@ -298,18 +340,37 @@ let handler i =
         | Around j when j == i ->
             Some
               (fun (k : (a, _) Effect.Deep.continuation) ->
-                Effect.Deep.continue k ())
+                if present i here then Effect.Deep.continue k ()
+                else Effect.Deep.discontinue k (Effect.Unhandled e))
         | _ -> None);
   }
 
+(* Refuses to adopt [p] unless its values may skip the check that [p] is
+   around: [p] reaches its values alone, and is live and around the caller,
+   so around the adopting extent. *)
+let adoptable ~name p =
+  match p.reach with
+  | Extent ->
+      Format.kasprintf invalid_arg "%s: adopts %s, an Extent" name p.name
+  | Values | Adopting _ ->
+      if not (Atomic.get p.live) then
+        Format.kasprintf invalid_arg "%s: adopts %s, which returned" name
+          p.name;
+      if not (around p) then
+        Format.kasprintf invalid_arg "%s: adopts %s outside %s's extent" name
+          p.name p.name
+
 let interpret ~name reach
     (rule : 'r. interpretation -> by:string -> 'r prim -> 'r) f =
-  let start = Atomic.fetch_and_add next 1 in
+  (match reach with
+  | Adopting p -> adoptable ~name p
+  | Values | Extent -> ());
   let live = Atomic.make true in
-  let i = { name; reach; rule; start; live; formulas = None } in
+  let i = { name; reach; rule; live; formulas = None } in
   let run () = Effect.Deep.try_with f i (handler i) in
   match reach with
-  | Values -> Fun.protect ~finally:(fun () -> Atomic.set live false) run
+  | Values | Adopting _ ->
+      Fun.protect ~finally:(fun () -> Atomic.set live false) run
   | Extent ->
       Atomic.incr extents;
       Fun.protect
@@ -317,6 +378,18 @@ let interpret ~name reach
           Atomic.set live false;
           Atomic.decr extents)
         run
+
+let traced i form payload = Traced { form; owner = i; payload }
+
+let payload (type v s d) i (x : (v, s, d) t) =
+  match x with
+  | Traced { owner; payload; _ } when owner == i -> Some payload
+  | Traced _ | Array _ | Shards _ | Donated _ | Deferred _ -> None
+
+let owner (type v s d) (x : (v, s, d) t) =
+  match x with
+  | Traced { owner; _ } -> Some owner
+  | Array _ | Shards _ | Donated _ | Deferred _ -> None
 
 (* An operation no handler answered computes, unless an operand is traced. *)
 let unreached ~by op =
@@ -399,8 +472,14 @@ let place ~by p x =
   | Array _ | Shards _ | Donated _ | Deferred _ | Traced _ ->
       eval ~by (Place (p, x))
 
-let expand i ~by op =
+let expand i ~by
+    ~(repeat :
+       'd.
+       int -> ('d index -> 'd any list -> 'd any list) -> 'd any list ->
+       'd any list) op =
   if not (Atomic.get i.live) then
     Format.kasprintf invalid_arg "%s: an expansion for %s after it returned" by
       i.name;
-  Effect.Deep.try_with (fun () -> Expand.run eval ~by op) () (handler i)
+  Effect.Deep.try_with
+    (fun () -> Expand.run eval ~by ~repeat op)
+    () (handler i)

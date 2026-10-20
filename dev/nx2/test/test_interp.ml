@@ -48,6 +48,14 @@ let tag i x = Nx.Prim.traced i (Nx.Prim.form x) (Tag 0)
 let received log = List.rev !log
 let names = list string
 
+(* The [repeat] of an expansion that folds. *)
+let folding n step init =
+  let rec go k c =
+    if k = n then c
+    else go (k + 1) (step (Nx.scalar Nx.int64 (Int64.of_int k)) c)
+  in
+  go 0 init
+
 (* The rule *)
 
 let x3 () = vec f32 [| 1.; 2.; 3. |]
@@ -124,6 +132,179 @@ let test_running () =
           Nx.Prim.interpret ~name:"test.own" Values own (fun i ->
               ignore (Nx.add (tag i x) x))))
 
+(* A rule reads an operation as it was called: the donor beside its own
+   handle, as in [add (donate x) x], is read as eager execution reads it, and
+   dies once the operation is received. *)
+let test_donor_beside () =
+  let x = x3 () in
+  let y =
+    Nx.Prim.interpret ~name:"test.extent" Extent
+      (fun _ ~by op -> Nx.Prim.eval ~by op)
+      (fun _ -> Nx.add (Nx.donate x) x)
+  in
+  equal (array float_exact) [| 2.; 4.; 6. |] (elements y);
+  invalid ~sub:"Nx.copy: operand 1 was donated to Nx.add" (fun () -> Nx.copy x)
+
+(* The [by]s a rule receives while [f] runs under it, each once, in order. *)
+let observed_names f =
+  let names = ref [] in
+  let observe _ ~by op =
+    if not (List.mem by !names) then names := by :: !names;
+    Nx.Prim.eval ~by op
+  in
+  Nx.Prim.interpret ~name:"test.names" Extent observe (fun _ -> ignore (f ()));
+  List.rev !names
+
+let square64 () = Nx.create f64 [| 2; 2 |] [| 2.; 0.; 0.; 1. |]
+
+(* Every operation a function makes reaches a rule named by the function the
+   user called, whatever functions that one computes through. *)
+let test_by_called () =
+  let m = square64 () in
+  equal ~msg:"trace" names [ "Nx.trace" ] (observed_names (fun () -> Nx.trace m));
+  equal ~msg:"inv" names [ "Nx.inv" ] (observed_names (fun () -> Nx.inv m));
+  equal ~msg:"cholesky Upper" names [ "Nx.cholesky" ]
+    (observed_names (fun () -> Nx.cholesky ~triangle:Upper m));
+  equal ~msg:"a call after the composite" names [ "Nx.trace"; "Nx.neg" ]
+    (observed_names (fun () -> Nx.neg (Nx.trace m)))
+
+(* A rule's refusal reaches the caller as the rule raised it, from inside a
+   composite too; one in the name the rule received names the function the
+   user called. *)
+let test_refusal_named () =
+  let a = square64 () and b = vec f64 [| 1.; 2. |] in
+  let lstsq why =
+    Nx.Prim.interpret ~name:"test.refuse" Extent
+      (fun _ ~by op ->
+        match op with
+        | Nx.Prim.Linalg _ -> invalid_arg (why by)
+        | _ -> Nx.Prim.eval ~by op)
+      (fun _ -> ignore (Nx.lstsq a b))
+  in
+  raises (Invalid_argument "test.refuse: no factorisation") (fun () ->
+      lstsq (fun _ -> "test.refuse: no factorisation"));
+  raises (Invalid_argument "Nx.lstsq: test.refuse has no factorisation")
+    (fun () -> lstsq (fun by -> by ^ ": test.refuse has no factorisation"))
+
+(* A rule is the user's function: a refusal of an nx function it calls reaches
+   the caller as raised, from inside a composite too. *)
+let test_rule_calls_named () =
+  let a = square64 () and b = vec f64 [| 1.; 2. |] in
+  let reshaping _ ~by op =
+    (match op with
+    | Nx.Prim.Linalg _ -> ignore (Nx.reshape [| 3 |] b)
+    | _ -> ());
+    Nx.Prim.eval ~by op
+  in
+  let by_reshape = function
+    | Invalid_argument m -> String.starts_with ~prefix:"Nx.reshape: " m
+    | _ -> false
+  in
+  raises_match by_reshape (fun () ->
+      Nx.Prim.interpret ~name:"test.reshaping" Extent reshaping (fun _ ->
+          Nx.lstsq a b))
+
+(* What a rule donates dies naming the function the rule called, inside a
+   composite too. *)
+let test_rule_donates () =
+  let own = vec f64 [| 1.; 2. |] and spent = ref false in
+  Nx.Prim.interpret ~name:"test.donor" Extent
+    (fun _ ~by op ->
+      if not !spent then begin
+        spent := true;
+        ignore (Nx.neg (Nx.donate own))
+      end;
+      Nx.Prim.eval ~by op)
+    (fun _ -> ignore (Nx.trace (square64 ())));
+  invalid ~sub:"Nx.copy: operand 1 was donated to Nx.neg" (fun () ->
+      Nx.copy own)
+
+(* A rule inside [trace] performs an effect whose handler resumes the rest of
+   the call on a second domain, as a work-stealing scheduler does. A plain
+   operation on the first domain afterwards is named by its own function: its
+   death, and the [by] a rule receives. *)
+type _ Effect.t += Hop : unit Effect.t
+
+let test_names_after_hop () =
+  let hopping f =
+    Effect.Deep.match_with f ()
+      {
+        retc = Fun.id;
+        exnc = raise;
+        effc =
+          (fun (type a) (e : a Effect.t) ->
+            match e with
+            | Hop ->
+                Some
+                  (fun (k : (a, unit) Effect.Deep.continuation) ->
+                    Domain.join
+                      (Domain.spawn (fun () -> Effect.Deep.continue k ())))
+            | _ -> None);
+      }
+  in
+  let hopped = ref false in
+  hopping (fun () ->
+      Nx.Prim.interpret ~name:"test.hop" Extent
+        (fun _ ~by op ->
+          if not !hopped then begin
+            hopped := true;
+            Effect.perform Hop
+          end;
+          Nx.Prim.eval ~by op)
+        (fun _ -> ignore (Nx.trace (square64 ()))));
+  equal ~msg:"hopped" bool true !hopped;
+  let x = vec f64 [| 1.; 2. |] in
+  equal ~msg:"a rule's by" names [ "Nx.neg" ]
+    (observed_names (fun () -> Nx.neg (Nx.donate x)));
+  invalid ~sub:"Nx.copy: operand 1 was donated to Nx.neg" (fun () -> Nx.copy x)
+
+(* One systhread holds a composite, blocked in its rule, while another of the
+   same domain runs a plain operation: each operation's death and the [by] its
+   rule receives name its own function. *)
+let test_names_two_threads () =
+  let m = Mutex.create () and c = Condition.create () in
+  let inside = ref false and plain_done = ref false in
+  let set flag =
+    Mutex.lock m;
+    flag := true;
+    Condition.broadcast c;
+    Mutex.unlock m
+  in
+  let await flag =
+    Mutex.lock m;
+    while not !flag do
+      Condition.wait c m
+    done;
+    Mutex.unlock m
+  in
+  let a = square64 () and composite = ref [] in
+  let held =
+    Thread.create
+      (fun () ->
+        let names = ref [] in
+        Nx.Prim.interpret ~name:"test.held" Extent
+          (fun _ ~by op ->
+            if not (List.mem by !names) then names := by :: !names;
+            if not !inside then begin
+              set inside;
+              await plain_done
+            end;
+            Nx.Prim.eval ~by op)
+          (fun _ -> ignore (Nx.trace (Nx.donate a)));
+        composite := List.rev !names)
+      ()
+  in
+  await inside;
+  let x = vec f64 [| 1.; 2. |] in
+  let plain = observed_names (fun () -> Nx.neg (Nx.donate x)) in
+  set plain_done;
+  Thread.join held;
+  equal ~msg:"the plain operation's by" names [ "Nx.neg" ] plain;
+  equal ~msg:"the composite's by" names [ "Nx.trace" ] !composite;
+  invalid ~sub:"Nx.copy: operand 1 was donated to Nx.neg" (fun () -> Nx.copy x);
+  invalid ~sub:"Nx.copy: operand 1 was donated to Nx.trace" (fun () ->
+      Nx.copy a)
+
 let test_after_return () =
   let x = x3 () in
   let i, t =
@@ -141,7 +322,7 @@ let test_after_return () =
   let expansion = ref ignore in
   Nx.Prim.interpret ~name:"test.extent" Extent
     (fun i ~by op ->
-      (expansion := fun () -> ignore (Nx.Prim.expand i ~by op));
+      (expansion := fun () -> ignore (Nx.Prim.expand i ~by ~repeat:folding op));
       Nx.Prim.eval ~by op)
     (fun _ -> ignore (Nx.add x x));
   invalid ~sub:"Nx.add: an expansion for test.extent after it returned"
@@ -195,19 +376,18 @@ let test_systhreads () =
   equal ~msg:"another systhread computes" (array float_exact) [| 2.; 4.; 6. |]
     (elements y)
 
-let test_later () =
-  let a, b =
-    logged ~name:"a" Values (ref []) (fun a ->
-        logged ~name:"b" Values (ref []) (fun b -> (a, b)))
-  in
-  equal ~msg:"b later" bool true (Nx.Prim.later b a);
-  equal ~msg:"a not later" bool false (Nx.Prim.later a b);
-  let c =
-    Domain.join
-      (Domain.spawn (fun () -> logged ~name:"c" Values (ref []) Fun.id))
-  in
-  equal ~msg:"c, started after them on another domain" bool true
-    (Nx.Prim.later c b)
+(* [quiet] is false while an extent lives, seen from any domain; a values
+   interpretation leaves it as it was. It may be false with no extent live,
+   after a continuation dropped in one, so the test asserts nothing of it
+   outside. *)
+let test_quiet () =
+  let outside = Nx.Prim.quiet () in
+  logged ~name:"test.values" Values (ref []) (fun _ ->
+      equal ~msg:"inside values" bool outside (Nx.Prim.quiet ()));
+  logged ~name:"test.extent" Extent (ref []) (fun _ ->
+      equal ~msg:"inside an extent" bool false (Nx.Prim.quiet ());
+      equal ~msg:"on another domain" bool false
+        (Domain.join (Domain.spawn Nx.Prim.quiet)))
 
 (* A formula reaches a Values rule as it is, computing nothing. *)
 let test_constants () =
@@ -263,13 +443,24 @@ let rule =
         test_extent_reach;
       test "the innermost that reaches an operation receives it" test_innermost;
       test "a rule computes, and refuses its own values" test_running;
+      test "a rule reads the donor beside its handle" test_donor_beside;
+      test "a rule receives the function the user called" test_by_called;
+      test "a rule's refusal keeps its name inside a composite"
+        test_refusal_named;
+      test "a rule's calls keep their names inside a composite"
+        test_rule_calls_named;
+      test "what a rule donates dies naming the rule's call" test_rule_donates;
+      test "a plain operation after a call resumed on another domain"
+        test_names_after_hop;
+      test "a plain operation beside another systhread's composite"
+        test_names_two_threads;
       test "a value used after its interpretation returned raises"
         test_after_return;
       test "a value refuses another domain; an extent does not reach one"
         test_domains;
       test "a value refuses another systhread; an extent does not reach one"
         test_systhreads;
-      test "later orders by start, across domains" test_later;
+      test "quiet is false while an extent lives" test_quiet;
       test "a formula reaches a values rule as it is" test_constants;
       test "a captured formula reaches an extent as its operations"
         test_captured;
@@ -512,7 +703,7 @@ let test_ill_formed () =
 let expanding f =
   Nx.Prim.interpret ~name:"test.expand" Extent
     (fun i ~by op ->
-      match Nx.Prim.expand i ~by op with
+      match Nx.Prim.expand i ~by ~repeat:folding op with
       | Some r -> r
       | None -> Nx.Prim.eval ~by op)
     (fun _ -> f ())
@@ -757,14 +948,14 @@ let jvp_rule (type r) i ~by (op : r Nx.Prim.t) : r =
   let primal op = Nx.Prim.map (fun x -> fst (parts i x)) op in
   match op with
   | Map ({ outs = [ _ ]; prog; loads; _ } as m) -> (
-      match (one_node prog, Nx.Prim.expand i ~by op) with
+      match (one_node prog, Nx.Prim.expand i ~by ~repeat:folding op) with
       | _, Some r -> r
       | Some node, None ->
           let y, () = Nx.Prim.eval ~by (primal (Map m)) in
           (dual i y (tangent i node loads y), ())
       | None, None -> fail "test.jvp: a map that does not expand")
   | Map _ -> (
-      match Nx.Prim.expand i ~by op with
+      match Nx.Prim.expand i ~by ~repeat:folding op with
       | Some r -> r
       | None -> fail "test.jvp: a map that does not expand")
   | Reduce _ | Scan _ ->
@@ -1205,7 +1396,7 @@ let exprs = Testable.make ~pp:pp_expr ~equal:( = )
 type ('v, 's, 'd) Nx.Prim.payload += Expr : expr -> ('v, 's, 'd) Nx.Prim.payload
 
 let capturing (type r) i ~by (op : r Nx.Prim.t) : r =
-  match Nx.Prim.expand i ~by op with
+  match Nx.Prim.expand i ~by ~repeat:folding op with
   | Some r -> r
   | None ->
       let (Nx.Prim.Operands xs) = Nx.Prim.operands op in
@@ -1535,6 +1726,313 @@ let fibers =
       test "a rule's exception raises inside the extent" test_rule_raises;
     ]
 
+(* Nesting: an interpretation that adopts another's values *)
+
+let adopting ~name p log f = logged ~name (Adopting p) log f
+
+(* A rule's answer to an operation, or the message of its refusal. *)
+let answer f =
+  match f () with
+  | _ -> "computed"
+  | exception Invalid_argument m -> m
+
+(* An adopting interpretation receives the operations on its parent's values
+   as on its own, before the parent, which receives none of them. *)
+let test_adopting_reach () =
+  let x = x3 () in
+  let parent = ref [] and adopted = ref [] in
+  logged ~name:"test.p" Values parent (fun p ->
+      let t = tag p x in
+      adopting ~name:"test.c" p adopted (fun c ->
+          ignore (Nx.copy t);
+          ignore (Nx.add (tag c x) x);
+          ignore (Nx.add x x)));
+  equal ~msg:"the adopting one" names [ "Copy"; "Map" ] (received adopted);
+  equal ~msg:"the parent" names [] (received parent)
+
+(* Adoption follows the parents: the innermost receives its grandparent's
+   values. A returned sibling's value is refused. *)
+let test_adopting_chain () =
+  let x = x3 () in
+  let log = ref [] in
+  logged ~name:"test.p" Values (ref []) (fun p ->
+      let sibling =
+        adopting ~name:"test.sibling" p (ref []) (fun s -> tag s x)
+      in
+      adopting ~name:"test.c1" p (ref []) (fun c1 ->
+          let t1 = tag c1 x in
+          adopting ~name:"test.c2" c1 log (fun _ ->
+              ignore (Nx.copy (tag p x));
+              ignore (Nx.copy t1);
+              equal ~msg:"the sibling's value" string
+                "Nx.copy: a value of test.sibling, used after test.sibling \
+                 returned"
+                (answer (fun () -> Nx.copy sibling)))));
+  equal ~msg:"the innermost" names [ "Copy"; "Copy" ] (received log)
+
+(* Inside an extent, an adopting interpretation receives an operation on its
+   parent's value before the extent, and the operations its rule applies reach
+   the extent. *)
+let test_adopting_inside_extent () =
+  let x = x3 () in
+  let extent = ref [] and adopted = ref [] in
+  logged ~name:"test.p" Values (ref []) (fun p ->
+      let t = tag p x in
+      logged ~name:"test.extent" Extent extent (fun _ ->
+          Nx.Prim.interpret ~name:"test.c" (Adopting p)
+            (fun c ~by op ->
+              adopted := Nx.Prim.name op :: !adopted;
+              ignore (Nx.neg x);
+              tagged c ~by op)
+            (fun _ -> ignore (Nx.copy t))));
+  equal ~msg:"the adopting one" names [ "Copy" ] (received adopted);
+  equal ~msg:"the extent, the rule's operation" names [ "Map" ]
+    (received extent)
+
+(* Adopting an interpretation that returned, an extent, or one that is not
+   around the caller raises. *)
+let test_adopting_refused () =
+  let x = x3 () in
+  let adopt p =
+    answer (fun () ->
+        Nx.Prim.interpret ~name:"test.c" (Adopting p) tagged ignore)
+  in
+  let p = logged ~name:"test.p" Values (ref []) Fun.id in
+  equal ~msg:"returned" string "test.c: adopts test.p, which returned"
+    (adopt p);
+  logged ~name:"test.extent" Extent (ref []) (fun e ->
+      equal ~msg:"an extent" string "test.c: adopts test.extent, an Extent"
+        (adopt e));
+  let outside = "test.c: adopts test.p outside test.p's extent" in
+  logged ~name:"test.p" Values (ref []) (fun p ->
+      equal ~msg:"another domain" string outside
+        (Domain.join (Domain.spawn (fun () -> adopt p))));
+  let in_rule = ref "" in
+  Nx.Prim.interpret ~name:"test.p" Values
+    (fun p ~by op ->
+      in_rule := adopt p;
+      tagged p ~by op)
+    (fun p -> ignore (Nx.copy (tag p x)));
+  equal ~msg:"its parent's rule" string outside !in_rule
+
+(* A fiber beside an adopting interpretation's, under a scheduler inside the
+   parent, reaches the parent; the adopting fiber's operations, before and
+   after it yields, reach the adopting one. *)
+let test_adopting_yield () =
+  let x = x3 () in
+  let parent = ref [] and adopted = ref [] in
+  logged ~name:"test.p" Values parent (fun p ->
+      let t = tag p x in
+      schedule
+        [
+          ( "adopting",
+            fun () ->
+              adopting ~name:"test.c" p adopted (fun _ ->
+                  ignore (Nx.copy t);
+                  yield ();
+                  ignore (Nx.copy t)) );
+          ("beside", fun () -> ignore (Nx.add t t));
+        ]);
+  equal ~msg:"the adopting one" names [ "Copy"; "Copy" ] (received adopted);
+  equal ~msg:"the parent" names [ "Map" ] (received parent)
+
+(* [f ()] on a fiber that its first yield suspends, then resumed on another
+   domain. *)
+let migrated f =
+  let suspended = ref None in
+  Effect.Deep.match_with f ()
+    {
+      retc = Fun.id;
+      exnc = raise;
+      effc =
+        (fun (type a) (e : a Effect.t) ->
+          match e with
+          | Yield ->
+              Some
+                (fun (k : (a, unit) Effect.Deep.continuation) ->
+                  suspended := Some (fun () -> Effect.Deep.continue k ()))
+          | _ -> None);
+    };
+  Domain.join (Domain.spawn (Option.get !suspended))
+
+(* An adopting interpretation resumed on another domain without its parent
+   refuses there its own values and its parent's. *)
+let test_adopting_migrated () =
+  let x = x3 () in
+  let got = ref [] in
+  logged ~name:"test.p" Values (ref []) (fun p ->
+      migrated (fun () ->
+          adopting ~name:"test.c" p (ref []) (fun c ->
+              let own = tag c x in
+              yield ();
+              got :=
+                [
+                  answer (fun () -> Nx.copy (tag p x));
+                  answer (fun () -> Nx.copy own);
+                ])));
+  equal ~msg:"refused there" names
+    [
+      "Nx.copy: a value of test.p, used outside test.p's extent";
+      "Nx.copy: a value of test.c, used outside test.c's extent";
+    ]
+    !got
+
+(* An adopting interpretation resumed on another domain with its parent, and
+   an extent between them, still receives its own values and its parent's
+   there, before the extent. *)
+let test_adopting_migrated_whole () =
+  let x = x3 () in
+  let parent = ref [] and extent = ref [] and adopted = ref [] in
+  migrated (fun () ->
+      logged ~name:"test.p" Values parent (fun p ->
+          logged ~name:"test.extent" Extent extent (fun _ ->
+              adopting ~name:"test.c" p adopted (fun c ->
+                  let own = tag c x in
+                  yield ();
+                  ignore (Nx.copy (tag p x));
+                  ignore (Nx.copy own)))));
+  equal ~msg:"the adopting one" names [ "Copy"; "Copy" ] (received adopted);
+  equal ~msg:"the extent" names [] (received extent);
+  equal ~msg:"the parent" names [] (received parent)
+
+(* The words an operation allocates, over [n] runs after one uncounted. *)
+let words_per f =
+  let n = 1000 in
+  f ();
+  let before = Gc.minor_words () in
+  for _ = 1 to n do
+    f ()
+  done;
+  (Gc.minor_words () -. before) /. Float.of_int n
+
+(* An operation on a parent's value allocates what one on the adopting
+   interpretation's own value does: the parent is around by construction. *)
+let test_adopting_words () =
+  let x = x3 () in
+  logged ~name:"test.p" Values (ref []) (fun p ->
+      let t = tag p x in
+      Nx.Prim.interpret ~name:"test.c" (Adopting p) tagged (fun c ->
+          let own = tag c x in
+          let copy y () = ignore (Sys.opaque_identity (Nx.copy y)) in
+          equal ~msg:"words per operation" float_exact
+            (words_per (copy own))
+            (words_per (copy t))))
+
+let nesting =
+  group "nesting"
+    [
+      test "an adopting interpretation receives its parent's values"
+        test_adopting_reach;
+      test "adoption follows the parents" test_adopting_chain;
+      test "an adopting interpretation is reached before an extent"
+        test_adopting_inside_extent;
+      test "adopting a returned, an extent or an absent one raises"
+        test_adopting_refused;
+      test "a fiber beside an adopting one reaches the parent"
+        test_adopting_yield;
+      test "an adopting interpretation left by its parent refuses"
+        test_adopting_migrated;
+      test "an adopting interpretation migrated with its parent receives"
+        test_adopting_migrated_whole;
+      test "a parent's value costs what an own value does" test_adopting_words;
+    ]
+
+(* Loops: an expansion's loop runs through the interpretation's [repeat] *)
+
+(* [repeat] as a fold, counting its trips. *)
+let fold trips n step init =
+  folding n
+    (fun k carry ->
+      incr trips;
+      step k carry)
+    init
+
+let pp_ints ppf a =
+  Format.fprintf ppf "[%s]"
+    (String.concat "; " (Array.to_list (Array.map string_of_int a)))
+
+let form_name (Nx.Prim.Any x) =
+  let f = Nx.Prim.form x in
+  Format.asprintf "%s%a" (D.name f.dtype) pp_ints (L.shape f.layout)
+
+(* The forms [step] gives once traced at stand-ins of its index and of [init]:
+   what a stager that holds [step] once sees. *)
+let traced_once step init =
+  Nx.Prim.interpret ~name:"test.stager" Values tagged (fun s ->
+      let stand_in (Nx.Prim.Any x) =
+        Nx.Prim.Any (Nx.Prim.traced s (Nx.Prim.form x) (Tag 0))
+      in
+      let k = Nx.Prim.traced s (Nx.Prim.form (Nx.scalar Nx.int64 0L)) (Tag 0) in
+      List.map form_name (step k (List.map stand_in init)))
+
+(* [f ()] with each scatter whose targets may repeat expanded through
+   [repeat]. *)
+let looping
+    (repeat :
+      'd.
+      int ->
+      ((int64, D.int64_elt, 'd) Nx.t -> 'd Nx.Prim.any list ->
+       'd Nx.Prim.any list) ->
+      'd Nx.Prim.any list ->
+      'd Nx.Prim.any list) f =
+  Nx.Prim.interpret ~name:"test.loops" Extent
+    (fun (type r) i ~by (op : r Nx.Prim.t) : r ->
+      match op with
+      | Scatter { unique = false; _ } -> (
+          match Nx.Prim.expand i ~by ~repeat op with
+          | Some r -> r
+          | None -> fail "a repeating scatter that does not expand")
+      | _ -> Nx.Prim.eval ~by op)
+    (fun _ -> f ())
+
+(* A scatter whose targets may repeat loops once per position along its
+   axis, through [repeat], to the eager sum. *)
+let test_repeat () =
+  let into = vec f32 [| 0.; 0. |] in
+  let idx = vec Nx.int64 [| 0L; 1L; 0L |] in
+  let updates = vec f32 [| 1.; 2.; 3. |] in
+  let loops = ref 0 and trips = ref 0 in
+  let repeat n step init =
+    incr loops;
+    fold trips n step init
+  in
+  let y =
+    looping repeat (fun () ->
+        Nx.scatter ~combine:Nx.Add ~axis:0 idx updates into)
+  in
+  equal ~msg:"the sum" (array float_exact) [| 4.; 2. |] (elements y);
+  equal ~msg:"loops" int 1 !loops;
+  equal ~msg:"trips" int 3 !trips
+
+(* A loop's step keeps its carry's forms, traced once at stand-ins, so that a
+   stager may hold it once; folded, it gives the eager result. *)
+let test_repeat_forms () =
+  let into = Nx.reshape [| 2; 2 |] (vec f32 [| 0.; 0.; 0.; 0. |]) in
+  let idx = Nx.reshape [| 2; 2 |] (vec Nx.int64 [| 0L; 1L; 1L; 1L |]) in
+  let updates = Nx.reshape [| 2; 2 |] (vec f32 [| 1.; 2.; 3.; 4. |]) in
+  let seen = ref [] and trips = ref 0 in
+  let repeat n step init =
+    seen := (List.map form_name init, traced_once step init) :: !seen;
+    fold trips n step init
+  in
+  let y =
+    looping repeat (fun () ->
+        Nx.scatter ~combine:Nx.Max ~axis:1 idx updates into)
+  in
+  equal ~msg:"the result" (array float_exact) [| 1.; 2.; 0.; 4. |]
+    (elements y);
+  equal ~msg:"forms kept"
+    (list (pair (list string) (list string)))
+    [ ([ "float32[2; 2]" ], [ "float32[2; 2]" ]) ]
+    !seen
+
+let loops =
+  group "loops"
+    [
+      test "a repeating scatter loops through repeat" test_repeat;
+      test "a loop's step keeps its carry's forms" test_repeat_forms;
+    ]
+
 (* Memory
 
    While backtraces are recorded, the runtime keeps the last exception raised
@@ -1685,4 +2183,6 @@ let domains =
     ]
 
 let () =
-  exit (run "nx interp" [ rule; laws; fibers; memory; interpreters; domains ])
+  exit
+    (run "nx interp"
+       [ rule; laws; fibers; nesting; loops; memory; interpreters; domains ])

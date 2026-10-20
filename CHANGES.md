@@ -57,6 +57,9 @@ All notable changes to this project will be documented in this file.
 
 ### Norn
 
+- `Dist.support` of `Dist.transform (Bij.interval ~low ~high)` with
+  per-element bounds holds every element's values. It mapped the base's
+  support through the lowest `low` and the highest `high`.
 - `Norn.Nuts`, `Norn.Hmc`, tempering's moves and nested sampling's slice
   moves work on one row per chain instead of per tensor of the position: a NUTS
   leapfrog step compiles to 210 kernels instead of 760 on eight schools, and
@@ -1492,6 +1495,22 @@ All notable changes to this project will be documented in this file.
 
 ### Munin (new)
 
+- `Store.list_runs` and `Store.find_run` take a run's status from its event
+  log where `index.json` is behind it, as a process killed between the two
+  writes of `Session.finish` or `Session.resume` leaves it: such a run read as
+  running for good, or as finished and not resumable. A run directory without
+  a manifest is no longer listed.
+- Runs that several processes or domains start and finish in one store at
+  the same time keep their status in `Store.list_runs`. A change to
+  `index.json` holds a file lock and replaces the file whole. Where the file
+  system refuses locks, a change removes `index.json`, and runs are read
+  from their manifests.
+- A change to a damaged or missing `index.json` rebuilds it from the runs on
+  disk. It replaced the index with one holding only the changed run.
+- `Store.list_runs` and `Store.find_run` take a store's runs from its run
+  directories, and `index.json` only caches their headers. A run the index
+  lacked, as a killed process or an index of another shape leaves, was
+  hidden, and a run whose directory was removed was still listed.
 - `Session.start` never gives two runs one directory. Runs started within
   one second drew ids that collided about once in 65,536 pairs, and the
   second wrote into the first's run.
@@ -1529,6 +1548,16 @@ thread.
 
 ### Tolk (new)
 
+- A kernel reducing over a variable size computes the reduction's identity
+  where the size is 0. A sum read its accumulator unwritten; over a value the
+  range does not change, a sum of an infinity was NaN and a maximum the value.
+- `Codegen.made` is the program `to_program` has made of a kernel in this
+  process, if any, without waiting; `Realize.lower_and_compile` compiles only
+  the kernels without one.
+- The disk cache keeps a `Codegen.to_program` program up to its source and
+  takes its binary from the compiler's table, so each binary is stored once.
+- A `Tolk_engine.link` that raises ends the holds it took on bound buffers
+  (`Rig.Claim.release`), so a donation right after it reuses their memory.
 - `Tolk_engine.link` holds the memory of every bound buffer a kernel or
   copy accesses (`Rig.Claim.hold`) while the schedule is reachable, so no
   call consumes it between runs. A bound buffer that died between two runs
@@ -3943,6 +3972,14 @@ thread.
 
 ### Nx
 
+- `Nx_io.load_npy`, `load_npz`, `load_npz_entry` and `load_safetensors` refuse
+  a bool element whose byte is other than 0 or 1, raising `Failure` naming the
+  file and the entry, as `load_gguf` does. Such a byte gave bool operations an
+  unspecified result. `load_safetensors` now reads its `BOOL` entries' bytes.
+- `Repr.Placed.v` no longer promises to raise on a `bool` storage holding a
+  byte other than 0 or 1, which it never checked. Its bytes must be 0 or 1, as
+  for `of_buffer` and `of_shards`; an operation that reads another byte gives
+  an unspecified result.
 - An operation no `Nx.Op.intercept` claims keeps none of its operands once it
   returns, in an interpreter's `run` and while another domain or thread
   intercepts. With backtraces recorded, the `Effect.Unhandled` its fallback
@@ -6323,6 +6360,9 @@ thread.
 
 ### Kaun
 
+- `Kaun_datasets.cifar10` raises `Failure` naming the file when a batch does
+  not hold 10,000 entries. A longer batch wrote past its arrays, and a shorter
+  one returned uninitialised bytes.
 - `Kaun_hf.download_file` writes a download through the descriptor that created
   its temporary file. curl reopened it by name, so a link put there meanwhile
   redirected the write, and a umask without the owner's write bit failed it.

@@ -46,7 +46,10 @@ val threshold : float -> Nx.float32_t -> Nx.float32_t
 val to_grayscale : Nx.float32_t -> Nx.float32_t
 (** [to_grayscale img] converts RGB to single-channel grayscale using ITU-R
     BT.601 weights: [0.299 * R + 0.587 * G + 0.114 * B]. Input must have
-    [C >= 3]. Output has [C = 1]. *)
+    [C >= 3]; channels after the third, such as alpha, are ignored. Output has
+    [C = 1].
+
+    Raises [Invalid_argument] if [img]'s rank is less than 3 or [C < 3]. *)
 
 val rgb_to_hsv : Nx.float32_t -> Nx.float32_t
 (** [rgb_to_hsv img] converts RGB \[0, 1\] to HSV. H is in \[0, 1\] (normalized
@@ -131,7 +134,21 @@ val gaussian_blur : sigma:float -> ?ksize:int -> Nx.float32_t -> Nx.float32_t
     convolution. [ksize] defaults to [2 * ceil(3 * sigma) + 1], capturing 99.7%
     of the distribution.
 
-    Raises [Invalid_argument] if [ksize] is even or not positive. *)
+    If [sigma] is [0] or less, the kernel follows from the given [ksize]. For
+    [ksize] [1] to [9] it is fixed, each row below over its sum:
+    {v
+    ksize 1: 1
+    ksize 3: 1 2 1
+    ksize 5: 1 4 6 4 1
+    ksize 7: 2 7 14 18 14 7 2
+    ksize 9: 4 13 30 51 60 51 30 13 4
+    v}
+    For a larger [ksize] it is the Gaussian of sigma
+    [0.3 * ((ksize - 1) / 2 - 1) + 0.8].
+
+    Raises [Invalid_argument] if [ksize] is even or not positive, if [sigma]
+    is NaN, or if [ksize] is not given and [sigma] is not positive or so large
+    that [2 * ceil(3 * sigma) + 1] exceeds [max_int]. *)
 
 val box_blur : ksize:int -> Nx.float32_t -> Nx.float32_t
 (** [box_blur ~ksize img] applies a [ksize * ksize] averaging filter. Each
@@ -157,7 +174,9 @@ val filter2d : Nx.float32_t -> Nx.float32_t -> Nx.float32_t
 val unsharp_mask : sigma:float -> ?amount:float -> Nx.float32_t -> Nx.float32_t
 (** [unsharp_mask ~sigma img] sharpens by subtracting a Gaussian blur:
     [img + amount * (img - gaussian_blur ~sigma img)]. [amount] defaults to
-    [1.0]. *)
+    [1.0].
+
+    Raises [Invalid_argument] if [sigma] is not positive. *)
 
 (** {1:morphology Morphological operations} *)
 
@@ -197,16 +216,47 @@ val morphological_gradient : kernel:Nx.uint8_t -> ('a, 'b) Nx.t -> ('a, 'b) Nx.t
 
 val sobel : ?ksize:int -> Nx.float32_t -> Nx.float32_t * Nx.float32_t
 (** [sobel img] computes Sobel gradients. Returns [(gx, gy)] where [gx] is the
-    horizontal gradient and [gy] is the vertical gradient. [ksize] defaults to
-    [3]. Input must have [C = 1]. *)
+    horizontal gradient and [gy] is the vertical gradient. Input must have
+    [C = 1].
+
+    [ksize] is the aperture, [1], [3], [5] or [7], and defaults to [3]. For
+    [ksize >= 3], [gx] correlates with the [ksize * ksize] kernel whose rows
+    are the binomial difference of [ksize] taps (for [3], [[-1 0 1]]), each
+    weighted by the binomial smoothing of [ksize] taps (for [3],
+    [[1 2 1]]); [gy] uses its transpose. For [ksize = 3]:
+    {v
+    gx: -1 0 1      gy: -1 -2 -1
+        -2 0 2           0  0  0
+        -1 0 1           1  2  1
+    v}
+    [ksize = 1] does not smooth: [gx] correlates with the 1x3 kernel
+    [[-1 0 1]] and [gy] with its 3x1 transpose. A kernel of [ksize >= 3]
+    scales a first derivative by [2 ^ (2 * ksize - 3)], [ksize = 1] by [2].
+
+    Raises [Invalid_argument] if [ksize] is not [1], [3], [5] or [7]. *)
 
 val scharr : Nx.float32_t -> Nx.float32_t * Nx.float32_t
 (** [scharr img] computes Scharr gradients, which are more rotationally accurate
     than Sobel. Returns [(gx, gy)]. Input must have [C = 1]. *)
 
 val laplacian : ?ksize:int -> Nx.float32_t -> Nx.float32_t
-(** [laplacian img] computes the Laplacian (sum of second spatial derivatives).
-    [ksize] defaults to [3]. Input must have [C = 1]. *)
+(** [laplacian img] computes the Laplacian (sum of second spatial derivatives):
+    the sum of the second x and y derivatives, each from {!sobel}'s kernel of
+    aperture [ksize] with the binomial difference taken twice (for [ksize] [1]
+    and [3], [[1 -2 1]] in place of [[-1 0 1]]). Input must have [C = 1].
+
+    [ksize] is a positive odd integer and defaults to [1]. [ksize = 1]
+    correlates with the 3x3 aperture on the left, [ksize = 3] with the one on
+    the right:
+    {v
+    0  1  0      2  0  2
+    1 -4  1      0 -8  0
+    0  1  0      2  0  2
+    v}
+    A kernel of [ksize >= 3] scales the Laplacian by [2 ^ (2 * ksize - 4)],
+    [ksize = 1] by [1].
+
+    Raises [Invalid_argument] if [ksize] is not a positive odd integer. *)
 
 val canny :
   low:float -> high:float -> ?sigma:float -> Nx.float32_t -> Nx.float32_t
@@ -216,4 +266,6 @@ val canny :
     [1.4]. Input must have [C = 1].
 
     {b Note.} Not differentiable: uses non-maximum suppression and hysteresis
-    thresholding. *)
+    thresholding.
+
+    Raises [Invalid_argument] if [sigma] is not positive. *)

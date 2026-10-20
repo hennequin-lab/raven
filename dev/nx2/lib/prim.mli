@@ -69,11 +69,26 @@ val shape : ('v, 's, 'd) t -> int array
 val has_shape : ('v, 's, 'd) t -> int array -> bool
 (** [has_shape x s] is [shape x = s]. It allocates nothing. *)
 
+val axis : by:string -> int -> int -> (Format.formatter -> unit) -> int
+(** [axis ~by r a what] is [a] as an axis of a value of rank [r], counted from
+    the end where [a] is negative. Raises [Invalid_argument] naming [by], [a]
+    and the value as [what] prints it, if [a] is no axis of it. *)
+
 val merge : int array -> int array -> (int array, int * int * int) result
 (** [merge s s'] is the shape [s] and [s'] broadcast to, aligned at their last
     axes, each extent equal or [1]; [Error (a, e, e')] at the first axis [a] of
     that shape where [s] has [e] and [s'] has [e'], neither [1] nor the other.
 *)
+
+val check_shape : by:string -> int array -> unit
+(** [check_shape ~by s] raises [Invalid_argument] naming [by] and [s] unless
+    [s] is a layout's shape ({!Nx_array.Layout.fits}): where an extent is
+    negative, [s] has more than {!Nx_array.Layout.max_rank} axes, or its
+    extents other than [0] multiply past {!Nx_array.Layout.max_numel}. *)
+
+val check_value : by:string -> ('v, 's) dtype -> 'v -> unit
+(** [check_value ~by dt v] raises [Invalid_argument] naming [by], [v] and
+    [dt]'s range unless [dt] holds [v] ({!Nx_array.Dtype.holds}). *)
 
 val broadcast_shape : by:string -> int array -> int array -> int array
 (** [broadcast_shape ~by s s'] is [merge s s']'s shape. Raises
@@ -106,6 +121,15 @@ val operands : 'r prim -> operands
 (** [operands op] is [op]'s operands in order: a map's loads, a contraction's
     [a], [b] then [init], [Check]'s [ok] then its data, the one operand of the
     others. *)
+
+val own_index :
+  'r prim -> (int list * Nx_array.Layout.t * Nx_array.Dtype.any) option
+(** [own_index op] is the positions in {!operands} of the operands [op] reads
+    only at its first result's own index, each of which a kernel may take as
+    that result's destination ({!Nx_kernel.S}), with that result's layout and
+    dtype: a map's plain loads, a scatter's [into], a contraction's [init], an
+    assembly's first piece where it covers the whole result. [None] for an
+    operation with none. *)
 
 val iteri : ('v 's 'd. int -> ('v, 's, 'd) t -> unit) -> 'r prim -> unit
 (** [iteri f op] is [f i x] for each operand [x] of [op], at its position [i] in
@@ -213,11 +237,6 @@ val reductions : ('d, 'r) reductions -> (Nx_kernel.reduction * int) array
 val reduced : int array -> int iarray -> int array
 (** [reduced s axes] is [s] without [axes]. *)
 
-val carrier : Nx_array.Dtype.any -> Nx_array.Dtype.any
-(** [carrier dt] is the dtype kernels reduce and scan terms of [dt] in, and a
-    scan's carry's: [float32] for a float narrower than it, [int8] and [uint8]
-    for [int4] and [uint4], [bool] for [bit], else [dt]. *)
-
 val op1 :
   by:string ->
   Nx_kernel.Prog.op1 ->
@@ -316,14 +335,8 @@ val is_padded : 'd load -> bool
 
 (** {1:families Transforms and factorisations} *)
 
-val fft_axes : ('d, 'r) fft -> int iarray
-val fft_operand : ('d, 'r) fft -> 'd any
-
 val routine_name : ('d, 'r) linalg -> string
 (** [routine_name l] names [l]'s routine in messages, as ["Cholesky"]. *)
-
-val linalg_operands : ('d, 'r) linalg -> 'd any list
-(** [linalg_operands l] is [a], then [b] for a triangular solve. *)
 
 val is_constant : ('v, 's, 'd) t -> bool
 

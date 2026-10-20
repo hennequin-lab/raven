@@ -13,7 +13,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sched.h>
 #endif
 
@@ -183,7 +185,7 @@ value caml_rig_set_bytes(value v_b, value v_j, value v_n, value v_c) {
    { index; name; machine; ...; opened }, as rig's Def module lays them
    out. */
 
-enum { DEVICE_INDEX, DEVICE_NAME, DEVICE_MACHINE, DEVICE_OPENED = 17 };
+enum { DEVICE_INDEX, DEVICE_NAME, DEVICE_MACHINE, DEVICE_OPENED = 16 };
 enum { BUFFER_MEM, BUFFER_OFFSET, BUFFER_LENGTH, BUFFER_GEN };
 enum { MEMORY_DEV, MEMORY_HOST, MEMORY_ADDRESS, MEMORY_HANDLE, MEMORY_ALLOC };
 enum { ALLOC_OWNER, ALLOC_HOST, ALLOC_COUNT, ALLOC_GEN, ALLOC_WHY,
@@ -305,11 +307,35 @@ void rig_buffer_side(value b, int local, struct rig_side *s) {
   s->local = local;
 }
 
-value caml_rig_buffer_overlaps(value b, value other) {
+/* [b]'s side narrowed to its [bytes] bytes from its byte [first]. A range
+   outside [b] is the caller's bug, which aborts as a release of no claim
+   does. */
+static void side_range(value b, intnat first, intnat bytes,
+                       struct rig_side *s) {
+  intnat n = (intnat)rig_buffer_bytes(b);
+  if (first < 0 || bytes < 0 || first > n || bytes > n - first)
+    caml_fatal_error("rig_buffers_overlap: %" ARCH_INTNAT_PRINTF_FORMAT
+                     "d bytes from byte %" ARCH_INTNAT_PRINTF_FORMAT
+                     "d lie outside the buffer's %" ARCH_INTNAT_PRINTF_FORMAT
+                     "d",
+                     bytes, first, n);
+  side_span(b, s);
+  s->first += first;
+  if (s->alias != 0) s->alias += first;
+  s->bytes = (size_t)bytes;
+}
+
+int rig_buffers_overlap(value a, intnat a_first, intnat a_bytes, value b,
+                        intnat b_first, intnat b_bytes) {
   struct rig_side x, y;
-  side_span(b, &x);
-  side_span(other, &y);
-  return Val_bool(rig_sides_overlap(&x, &y));
+  side_range(a, a_first, a_bytes, &x);
+  side_range(b, b_first, b_bytes, &y);
+  return rig_sides_overlap(&x, &y);
+}
+
+value caml_rig_buffer_overlaps(value b, value other) {
+  intnat n = (intnat)rig_buffer_bytes(b), m = (intnat)rig_buffer_bytes(other);
+  return Val_bool(rig_buffers_overlap(b, 0, n, other, 0, m));
 }
 
 intnat caml_rig_cached_host(value b) { return cached_host(b); }
@@ -607,11 +633,13 @@ value caml_rig_claim_holds(value v_bs, value v_taken) {
 }
 
 /* Ends the hold [v_i] of [v_taken] on the allocation [v_alloc]'s memory, if
-   it is taken. */
+   it is taken. The mark is cleared in one exchange, so of two releases on two
+   domains one ends the hold. */
 value caml_rig_claim_unhold(value v_taken, value v_i, value v_alloc) {
-  unsigned char *taken = Bytes_val(v_taken) + Long_val(v_i);
-  if (*taken == 0) return Val_unit;
-  *taken = 0;
+  _Atomic unsigned char *taken =
+      (_Atomic unsigned char *)(Bytes_val(v_taken) + Long_val(v_i));
+  if (atomic_exchange_explicit(taken, 0, memory_order_relaxed) == 0)
+    return Val_unit;
   unhold_word((_Atomic value *)&Field(v_alloc, ALLOC_COUNT));
   return Val_unit;
 }

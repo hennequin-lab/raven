@@ -103,8 +103,12 @@ val control :
     checked, once it has written at each field of [p] that [refs] names the
     address of that ref's bytes, which it keeps through the call. *)
 
+val free : t -> parent:int -> int -> (unit, string) result
+(** [free c ~parent obj] frees [obj], a child of [parent], and every object
+    under it, or is the RM's refusal ([NV_ESC_RM_FREE]). *)
+
 val rm : t -> Rig_nv.rm
-(** [rm c] is the RM as the driver calls it. *)
+(** [rm c] is the RM as the driver calls it, whose [free] is {!free}. *)
 
 val control_request : int
 (** [control_request] is the ioctl of a control on the control file
@@ -120,16 +124,3 @@ val uvm :
 val uvm_call :
   t -> int -> Rig_nv.params -> int * int -> string -> (unit, string) result
 (** [uvm_call] is {!uvm} that checks the status. *)
-
-(** {1:params Parameters} *)
-
-val params : int -> Rig_nv.params
-(** [params n] is [n] zero bytes. *)
-
-val get : Rig_nv.params -> int * int -> int
-(** [get p f] reads the field [f] of [p], a (byte offset, bytes) of 1, 2, 4
-    or 8 bytes. *)
-
-val set : Rig_nv.params -> int * int -> int -> unit
-(** [set p f x] writes [x] to the field [f] of [p]. *)
-

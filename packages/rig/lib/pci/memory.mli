@@ -20,7 +20,7 @@
     {!region}, and {!free} gives any region back.
 
     {b After the GPU is given back.} Once the GPU's function is released
-    ({!Function.release}, which {!Gpus.stop} and {!release} do), {!free}
+    ({!Function.release}, which {!Driver.stop} and {!release} do), {!free}
     writes none of the GPU's tables. It gives back system memory, pins and
     virtual addresses only, and {!val-alloc}, {!map_host} and {!map_peer} raise
     [Invalid_argument]. Once the function is released, another open may reset
@@ -63,8 +63,8 @@ val create : ?link:link -> Function.t -> Page_table.t -> bar:int -> t
 val release : t -> unit
 (** [release m] releases the function of [m]'s GPU ({!Function.release}), then
     drops the page tables {!create} was given, which only a live GPU uses. A
-    driver that keeps [m] past the GPU's stop ({!Gpus.stop}) releases it there,
-    so that [m] holds no page table. Releasing [m] again does nothing. *)
+    driver that keeps [m] past the GPU's stop ({!Driver.stop}) releases it
+    there, so that [m] holds no page table. Releasing [m] again does nothing. *)
 
 type reach
 (** The type for the facts that decide whose GPU memory a GPU maps
@@ -82,12 +82,11 @@ val reaches : reach -> reach -> bool
     one fabric join them, or neither GPU is behind an IOMMU
     ({!Machine.Iommu}), [o]'s memory BAR reaches all of [o]'s memory and the
     bus carries [r]'s requests to it. The bus carries them as Linux's p2pdma
-    decides (drivers/pci/p2pdma.c): through a bridge above both GPUs, where
-    no device on the way to it redirects peer requests to the root complex
-    by ACS, or else through the root complex where the CPU is AMD's from Zen
-    on, or where Linux lists both GPUs' host bridges, some of them only for
-    GPUs under one host bridge. A machine reached through a transport carries
-    none.
+    decides, through a bridge above both GPUs, where no device on the way to
+    it redirects peer requests to the root complex by ACS, or else through the
+    root complex where the CPU is AMD's from Zen on, or where Linux lists both
+    GPUs' host bridges, some of them only for GPUs under one host bridge. A
+    machine reached through a transport carries none.
     It is [false] for two reaches of one GPU, [reaches r r] included, since
     the GPU maps its own memory already. *)
 
@@ -110,18 +109,6 @@ type region
 (** The type for ranges of memory a GPU addresses: what {!val-alloc},
     {!map_host} or {!map_peer} gave, until {!free}. *)
 
-(** The type for how a region came to its GPU. *)
-type source =
-  | Allocated  (** By {!val-alloc}. *)
-  | Borrowed of int
-      (** Memory of the machine at this address of the process, by {!map_host}.
-      *)
-  | Peer of region
-      (** Another GPU's region, allocated or borrowed there, by {!map_peer}. *)
-
-val source : region -> source
-(** [source r] is how [r] came to its GPU. *)
-
 val address : region -> int
 (** [address r] is the GPU address of [r]'s first byte. *)
 
@@ -134,7 +121,8 @@ val pages : region -> Page_table.target * (int * int) list
 val host : region -> Window.t option
 (** [host r] is the process's window on [r]'s bytes, if it has one: the system
     memory {!val-alloc} gave, the BAR window on {!Bar} memory, the bytes
-    {!map_host} borrowed, or the window of the region a {!Peer} maps. *)
+    {!map_host} borrowed, or the window of the region a {!map_peer} region
+    maps. *)
 
 (** {1:alloc Allocating and mapping}
 
@@ -167,8 +155,8 @@ val map_host : t -> int -> int -> (region option, string) result
     [n] bytes at [a]. It {!Function.pin}s them and maps them, snooped and
     uncached, at addresses it takes from the GPU's space ({!Page_table.space}),
     whatever [a] is. In the result, {!address} is where the GPU reaches byte
-    [a], {!host} is a window on the [n] bytes at [a], and the source is
-    [Borrowed a]. Each call maps anew, so memory mapped already maps again at
+    [a], and {!host} is a window on the [n] bytes at [a]. Each call maps
+    anew, so memory mapped already maps again at
     other addresses and is pinned once more.
 
     [Error why] if the pages cannot be pinned, with {!Function.pin}'s reason,
@@ -181,9 +169,8 @@ val map_peer : t -> region -> (region option, string) result
     GPU of [m], at the address [r] has there. GPU memory is mapped through its
     owner's memory BAR or their fabric's link. System memory, allocated or
     borrowed, is mapped at its pages, which {!Function.pin} keeps for [m]'s
-    GPU. If [r] is itself a {!Peer} region, [map_peer] maps the region it
-    maps. The result's source is [Peer r'], where [r'] is the region its
-    owner gave.
+    GPU. If [map_peer] gave [r] itself, [map_peer] maps the region that [r]
+    maps, which its owner gave.
 
     Where the GPU of [m] maps that memory already, as its own or through
     another region [map_peer] gave, the result is a new region over the same
@@ -202,8 +189,18 @@ val map_peer : t -> region -> (region option, string) result
 val free : t -> region -> unit
 (** [free m r] gives back what {!val-alloc}, {!map_host} or {!map_peer} gave.
     Once no other region of [m] over [r]'s mapping is out, it unmaps [r], then
-    frees its memory or unpins it, and returns its addresses. A {!Peer}
-    region's memory stays its owner's. After the function's release it writes
-    no table.
+    frees its memory or unpins it, and returns its addresses. The memory of a
+    region {!map_peer} gave stays its owner's. After the function's release it
+    writes no table.
 
     Raises [Invalid_argument] if [r] is not [m]'s or was freed. *)
+
+(**/**)
+
+(* How a region came to its GPU: by {!val-alloc}, by {!map_host} at this
+   address of the process, or by {!map_peer} from another GPU's region,
+   allocated or borrowed there. *)
+type source = Allocated | Borrowed of int | Peer of region
+
+(* [source r] is how [r] came to its GPU. *)
+val source : region -> source

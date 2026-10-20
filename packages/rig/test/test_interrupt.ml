@@ -546,9 +546,11 @@ let probes () =
       free "failure" (fun () -> ignore (Rig.failure ()));
       free "Point.reached" (fun () -> ignore (Rig.Point.reached pt));
       free "Buffer.view" (fun () -> ignore (B.view b ~first:0 ~length:1));
+      free "Buffer.reached" (fun () -> ignore (B.reached b Rig.Read_write));
       free "Buffer.of_bigarray" (fun () -> ignore (B.of_bigarray ba));
       free "Claim.with_" (fun () ->
           Rig.Claim.with_ ~read:[ b ] ~donate:[] ignore);
+      free "Claim.release" (fun () -> Rig.Claim.release (Rig.Claim.hold [ h ]));
       free "Image.name" (fun () -> ignore (Rig.Image.name fill));
       free "Image.image" (fun () -> ignore (Rig.Image.image fill));
       free "Image.params" (fun () -> ignore (Rig.Image.params fill));
