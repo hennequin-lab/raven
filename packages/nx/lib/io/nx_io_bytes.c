@@ -243,7 +243,7 @@ CAMLprim value caml_nx_io_sync_dir(value vpath) {
   int error = 0;
   int fd;
   do
-    fd = open(path, O_RDONLY | O_CLOEXEC);
+    fd = open(path, O_RDONLY | FD_CLOEXEC);
   while (fd < 0 && errno == EINTR);
   if (fd >= 0) {
     error = sync_fd(fd);
