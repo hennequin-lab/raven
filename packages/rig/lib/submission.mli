@@ -93,6 +93,12 @@ val entry : func -> at:int -> ref
 val copy : src:side -> dst:side -> part
 (** [copy ~src ~dst] is {!Rig.Submission.copy}[ ~src ~dst]. *)
 
+val set : dst:side -> char -> part
+(** [set ~dst c] is a copy part that sets every byte of [dst] to [c],
+    reading no memory: a fill at the edge ([copy.fill] in [rig_edge.h]). It
+    checks nothing of [dst]; {!make} refuses a [dst] buffer that is dead,
+    not the device's, or this process's memory. *)
+
 val launch : ?refs:ref array -> func -> params:int -> part
 (** [launch ~refs f ~params] is {!Rig.Submission.launch}[ ~refs f ~params]. *)
 
@@ -185,11 +191,31 @@ end
 val submit : ?waits:int array -> Run.t -> buffers:buffer array -> int
 (** [submit ~waits r ~buffers] is {!Rig.submit}[ ~waits r ~buffers]. *)
 
-val run_copy : device -> src:buffer -> dst:buffer -> int
-(** [run_copy d ~src ~dst] submits a copy of [src] into [dst] on [d]'s copy
-    engine, and is its point. It submits [d]'s submission of the one part
-    [copy ~src:(Slot 0) ~dst:(Slot 1)], made once per device with its run,
-    which holds no bytes, so any number of copies submit it at once. [d]
-    must reach both buffers. They are [d]'s, or, for a device of another
-    machine, one of them may be this process's memory. It raises as
+val run_copy : device -> waits:int array -> src:buffer -> dst:buffer -> int
+(** [run_copy d ~waits ~src ~dst] submits a copy of [src] into [dst] on [d]'s
+    copy engine, after the points of [waits], and is its point. It submits
+    [d]'s submission of the one part [copy ~src:(Slot 0) ~dst:(Slot 1)], made
+    once per device with its run, which holds no bytes, so any number of
+    copies submit it at once. [d] must reach both buffers. They are [d]'s,
+    or, for a device of another machine, one of them may be this process's
+    memory. It raises as {!Rig.Submission.make} and {!Rig.submit} do. *)
+
+val run_boxes :
+  device -> waits:int array -> src:buffer -> dst:buffer -> box array -> int
+(** [run_boxes d ~waits ~src ~dst boxes] is {!run_copy} of the rows of each
+    box of [boxes], in order, from [src] into [dst]. It makes [d]'s
+    submission of one part per box for the call. Each box must fit [src]
+    and [dst] ({!Rig.Buffer.type-box}), which nothing checks. *)
+
+val run_set : device -> waits:int array -> dst:buffer -> char -> int
+(** [run_set d ~waits ~dst c] submits a fill of [dst] with [c] on [d]'s copy
+    engine, after the points of [waits], and is its point. It submits [d]'s
+    submission of the one part [set ~dst:(Slot 0) c], made with its run at
+    [c]'s first fill on [d], which holds no bytes, so any number of fills
+    submit it at once. [dst] must be [d]'s. It raises as
     {!Rig.Submission.make} and {!Rig.submit} do. *)
+
+val mark : unit -> int
+(** [mark ()] submits the host's submission of no part, made once, and is
+    its point: the next value of the host's timeline, reached when it
+    returns. *)

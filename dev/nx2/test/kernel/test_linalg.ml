@@ -1018,18 +1018,20 @@ let law_eigh_spectrum (b : Support.backend) c =
   let u = reflector_draws r c.dt n in
   check_spectrum b c.dt ~k:(c.seed mod (n + 1)) ~u l
 
-(* [r] of [x] alone, of [x] laid out Transposed, and of [x] repeated in a
-   batch of as many matrices as the host has cores, each then on one
-   thread: every result has the bits of the call's alone. *)
+(* [r] of [x] alone, of [x] laid out Transposed, and of a batch of two
+   copies of [x] on one thread ({!Nx_cpu.one_thread}): each matrix then runs
+   as a unit of a batch with at least the call's threads does, the second at
+   an offset, on the arena the first used. Every result has the bits of the
+   call's alone. *)
 let agree_bits (b : Support.backend) r x =
   let (A.Any a) = x in
-  let t = Domain.recommended_domain_count () in
-  let s = Array.append [| t |] (L.shape (A.layout a)) in
-  let batch =
+  let s = Array.append [| 2 |] (L.shape (A.layout a)) in
+  let pair =
     A.Any (A.copy (Option.get (A.move (M.Broadcast (Iarray.of_array s)) a)))
   in
   let z = run b r [| laid_out Transposed x |] in
-  match (run b r [| x |], z, run b r [| batch |]) with
+  let w = Nx_cpu.one_thread (fun () -> run b r [| pair |]) in
+  match (run b r [| x |], z, w) with
   | Some y, Some z, Some w ->
       Array.iteri
         (fun j y ->
@@ -1038,8 +1040,9 @@ let agree_bits (b : Support.backend) r x =
           equal ~msg:(Printf.sprintf "result %d, transposed" j) same_bits want
             (bits z.(j));
           let got = bits w.(j) in
-          for i = 0 to t - 1 do
-            equal ~msg:(Printf.sprintf "result %d, matrix %d of the batch" j i)
+          for i = 0 to 1 do
+            equal
+              ~msg:(Printf.sprintf "result %d, matrix %d of the batch" j i)
               same_bits want (Array.sub got (i * n) n)
           done)
         y
@@ -1717,6 +1720,30 @@ let test_eig_extremes (b : Support.backend) () =
   case (D.Any D.Complex64) [| 0.; 0x1p100; 0x1p-100; 0. |] [ -1.; 1. ];
   case (D.Any D.Float64) [| 1.; 1e300; 1e-300; 1. |] [ 0.; 2. ];
   case (D.Any D.Complex128) [| 1.; 1e300; 1e-300; 1. |] [ 0.; 2. ]
+
+(* A real matrix of subnormals whose complex pair's imaginary part lies
+   below half the least subnormal η: a = η [−1 3 1; 3 1 1; 1 −1 2],
+   which balancing leaves, of eigenvalues −3.22 η and (2.61 ± 0.0974 i) η.
+   eig's results meet check_eig's relations and check_real's, with the
+   vectors and without. *)
+let test_eig_subnormal_pair (b : Support.backend) () =
+  let n = 3 and m = [| -1.; 3.; 1.; 3.; 1.; 1.; 1.; -1.; 2. |] in
+  List.iter
+    (fun dt ->
+      let e = tiny ~bits:0 dt in
+      let a =
+        Array.map (fun re -> { Complex.re = Float.ldexp re (-e); im = 0. }) m
+      in
+      let x = of_values dt [| n; n |] a in
+      match (run b (Eig true) [| x |], run b (Eig false) [| x |]) with
+      | Some y, Some y' ->
+          let w = values y.(0) and v = values y.(1) and w' = values y'.(0) in
+          let msg = Format.asprintf "%a" pp_dtype dt in
+          check_eig dt ~e ~count:1 ~n (up e a) (up e w) v;
+          check_real ~msg:(msg ^ " with vectors") ~count:1 ~n w v;
+          check_real ~msg:(msg ^ " alone") ~count:1 ~n w' [||]
+      | _ -> ())
+    [ D.Any D.Float32; D.Any D.Float64 ]
 
 (* A graded cycle, which xTREVC3's normalisation of each back-transformed
    column keeps finite: a = D b D⁻¹ of order 30, b bidiagonal with
@@ -2728,6 +2755,8 @@ let laws (b : Support.backend) =
           b.around (test_eig_balanced b));
       test "eig balances before it scales" (fun () ->
           b.around (test_eig_extremes b));
+      test "eig keeps a subnormal matrix's pair a pair" (fun () ->
+          b.around (test_eig_subnormal_pair b));
       test "eig keeps a graded cycle's vectors finite" (fun () ->
           b.around (test_eig_graded_cycle b));
       test "svd and eig scale an element whose modulus overflows" (fun () ->

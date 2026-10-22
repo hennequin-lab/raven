@@ -24,10 +24,11 @@
    flushes the host data path if the host wrote GPU memory through the BAR,
    and rings the doorbells.
 
-   A timed value also places its stamps (rig_amd_stubs.h's Times). A
-   device without a source of its clock measures it at open with a stamp
-   the compute queue writes between two readings of the host's clock, the
-   closest pair of eight kept. */
+   A timed value also places its stamps (rig_amd_stubs.h's Times). At open
+   a device measures its clock with a stamp the compute queue writes
+   between two readings of the host's clock, the closest pair of eight
+   kept: against the host's clock without a source of its clock, and with
+   one against the source's read, for the constant between them. */
 
 #define _GNU_SOURCE
 
@@ -56,17 +57,19 @@ static uint64_t add(uint64_t a, uint64_t b) {
 
 /* A copy of no bytes places nothing. */
 static int is_copy(const struct rig_part *p) {
-  return p->kind == RIG_COPY && p->copy.bytes > 0;
+  return p->kind == RIG_COPY && p->copy.width > 0 && p->copy.rows > 0;
 }
 
 /* Small copies keep SDMA's lower dispatch cost. */
 #define COPY_MIN_BYTES (2ULL << 20)
 
-/* Whether the driver's copy kernel runs [p]: a copy within this device's
-   Device memory, large enough to pay for its dispatch. */
+/* Whether the driver's copy kernel runs [p]: a copy of one row within this
+   device's Device memory, large enough to pay for its dispatch. The kernel
+   is linear, and reads its source. */
 static int kernel_copies(const struct rig_amd *d, const struct rig_part *p) {
-  return p->kind == RIG_COPY && p->copy.device_memory &&
-         p->copy.bytes >= COPY_MIN_BYTES && d->copy_launch != NULL;
+  return p->kind == RIG_COPY && !p->copy.fill && p->copy.rows == 1 &&
+         p->copy.device_memory && p->copy.width >= COPY_MIN_BYTES &&
+         d->copy_launch != NULL;
 }
 
 /* Decides the routes of [p]'s parts into [r]: a copy the kernel runs
@@ -170,8 +173,40 @@ static void mark(struct rig_amd_marks *m, uint64_t v, uint64_t end) {
   m->count++;
 }
 
+static uint64_t ceil_div(uint64_t n, uint64_t k) { return (n + k - 1) / k; }
+
 static uint64_t copies(const struct rig_amd *d, uint64_t bytes) {
-  return (bytes + d->max_copy - 1) / d->max_copy;
+  return ceil_div(bytes, d->max_copy);
+}
+
+/* A fill of [n] bytes at [dst] as the engine runs it: [*head] bytes up to
+   a multiple of 4, [*body] bytes of whole dwords, then the [*tail] bytes
+   left, at most three. CONST_FILL sets dwords; each end is a copy from four
+   bytes of the segment that hold the byte. */
+static void fill_split(uint64_t dst, uint64_t n, uint64_t *head,
+                       uint64_t *body, uint64_t *tail) {
+  uint64_t h = (4 - (dst & 3)) & 3;
+  if (h > n) h = n;
+  *head = h;
+  *body = (n - h) & ~(uint64_t)3;
+  *tail = n - h - *body;
+}
+
+/* The words the copy engine's packets for the copy part [p] take, and in
+   [*args] the segment bytes a fill's ends copy from: [copy] places them. */
+static uint64_t copy_words(const struct rig_amd *d, const struct rig_part *p,
+                           uint64_t *args) {
+  uint64_t width = p->copy.width, rows = p->copy.rows;
+  *args = 0;
+  if (width == 0 || rows == 0) return 0;
+  if (p->copy.fill) {
+    uint64_t head, body, tail;
+    fill_split(p->copy.dst + p->copy.dst_offset, width, &head, &body, &tail);
+    if (head + tail > 0) *args = SEGMENT_ALIGN;
+    return (uint64_t)((head > 0) + (tail > 0)) * words_of(d, S_COPY) +
+           ceil_div(body, d->max_fill) * words_of(d, S_FILL);
+  }
+  return rows * copies(d, width) * (uint64_t)words_of(d, S_COPY);
 }
 
 /* The bytes of launch [l]'s arguments: its parameters, and its function's
@@ -198,7 +233,7 @@ static uint64_t part_words(const struct rig_amd *d, const struct rig_part *p,
       *args = align_up(arguments(l, 3 * sizeof(uint64_t)), SEGMENT_ALIGN);
       return (uint64_t)l->n + (l->packet ? 0 : words_of(d, T_INVALIDATE));
     }
-    return copies(d, p->copy.bytes) * (uint64_t)words_of(d, S_COPY);
+    return copy_words(d, p, args);
   }
 }
 
@@ -214,14 +249,14 @@ static int aql(const struct rig_amd *d) {
   return d->rings[RIG_AMD_COMPUTE].kind == RING_AQL;
 }
 
-/* What a submission takes besides its parts: on the compute ring its prefix,
-   RIG_AMD_WAITS waits, the scratch writes, its release and the stamps of its
-   start and end, and on the copy ring its prefix, its two stamps, the fence
-   after them and its release. */
-static struct cost fixed_cost(const struct rig_amd *d) {
+/* What a submission of [nwaits] waits takes besides its parts: on the
+   compute ring its prefix, the waits, the scratch writes, its release and
+   the stamps of its start and end, and on the copy ring its prefix, its two
+   stamps, the fence after them and its release. */
+static struct cost fixed_cost(const struct rig_amd *d, int nwaits) {
   uint64_t pm4 = words_of(d, T_WAIT) +
                  RIG_AMD_SCRATCH_WRITES * words_of(d, T_WRITE) +
-                 RIG_AMD_WAITS * words_of(d, T_WAIT64) +
+                 (uint64_t)nwaits * words_of(d, T_WAIT64) +
                  words_of(d, T_SIGNAL) + words_of(d, T_WAIT) +
                  words_of(d, T_RELEASE) + 2 * words_of(d, T_STAMP);
   struct cost k = {
@@ -284,11 +319,11 @@ static uint64_t slot_bytes(int n) {
   return align_up(8 * ((uint64_t)n + 1), SEGMENT_ALIGN);
 }
 
-/* What a submission of the routed [parts] takes. */
-static struct cost need(const struct rig_amd *d,
+/* What a submission of the routed [parts] after [nwaits] waits takes. */
+static struct cost need(const struct rig_amd *d, int nwaits,
                         const struct rig_amd_route *routes,
                         const struct rig_part *p, int n) {
-  struct cost k = fixed_cost(d);
+  struct cost k = fixed_cost(d, nwaits);
   k.bytes += slot_bytes(n);
   for (int i = 0; i < n; i++) {
     const struct rig_amd_route *x = &routes[i];
@@ -454,13 +489,13 @@ static void ask(const struct rig_amd *d, const struct cost *k) {
       k->copy > room.copy ? 4 * (2 * k->copy + 1) : 0;
 }
 
-int rig_amd_room(void *self, const struct rig_part *parts, int n,
-                 void *routes, const uint8_t *args) {
+int rig_amd_room(void *self, int nwaits, const struct rig_part *parts,
+                 int n, void *routes, const uint8_t *args) {
   struct rig_amd *d = ((struct rig_amd_edge *)self)->d;
   for (int i = 0; i < n; i++)
     if (!runs(d, &parts[i], i, args)) return RIG_NEVER;
   route(d, routes, parts, n);
-  struct cost k = need(d, routes, parts, n), room = room_of(d);
+  struct cost k = need(d, nwaits, routes, parts, n), room = room_of(d);
   struct cost most = most_of(d);
   if (k.compute > most.compute || k.copy > most.copy) return RIG_NEVER;
   if (d->draining || !holds(&room, &k)) {
@@ -551,14 +586,47 @@ static uint64_t host_ns(const struct rig_amd *d, uint64_t ticks) {
   return b->host + (uint64_t)(int64_t)(dh < 0 ? dh - 0.5 : dh + 0.5);
 }
 
+/* Reads [d]'s source into [*m], in the clock's counts, and the interval of
+   its host readings into [*width]: 0, or -1 if the source could not. */
+static int read_source(struct rig_amd *d, struct rig_amd_measure *m,
+                       uint64_t *width) {
+  if (d->source->read(d->source, &m->ticks, &m->host, width) != 0) return -1;
+  m->ticks += (uint64_t)d->offset;
+  return 0;
+}
+
+/* Takes [d]'s latest measure again from its source once it is
+   RIG_AMD_MEASURE_NS old, dropping a read wider than RIG_AMD_READ_BOUND_NS,
+   and replacing a first measure that was wider: 0, or -1 if the source
+   could not be read. It never waits for the GPU. */
+static int remeasure(struct rig_amd *d) {
+  struct rig_amd_measure m;
+  uint64_t width;
+  if (d->source == NULL || rig_now_ns() - d->latest.host < RIG_AMD_MEASURE_NS)
+    return 0;
+  if (read_source(d, &m, &width) != 0) return -1;
+  if (width > RIG_AMD_READ_BOUND_NS) return 0;
+  d->latest = m;
+  if (d->first_wide) {
+    d->first = m;
+    d->first_wide = 0;
+  }
+  return 0;
+}
+
+static const char unread[] = "the GPU's clock could not be read";
 static const char unwritten[] = "a stamp of the GPU's work was never written";
 
-/* Writes the times of slot [k]'s value, whose work has completed and which
-   is the next to convert: the earliest of its queues' starts and its end,
-   each no earlier than the end of the value converted before it, which
-   completed first. Its times go, written or not; a stamp the work did not
-   write is the device's failure. */
-static void convert(struct rig_amd *d, uint64_t k) {
+/* Writes the times of slot [k]'s value, whose work has completed by the
+   host's time [now] and which is the next to convert: the earliest of its
+   queues' starts and its end, each no earlier than the end of the value
+   converted before it, which completed first. Its times go, written or not;
+   a stamp the work did not write is the device's failure. On a device with
+   a source, a start before the value's submit or an end after [now], by
+   more than RIG_AMD_MOVED_NS, leaves both times 0, as for work that cannot
+   be timed: the clock moved against the source's counter, or a read of the
+   source was late. */
+static void convert(struct rig_amd *d, uint64_t k, uint64_t now) {
   struct rig_amd_timed *t = &d->timed[k];
   volatile const struct rig_amd_stamps *x = &d->stamps[k];
   uint64_t *times = t->times, start = UINT64_MAX;
@@ -577,22 +645,27 @@ static void convert(struct rig_amd *d, uint64_t k) {
     d->times_failure = unwritten;
     return;
   }
+  uint64_t end = host_ns(d, x->end);
+  if (d->source != NULL && (start + RIG_AMD_MOVED_NS < t->submitted ||
+                            end > now + RIG_AMD_MOVED_NS))
+    return;
   start = later(start, d->last_end);
-  uint64_t end = later(host_ns(d, x->end), start);
+  end = later(end, start);
   d->last_end = end;
   times[0] = start;
   times[1] = end;
 }
 
 /* Writes, in value order, the times of every timed value up to [v] not
-   yet written, whose work has completed with [v]'s. */
-static void convert_upto(struct rig_amd *d, uint64_t v) {
+   yet written, whose work has completed with [v]'s by the host's time
+   [now]. */
+static void convert_upto(struct rig_amd *d, uint64_t v, uint64_t now) {
   uint64_t u = d->converted + 1;
   if (v >= RIG_AMD_STAMPS && u < v - RIG_AMD_STAMPS + 1)
     u = v - RIG_AMD_STAMPS + 1;
   for (; u <= v && d->unconverted > 0; u++) {
     uint64_t k = u % RIG_AMD_STAMPS;
-    if (d->timed[k].times != NULL && d->timed[k].v == u) convert(d, k);
+    if (d->timed[k].times != NULL && d->timed[k].v == u) convert(d, k, now);
   }
   d->converted = later(d->converted, v);
 }
@@ -607,11 +680,14 @@ static struct rig_amd_timed *take_slot(struct rig_amd *d, uint64_t v,
                                        uint64_t *times) {
   uint64_t k = v % RIG_AMD_STAMPS;
   struct rig_amd_timed *t = &d->timed[k];
-  if (t->times != NULL) convert_upto(d, t->v);
+  if (t->times != NULL) {
+    if (remeasure(d) != 0) d->times_failure = unread;
+    convert_upto(d, t->v, rig_now_ns());
+  }
   if (d->unconverted == 0) d->converted = v - 1;
   if (times == NULL) return NULL;
   memset((void *)&d->stamps[k], 0, sizeof d->stamps[k]);
-  *t = (struct rig_amd_timed){v, times, 0};
+  *t = (struct rig_amd_timed){v, times, 0, rig_now_ns()};
   d->unconverted++;
   return t;
 }
@@ -631,21 +707,11 @@ static void stamp(struct rig_amd *d, int q, uint64_t address) {
 
 int rig_amd_settle(void *self, uint64_t v, const char **failure) {
   struct rig_amd *d = ((struct rig_amd_edge *)self)->d;
-  struct rig_amd_measure m;
-  uint64_t width;
-  if (d->source != NULL &&
-      rig_now_ns() - d->latest.host >= RIG_AMD_MEASURE_NS) {
-    if (d->source->read(d->source, &m.ticks, &m.host, &width) != 0) {
-      *failure = "the GPU's clock could not be read";
-      return RIG_FAILED;
-    }
-    if (width <= RIG_AMD_READ_BOUND_NS) d->latest = m;
-    if (width <= RIG_AMD_READ_BOUND_NS && d->first_wide) {
-      d->first = m;
-      d->first_wide = 0;
-    }
+  if (remeasure(d) != 0) {
+    *failure = unread;
+    return RIG_FAILED;
   }
-  convert_upto(d, v);
+  convert_upto(d, v, rig_now_ns());
   if (d->times_failure == NULL) return RIG_OK;
   *failure = d->times_failure;
   return RIG_FAILED;
@@ -723,14 +789,67 @@ static void signal_slot(struct submission *s, int q, int i) {
        s->v, 0);
 }
 
+/* Places linear copies of the [n] bytes at [src] to [dst], at most
+   max_copy each. */
+static void copy_run(struct rig_amd *d, struct rig_amd_ring *r, uint64_t dst,
+                     uint64_t src, uint64_t n) {
+  for (uint64_t off = 0; off < n; off += d->max_copy) {
+    uint64_t k = n - off;
+    emit(d, r, S_COPY, dst + off, src + off, k < d->max_copy ? k : d->max_copy);
+  }
+}
+
+/* Places the fill [p]: CONST_FILL over its dwords, at most max_fill bytes
+   each, and its ends copied from four bytes of the segment that hold its
+   byte. */
+static void fill(struct submission *s, const struct rig_part *p) {
+  struct rig_amd *d = s->d;
+  struct rig_amd_ring *r = &d->rings[RIG_AMD_COPY];
+  struct rig_amd_segment *g = &d->segment;
+  uint64_t dst = p->copy.dst + p->copy.dst_offset, head, body, tail;
+  fill_split(dst, p->copy.width, &head, &body, &tail);
+  uint64_t word = UINT64_C(0x01010101) * p->copy.byte, ends = 0;
+  if (head + tail > 0) {
+    uint64_t at = g->put % g->size;
+    memcpy(g->host + at, &(uint32_t){(uint32_t)word}, 4);
+    ends = g->gpu + at;
+    g->put += SEGMENT_ALIGN;
+  }
+  if (head > 0) emit(d, r, S_COPY, dst, ends, head);
+  for (uint64_t off = 0; off < body; off += d->max_fill) {
+    uint64_t k = body - off;
+    emit(d, r, S_FILL, dst + head + off, word,
+         k < d->max_fill ? k : d->max_fill);
+  }
+  if (tail > 0) emit(d, r, S_COPY, dst + head + body, ends, tail);
+}
+
+/* Places the copy part [p]: each row as linear copies. */
 static void copy(struct submission *s, const struct rig_part *p) {
   struct rig_amd *d = s->d;
   struct rig_amd_ring *r = &d->rings[RIG_AMD_COPY];
+  if (p->copy.fill) {
+    fill(s, p);
+    return;
+  }
   uint64_t dst = p->copy.dst + p->copy.dst_offset;
   uint64_t src = p->copy.src + p->copy.src_offset;
-  for (uint64_t off = 0; off < p->copy.bytes; off += d->max_copy) {
-    uint64_t n = p->copy.bytes - off;
-    emit(d, r, S_COPY, dst + off, src + off, n < d->max_copy ? n : d->max_copy);
+  uint64_t width = p->copy.width, rows = p->copy.rows;
+  uint64_t sp = p->copy.src_pitch, dp = p->copy.dst_pitch;
+  for (uint64_t i = 0; i < rows; i++)
+    copy_run(d, r, dst + i * dp, src + i * sp, width);
+}
+
+/* Stores the low [n] bytes of [v], for [n] 2, 4 or 8, at [p], in the
+   host's byte order, which is the GPU's. */
+static inline void store_le(uint8_t *p, uint64_t v, int n) {
+  uint16_t h = (uint16_t)v;
+  uint32_t w = (uint32_t)v;
+  switch (n) {
+  case 2: memcpy(p, &h, 2); break;
+  case 4: memcpy(p, &w, 4); break;
+  case 8: memcpy(p, &v, 8); break;
+  default: break;
   }
 }
 
@@ -738,19 +857,18 @@ static void copy(struct submission *s, const struct rig_part *p) {
    block [b]: its grid of whole groups starts at thread 0. */
 static void implicit(const struct rig_amd_launch *l, const struct rig_block *b,
                      uint8_t *args) {
-  const int32_t *h = l->hidden;
-  uint16_t dims = 1, zero16 = 0;
-  uint64_t zero64 = 0;
+  uint64_t v[RIG_AMD_HIDDEN] = {0};
+  uint64_t dims = 1;
   for (int k = 0; k < 3; k++) {
-    uint16_t t = (uint16_t)b->threads[k];
-    if ((uint64_t)b->groups[k] * b->threads[k] > 1) dims = (uint16_t)(k + 1);
-    if (h[H_BLOCKS + k] >= 0) memcpy(args + h[H_BLOCKS + k], &b->groups[k], 4);
-    if (h[H_GROUP + k] >= 0) memcpy(args + h[H_GROUP + k], &t, 2);
-    if (h[H_REMAINDER + k] >= 0) memcpy(args + h[H_REMAINDER + k], &zero16, 2);
-    if (h[H_OFFSET + k] >= 0) memcpy(args + h[H_OFFSET + k], &zero64, 8);
+    if ((uint64_t)b->groups[k] * b->threads[k] > 1) dims = (uint64_t)k + 1;
+    v[H_BLOCKS + k] = b->groups[k];
+    v[H_GROUP + k] = b->threads[k];
   }
-  if (h[H_DIMS] >= 0) memcpy(args + h[H_DIMS], &dims, 2);
-  if (h[H_LDS] >= 0) memcpy(args + h[H_LDS], &b->shared, 4);
+  v[H_DIMS] = dims;
+  v[H_LDS] = b->shared;
+  for (int i = 0; i < RIG_AMD_HIDDEN; i++)
+    if (l->hidden[i] >= 0)
+      store_le(args + l->hidden[i], v[i], rig_amd_hidden_bytes[i]);
 }
 
 /* Places [l]'s dispatch of block [b], whose arguments begin at segment offset
@@ -796,13 +914,13 @@ static void copy_compute(struct submission *s, const struct rig_part *p,
   struct rig_amd_segment *g = &s->d->segment;
   const struct rig_amd_launch *l = s->d->copy_launch;
   uint64_t width = COPY_THREADS * COPY_VECTOR_BYTES;
-  uint64_t groups = (p->copy.bytes + width - 1) / width;
+  uint64_t groups = (p->copy.width + width - 1) / width;
   struct rig_block b = {
       .groups = {groups < COPY_GROUPS ? (uint32_t)groups : COPY_GROUPS, 1, 1},
       .threads = {COPY_THREADS, 1, 1}};
   uint64_t at = g->put % g->size;
   uint64_t params[3] = {p->copy.dst + p->copy.dst_offset,
-                        p->copy.src + p->copy.src_offset, p->copy.bytes};
+                        p->copy.src + p->copy.src_offset, p->copy.width};
   memcpy(g->host + at, params, sizeof params);
   implicit(l, &b, g->host + at);
   g->put += align_up(arguments(l, sizeof params), SEGMENT_ALIGN);
@@ -879,7 +997,7 @@ int rig_amd_submit(void *self, uint64_t v, const struct rig_wait *waits,
 
   /* The submission's segment bytes lie in one run, which never wraps, its
      slot words first. */
-  uint64_t bytes = need(d, s.routes, parts, nparts).bytes;
+  uint64_t bytes = need(d, nwaits, s.routes, parts, nparts).bytes;
   struct rig_amd_segment *g = &d->segment;
   if (g->put % g->size + bytes > g->size) g->put += g->size - g->put % g->size;
   volatile uint32_t *slot = (volatile uint32_t *)(g->host + g->put % g->size);
@@ -955,27 +1073,58 @@ static int calibration(struct rig_amd *d, uint64_t *before, uint64_t *after) {
   return 1;
 }
 
-int rig_amd_measure(struct rig_amd *d) {
-  struct rig_amd_measure m;
-  uint64_t best = UINT64_MAX, width;
-  if (d->source != NULL) {
-    for (int i = 0; i < CALIBRATIONS * 2 && best > RIG_AMD_READ_BOUND_NS;
-         i++) {
-      if (d->source->read(d->source, &m.ticks, &m.host, &width) != 0) return 0;
-      if (width >= best) continue;
-      best = width;
-      d->first = d->latest = m;
-    }
-    d->first_wide = best > RIG_AMD_READ_BOUND_NS;
-    return 1;
-  }
+/* Measures [d]'s clock against the host's clock with stamps into [*m]:
+   the closest pair of CALIBRATIONS. Answers 0 if a stamp never showed. */
+static int round_trip(struct rig_amd *d, struct rig_amd_measure *m) {
+  uint64_t best = UINT64_MAX;
   for (int i = 0; i < CALIBRATIONS; i++) {
     uint64_t before, after;
     if (!calibration(d, &before, &after)) return 0;
     if (after - before >= best) continue;
     best = after - before;
-    m = (struct rig_amd_measure){*d->clock, before + best / 2};
+    *m = (struct rig_amd_measure){*d->clock, before + best / 2};
   }
+  return 1;
+}
+
+/* Reads [d]'s source up to sixteen times, keeping in [*m] and [*best] the
+   first read within RIG_AMD_READ_BOUND_NS, or the narrowest if it is
+   narrower than [*best]. Answers 0, or -1 if the source could not be read. */
+static int read_narrow(struct rig_amd *d, struct rig_amd_measure *m,
+                       uint64_t *best) {
+  struct rig_amd_measure r;
+  uint64_t width;
+  for (int i = 0; i < CALIBRATIONS * 2 && *best > RIG_AMD_READ_BOUND_NS;
+       i++) {
+    if (read_source(d, &r, &width) != 0) return -1;
+    if (width >= *best) continue;
+    *best = width;
+    *m = r;
+  }
+  return 0;
+}
+
+int rig_amd_measure(struct rig_amd *d) {
+  struct rig_amd_measure m, s;
+  if (d->source == NULL) {
+    if (!round_trip(d, &m)) return 0;
+    d->first = d->latest = m;
+    return 1;
+  }
+  /* The constant is taken against a read within the bound: reads before the
+     round trip, and if none lies within it, reads after, the narrowest of
+     all kept. Each lies under a millisecond from the stamps, so the
+     nominal rate carries the source's count to the stamps' host time. */
+  uint64_t best = UINT64_MAX;
+  if (read_narrow(d, &m, &best) != 0 || !round_trip(d, &s) ||
+      read_narrow(d, &m, &best) != 0)
+    return 0;
+  d->first_wide = best > RIG_AMD_READ_BOUND_NS;
+  int64_t dt = (int64_t)(s.host - m.host);
+  int64_t hz = (int64_t)d->clock_hz, n = INT64_C(1000000000);
+  int64_t ticks = dt / n * hz + dt % n * hz / n;
+  d->offset = (int64_t)(s.ticks - m.ticks) - ticks;
+  m.ticks += (uint64_t)d->offset;
   d->first = d->latest = m;
   return 1;
 }

@@ -85,8 +85,8 @@ val capability : t -> Rig_nv_abi.Gpu.t
       | [budget] | The path's {!field-budget}. |
       | [queues] | ["COMPUTE:0"] and ["COPY:0"] ({!section-submitting}). |
       | [copy_engine] | [Some 1], ["COPY:0"]. |
-      | [completion] | [Store]: the channels' releases write the word. |
-      | [waits] | [stores] and [hosts]; [most] is [256]. |
+      | [completion] | [Store]: the channels' releases, or a submission's last launch, write the word. |
+      | [waits] | [stores] and [hosts]. |
       | [may_block] | [false]: its C functions only store to memory. |
       | [hang_ms] | The path's {!field-hang_ms}. |
       | [maps_host] | [true] iff the path maps host memory. |
@@ -94,6 +94,7 @@ val capability : t -> Rig_nv_abi.Gpu.t
       | [alignment] | [4096]: each path allocates whole pages of 4 KiB. |
       | [capability] | {!val-capability} ({!Rig_nv_abi.declare}). |
       | [word] | The word [make] was given, mapped through the path. |
+      | [bus] | The path's {!field-bus}. |
     }
 
     The device maps the 64 KiB of rig's array of words that holds its word
@@ -124,11 +125,27 @@ val capability : t -> Rig_nv_abi.Gpu.t
 
     The device keeps device order and prefix order
     ({!Rig_edge.section-calls}), and the release of [v] waits for the work
-    of [v] to complete, so two submissions never overlap on the GPU. A part
+    of [v] to complete, so two submissions never overlap on the GPU. An
+    untimed submission whose parts all run on the compute channel and whose
+    last part is a launch, of a value whose low 32 bits are not [0], has
+    that launch release [v] as it completes, which follows every launch
+    before it. Such a [v] has the high 32 bits of [v - 1], so the word goes
+    from [v - 1] to [v] even if the launch writes the 64 bits in two stores,
+    which NVIDIA does not rule out. A part
     starts once the parts before it on its queue have completed, and reads
     what they wrote. [Words] run on their queue's
     channel. A copy runs on either channel and keeps its place in its
-    queue's order, even a copy of zero bytes.
+    queue's order, even a copy of zero bytes. On ["COPY:0"] a copy part of
+    rows runs as one multi-line launch of the copy engine for each
+    [2{^32} - 1] rows, and a copy of one row, or of rows that hold more than
+    2 GiB or lie [2{^32}] bytes or more apart, as one launch of one line for
+    each 2 GiB of each row. A fill writes its byte by the copy engine's
+    remap of a constant, which reads no memory: in components of four bytes
+    from the first multiple of 4 of its address, 2 GiB a launch, and of one
+    byte in the at most three bytes at each end. On sm_80, sm_86, sm_87 and
+    sm_89, a copy or a fill of one row of at least 256 KiB within the
+    device's own [Device] memory runs instead as a kernel of the driver on
+    the compute channel.
 
     A wait names an aligned 64-bit word that the device's work addresses,
     and a value [w]. It holds the submission's work back until the word
@@ -189,13 +206,14 @@ val capability : t -> Rig_nv_abi.Gpu.t
       {!Rig_nv_abi.Launch.max_threads}, or whose dynamic shared memory,
       rounded up to 128 bytes, exceeds {!Rig_nv_abi.Launch.dynamic_shared}.
 
-    Launches, whose constant bank 0 {!entry} bounds, and copies of at most
-    2 GiB take no ring entry of their own, and the segment and launch rings
-    grow to hold them. The driver's words for them close into an entry for
-    each 4 MiB of segment, and a segment ring lies below [2{^40}], so their
-    entries stay below the 262,144 a channel's ring holds from its open,
-    and only memory bounds them. Words, and longer copies, take the entries
-    their sizes take.
+    Launches, whose constant bank 0 {!entry} bounds, copies whose rows
+    hold at most 2 GiB, with pitches and rows below [2{^32}], and fills of
+    at most 2 GiB take no ring entry of their own, and the segment and
+    launch rings grow to hold them. The driver's words for them close into
+    an entry for each 4 MiB of segment, and a segment ring lies below
+    [2{^40}], so their entries stay below the 262,144 a channel's ring holds
+    from its open, and only memory bounds them. Words, and longer copies,
+    take the entries their sizes take.
 
     A launch's constant bank 0 is its kernel's, of at most
     {!Rig_nv_abi.Launch.max_bank_bytes}: its first KiB holds the driver's
@@ -273,7 +291,16 @@ val capability : t -> Rig_nv_abi.Gpu.t
     device's later work until the other device stops. {!val-map_peer} of a
     stopped device's [Mapped] memory is [None]. Peer access between GPUs is
     untested. {!val-map_host} returns [None] if the
-    path maps no host memory or refuses the pages ({!field-map_host}). *)
+    path maps no host memory or refuses the pages ({!field-map_host}).
+
+    {!val-dma} is the path's answer ({!field-dma}). Another function reads
+    what a value's work wrote once the value is reached: a copy's release
+    writes the word once the copy engine's earlier copies are complete
+    ({!Rig_nv_abi.Method.copy_release}), and a compute release once its
+    launches' writes are visible to the system. The device's later work
+    reads what the function wrote once its writes are complete: a copy
+    engine reads the memory itself, and each launch's descriptor invalidates
+    the compute engine's data caches as the launch starts. *)
 
 (** {1:images Images}
 
@@ -333,7 +360,7 @@ val capability : t -> Rig_nv_abi.Gpu.t
 
     Either way the stop frees the C state the device ran work with, its
     templates and the channels' records, which the channels never read. The
-    edge that reads the word, 24 bytes, stays for the process.
+    edge that reads the word, 80 bytes, stays for the process.
 
     Once the word shows the last value and {!val-stop} has returned, no work
     of the device writes it. A channel's release of a value follows its work,
@@ -495,6 +522,12 @@ type 'm path = {
           for this GPU, or [None] if this GPU cannot address it. *)
   free : 'm memory -> unit;
       (** [free m] gives back what [alloc], [map_host] or [map_peer] gave. *)
+  bus : string option;
+      (** The bus address of the GPU's PCI function on its machine. *)
+  dma : 'm memory -> fn:string -> (Rig_edge.dma, string) result;
+      (** [dma m ~fn] is how the function at [fn] reaches the memory [m] that
+          [alloc] gave, as {!Rig_edge.Driver.val-dma} states, or [Error]
+          with the path's reason. *)
   register : int -> (unit, string) result;
       (** [register c] makes the channel [c], which the device allocated under
           [device], ready to run, as the path requires. *)

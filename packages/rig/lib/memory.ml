@@ -102,6 +102,21 @@ let reached_all (a : alloc) every =
 let reached_points m = reached_all m.alloc true
 let reached_write m = reached_all m.alloc false
 
+(* [reached_all]'s walk, asking [Dev.seen_done], which commits nothing and
+   calls no driver. *)
+let rec done_from c i =
+  c = 0
+  ||
+  if i = uses then done_from (stamps_next c) 0
+  else
+    let p = stamps_followed c i true in
+    p = ended || ((p = 0 || Dev.seen_done p) && done_from c (i + 1))
+
+let uses_done m =
+  let st = m.alloc.entry.stamps in
+  let p = stamps_folded st true in
+  done_from st 0 && (p = 0 || Dev.seen_done p)
+
 (* Visit every point even after a refusal: reading a later transport word may
    discover its device's loss. The walk carries no allocated state. *)
 let rec all_from f c i ok =
@@ -163,6 +178,13 @@ external release_front : int -> int = "caml_rig_release_front" [@@noalloc]
 external release_pop : int -> unit = "caml_rig_release_pop" [@@noalloc]
 external node_record : int -> released = "caml_rig_node_record" [@@noalloc]
 external released_any : int -> bool = "caml_rig_released_any" [@@noalloc]
+
+(* Whether a token was collected onto the list of a device whose stop
+   returned, or a stop returned, since the last call that answered [true]. *)
+external ended_linked : unit -> bool = "caml_rig_ended_linked" [@@noalloc]
+
+(* Asks the next drain to drain those devices again. *)
+external ended_rearm : unit -> unit = "caml_rig_ended_rearm" [@@noalloc]
 external page_size : unit -> int = "caml_rig_page_size"
 
 let no_token = no_token ()
@@ -222,6 +244,7 @@ let entry ?(access = Read_write) owner backing bytes stamps =
     unmaps = 1;
     pages = Unasked;
     proxy = 0;
+    reached = false;
   }
 
 let no_entry = entry Dev.host (Kept Nothing) 0 0
@@ -404,14 +427,31 @@ let give_room d budget n =
 
 (* Releases *)
 
-(* Appends [p] after the work that may use it without naming it. Reading the
-   submitted value under the append lock keeps the queue's values ordered. *)
+(* The queue [q] of releases with [p] at the value [v], after the releases
+   of [v] or less. A release at the end, as one at the submitted value
+   nearly always is, takes a cons. One before others, such as a release at
+   the submitted value after an unmap of a word at the next value
+   ([retire_locked]), rebuilds the queue. *)
+let insert (front, back) v p =
+  let rec last = function
+    | [ (v, _) ] -> v
+    | _ :: rest -> last rest
+    | [] -> min_int
+  in
+  let latest = match back with (v, _) :: _ -> v | [] -> last front in
+  if front == [] then ([ (v, p) ], [])
+  else if v >= latest then (front, (v, p) :: back)
+  else
+    let before, after =
+      List.partition (fun (v', _) -> v' <= v) (front @ List.rev back)
+    in
+    (before @ ((v, p) :: after), [])
+
+(* Puts [p] after the work that may use it without naming it. Reading the
+   submitted value under the lock keeps the queue's values ordered. *)
 let append_pending (d, p) =
-  let v = Dev.submitted d in
   let l = d.live in
-  let front, back = l.pending in
-  l.pending <-
-    (if front == [] then ([ (v, p) ], []) else (front, (v, p) :: back))
+  l.pending <- insert l.pending (Dev.submitted d) p
 
 let defer d p = Dev.protect d append_pending (d, p)
 
@@ -539,24 +579,21 @@ let rec give_words () =
          | None -> ());
       give_words ()
 
-let retire_at (d, v, m) = d.live.retired <- (v, m) :: d.live.retired
-let retire_locked d m = retire_at (d, Dev.next_value d, m)
+let retire_locked d m =
+  let l = d.live in
+  l.pending <- insert l.pending (Dev.next_value d) (Unmap_word m)
 
 external reraise : exn -> 'a = "%reraise"
 
-(* Gives back [d]'s mapping [r] of [p]'s word now, or later among [d]'s
-   retired mappings, then runs [d]'s owed stop ([Dev.give]). A free that
-   raises is not run again ([Dev.give]), so [p]'s count drops before the
-   exception passes on, with nothing allocated first. *)
+(* Gives back [d]'s mapping [r] of [p]'s word now, or later ([waits]). A
+   free that raises is not run again ([Dev.give]), so [p]'s count drops
+   before the exception passes on, with nothing allocated first. *)
 let unmap_word d ((r, p) as m) : Dev.given =
   match free_region d r with
   | Given ->
       word_unmapped p;
       Given
-  | Later ->
-      Dev.protect d retire_at (d, 0, m);
-      Dev.run_own d;
-      Later
+  | Later -> waits d (Unmap_word m) Later
   | exception e ->
       word_unmapped p;
       reraise e
@@ -659,10 +696,18 @@ let key n kind =
   let k = match kind with Device -> 0 | Pinned -> 1 | Mapped -> 2 in
   (n * 4) + k
 
-(* Memory the cache never takes: io memory, and host memory a device borrowed,
-   which returns to its keeper once its uses are reached. *)
+(* Memory the cache never takes: io memory, host memory a device borrowed,
+   which returns to its keeper once its uses are reached, and memory another
+   PCI function reaches, which may still write it. *)
 let uncached (e : entry) =
-  match e.backing with Driver_memory _ -> false | Io_memory _ | Kept _ -> true
+  e.reached
+  ||
+  match e.backing with
+  | Driver_memory _ -> false
+  | Io_memory _ | Kept _ -> true
+
+let mark_reached (e : entry) =
+  Dev.protect e.owner (fun (e : entry) -> e.reached <- true) e
 
 let cache_key (e : entry) =
   match e.backing with
@@ -865,43 +910,35 @@ let release_early (a : alloc) =
 
 (* Staging memory
 
-   A device's staging slots are copy's, in its [live]; memory returns their
-   free halves where it returns cached memory, as collected memory returns. *)
+   A device's staging halves are copy's, in its [live]; memory returns the
+   buffers of free halves where it returns cached memory, as collected memory
+   returns. *)
 
 external buffer_free : buffer -> string -> int = "caml_rig_buffer_free"
 
-let rec halves_of hs h (s : slot) =
-  if h = 2 then hs
-  else
-    match s.halves.(h) with
-    | Some b -> halves_of (b :: hs) (h + 1) s
-    | None -> halves_of hs (h + 1) s
-
-(* Under [l]'s lock: the halves of [l]'s free slots, taken out of them, each
-   slot's list made before its stores. *)
+(* Under [l]'s lock: the buffers of [l]'s free halves, taken out of them,
+   each half's cursor back at its start, and the list made before the
+   stores. *)
 let take_free_halves l =
   Array.fold_left
-    (fun hs (s : slot) ->
-      if s.held then hs
-      else
-        let hs = halves_of hs 0 s in
-        s.halves.(0) <- None;
-        s.halves.(1) <- None;
-        hs)
-    [] l.slots
+    (fun bs (h : half) ->
+      match h.buffer with
+      | Some b when not h.held ->
+          let bs = b :: bs in
+          h.buffer <- None;
+          h.cursor <- 0;
+          bs
+      | Some _ | None -> bs)
+    [] l.halves
 
-(* Whether a slot of [l] has a half, which keeps [l]'s device's slot. *)
-let has_halves l =
-  let some = function Some _ -> true | None -> false in
-  Array.exists
-    (fun (s : slot) -> some s.halves.(0) || some s.halves.(1))
-    l.slots
+(* Whether a half of [l] has a buffer, which keeps [l]'s device's slot. *)
+let has_halves l = Array.exists (fun (h : half) -> h.buffer <> None) l.halves
 
 let return_half b = if buffer_free b "freed" = 1 then release_early b.mem.alloc
 
 (* Returns [d]'s free staging halves ([return_half]). *)
 let release_staging d =
-  if Array.length d.live.slots > 0 then
+  if Array.length d.live.halves > 0 then
     List.iter return_half (Dev.protect d take_free_halves d.live)
 
 (* Under [hold_lock]: releases the holds at the front of the list's hand whose
@@ -931,27 +968,31 @@ let fate d ~lost ~free_lost (e : entry) =
 
 (* Under [d]'s lock: from the retiring entry [judged] on, caches each whose
    uses are reached and takes out the first to free, moving the last entry
-   into its place: it, or [no_entry]. Its judgement reads [d]'s loss and
-   [freeing] at each entry, which only ever become true: a drain of another
-   domain that restarts the pass meanwhile makes it judge entries again,
-   never wrongly. *)
-let rec take_freed d =
+   into its place: it, or [no_entry]. Its judgement reads [freeing] at each
+   entry, and [d]'s loss, a call, once per hold of the lock ([take_freed]):
+   both only ever become true, and a drain of another domain that restarts
+   the pass meanwhile makes it judge entries again, never wrongly. A loss
+   after the read is as one after a judgement, which the entry's free or
+   its device's cache then meets. *)
+let rec take_freed_from d lost =
   let l = d.live in
   let i = l.judged in
   if i >= l.nretiring then no_entry
   else
     let e = l.retiring.(i) in
-    match fate d ~lost:(Dev.is_lost d) ~free_lost:l.freeing e with
+    match fate d ~lost ~free_lost:l.freeing e with
     | Stays ->
         l.judged <- i + 1;
-        take_freed d
+        take_freed_from d lost
     | (Cached | Freed) as f ->
         if f = Cached then cache e;
         let last = l.nretiring - 1 in
         l.retiring.(i) <- l.retiring.(last);
         l.retiring.(last) <- no_entry;
         l.nretiring <- last;
-        if f = Freed then e else take_freed d
+        if f = Freed then e else take_freed_from d lost
+
+let take_freed d = take_freed_from d (Dev.is_lost d)
 
 (* Under [l]'s lock: a pass starts at the first retiring entry, the second
    on a device found lost and Stopped. *)
@@ -1162,28 +1203,33 @@ let due_at d =
   else if Dev.stopped d then max_int
   else -1
 
-(* Takes one of [l]'s retired mappings of words whose value [w] reached. *)
-let take_retired (l, w) =
+(* Under [l]'s lock: takes the first of [l]'s retired mappings among its
+   pending releases whose value [w] reached, and leaves the others in
+   order. *)
+let take_word (l, w) =
+  let front, back = l.pending in
   let rec take before = function
-    | [] -> None
-    | (v, m) :: rest when v <= w ->
+    | (v, _) :: _ when v > w -> None
+    | (_, Unmap_word m) :: rest ->
         let taken = Some m in
-        l.retired <- List.rev_append before rest;
+        l.pending <- (List.rev_append before rest, []);
         taken
-    | r :: rest -> take (r :: before) rest
+    | p :: rest -> take (p :: before) rest
+    | [] -> None
   in
-  take [] l.retired
+  take [] (if back == [] then front else front @ List.rev back)
 
 (* Gives back [d]'s retired mappings of words whose waits its queue passed,
-   one at a time, as [give_maps] does. A mapping that does not go back ends
-   the walk: it is retired again due at once, since [d] was lost after [w]
-   was read and nothing more of it goes back until its stop. *)
+   one at a time, as [give_maps] does, and runs none of its other releases.
+   A mapping that does not go back ends the walk: it waits again, since [d]
+   was lost after [w] was read and nothing more of it goes back until its
+   stop. *)
 let give_retired d =
   let l = d.live in
-  if l.retired != [] then
+  if fst l.pending != [] then
     let w = due_at d in
     let rec give () =
-      match Lock.protect l.lock take_retired (l, w) with
+      match Lock.protect l.lock take_word (l, w) with
       | None -> ()
       | Some m -> (
           match unmap_word d m with Given -> give () | Later -> ())
@@ -1212,6 +1258,7 @@ let run_pending d : pending -> Dev.given = function
           Given
       | Given, None -> Given
       | Later, _ -> Later)
+  | Unmap_word m -> unmap_word d m
   | Let_go _ -> Given
 
 (* Unloads [d]'s image [l] now, then gives back its code memory [code], or
@@ -1240,8 +1287,7 @@ let due_pending d =
 let drain_own d =
   if released_any d.live.release then route_released d;
   due d;
-  due_pending d;
-  give_retired d
+  due_pending d
 
 let is_let_go = function _, Let_go _ -> true | _ -> false
 
@@ -1265,27 +1311,31 @@ let forget d =
 let idle l =
   l.nretiring = 0
   && fst l.pending == []
-  && l.retired == []
   && not (released_any l.release)
 
 let kept_locked l =
-  l.cached > 0 || l.word_maps != [] || l.retired != []
+  l.cached > 0 || l.word_maps != []
+  || fst l.pending != []
   || Cache.length l.mapped > 0
   || first_mapped l.pairs 0 >= 0
   || has_halves l
 
-(* Whether the lost [d] keeps what returns once it is Stopped: its cache and
-   its mappings. Read under the lock: a pair's mapping that a decision
-   retires is in the cell or among the retired ones. *)
+(* Whether the lost [d] keeps what returns once it is Stopped: its cache,
+   its mappings and its pending releases. Read under the lock: a pair's
+   mapping that a decision retires is in the cell or among the pending
+   releases. *)
 let kept d = Dev.protect d kept_locked d.live
 
 (* A lost device's memory returns once it has stopped, so its drain runs its
    owed stop first. A device whose stop returned frees its slot once its last
    memory and mapping went back and its last kept value went, then lets go
    of its word. Every drain gives back the words that lost their last
-   mapping, and first releases the holds collected. *)
-let drain d =
+   mapping, and first releases the holds collected and drains the devices
+   whose stop returned and whose list took records: no call on them is due,
+   as a program makes none on a device it closed. *)
+let rec drain d =
   if released_any hold_list then release_holds ();
+  if ended_linked () then drain_every_ended ();
   if Dev.orphaned d then forget d
   else begin
     if Dev.is_lost d then Dev.run_own d;
@@ -1295,6 +1345,19 @@ let drain d =
       let_go_word d;
     give_words ()
   end
+
+and drain_ended d =
+  if Dev.stop_returned d && released_any d.live.release then drain d
+
+(* The request was taken before the walk, so a drain that raises, at an
+   allocation's asynchronous exception or a driver's free, asks again for
+   the devices it leaves. The request goes first, as it allocates nothing. *)
+and drain_every_ended () =
+  match Dev.iter drain_ended with
+  | () -> ()
+  | exception e ->
+      ended_rearm ();
+      Printexc.raise_with_backtrace e (Printexc.get_raw_backtrace ())
 
 let () = Dev.answered := drain
 
@@ -1341,7 +1404,8 @@ let holds_back (pool, l) =
   let holds = function
     | _, (Free e | Give e | Unmap (_, Some e) | Unload (_, Some e)) ->
         charged pool e
-    | _, (Unmap (_, None) | Unload (_, None) | Let_go _) -> false
+    | _, (Unmap (_, None) | Unload (_, None) | Unmap_word _ | Let_go _) ->
+        false
   in
   let front, back = l.pending in
   List.exists holds front || List.exists holds back
@@ -1575,8 +1639,14 @@ let make_entry (a : alloc) =
 
 let ensure_entry (a : alloc) = Dev.protect a.owner make_entry a
 
+(* [d]'s mapping among [maps], if any: a loop of its own, so looking builds
+   no closure. *)
+let rec map_on d = function
+  | [] -> None
+  | mp :: maps -> if mp.on == d then Some mp else map_on d maps
+
 (* [d]'s mapping of [e], if any. *)
-let find_map ((e : entry), d) = List.find_opt (fun mp -> mp.on == d) e.maps
+let find_map ((e : entry), d) = map_on d e.maps
 
 (* Counts [mp] in [e], and adds it to [e]'s mappings, unless its device
    mapped [e] meanwhile: that mapping, then. *)
@@ -1679,7 +1749,7 @@ let map_new d (a : alloc) host =
    made at the first borrow and shared by the later ones. *)
 let mapping d (a : alloc) host =
   match Dev.protect a.owner find_map (a.entry, d) with
-  | Some mp -> Some mp
+  | Some _ as found -> found
   | None -> map_new d a host
 
 (* Keeps [got] as [e]'s pages, unless a call kept some first. *)

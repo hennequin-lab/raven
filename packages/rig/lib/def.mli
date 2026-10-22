@@ -15,8 +15,8 @@
     The C stubs read some fields by position, so their order is fixed.
     [rig_memory.c] reads, for the readers and claims [rig.h] declares, the
     fields of {!buffer} and {!memory}, those of {!alloc} up to [entry], those
-    of {!entry} up to [pages], and those of {!device} up to [machine] and its
-    [opened], and takes [Here] to be {!machine}'s first constant constructor.
+    of {!entry} up to [pages], and those of {!device} up to [opened], and
+    takes [Here] to be {!machine}'s first constant constructor.
     [rig.h]'s [enum rig_access] lists {!access}'s constructors in order. A
     change of either changes the C too. *)
 
@@ -61,6 +61,17 @@ type kind =
 (** {!Rig.Buffer.access}. *)
 type access = Read | Read_write
 
+(** {!Rig.Buffer.type-box}. C reads its fields in this order
+    ([caml_rig_sub_box]). *)
+type box = {
+  src_offset : int;
+  dst_offset : int;
+  width : int;
+  rows : int;
+  src_pitch : int;
+  dst_pitch : int;
+}
+
 (** The type for the host memory an allocation keeps reachable: none, a
     heap bigarray, whose collection returns its bytes to the host's budget,
     or the caller's bigarray. *)
@@ -98,15 +109,21 @@ type local = Local : 'a Type.Id.t * 'a -> local
 
 (** The type for devices: {!Rig.t}. A device is its facts, fixed at open,
     and its {!live} state. The table of devices holds it at its index until
-    a later device takes its slot. *)
+    a later device takes its slot. C reads its first four fields by position
+    ([rig_memory.c]'s [DEVICE_] constants), so they stay first and in this
+    order, and a new field goes anywhere after them. *)
 type device = {
   index : int;
       (** Its slot, its index in the table of devices, [0] for the host. *)
   name : string;
       (** The opener's name, followed by ["@machine"] on another machine. *)
   machine : machine;  (** The machine it belongs to. *)
+  opened : int;
+      (** The open that made it, unique for the process. The open takes it
+          after its slot, so a later device of the slot has a larger one. *)
   kind : kind;  (** What it is, with the module and handle that run it. *)
   arch : string;  (** Its architecture, as its driver names it. *)
+  bus : string option;  (** {!Rig.bus}. *)
   maps_host : bool;  (** Whether it maps host memory. *)
   alignment : int;  (** {!Rig.alignment}. *)
   host_addresses : bool;  (** Whether the host addresses all its regions. *)
@@ -128,9 +145,6 @@ type device = {
       (** The value its timeline started after, which its slot's word held
           when it opened: its points' values lie above it, and those of the
           earlier devices of its slot at or below it. *)
-  opened : int;
-      (** The open that made it, unique for the process. The open takes it
-          after its slot, so a later device of the slot has a larger one. *)
 }
 
 (** The type for a device's state: its C record, its lock, its memory and
@@ -180,19 +194,15 @@ and live = {
       (** Whether a drain found it lost and Stopped, from when its retiring
           memory is freed as its uses are reached. Never cleared. *)
   mutable pending : (int * pending) list * (int * pending) list; [@atomic]
-      (** Releases by nondecreasing value of it, replaced whole: the front in
-          order, the back reversed, and the front empty only when both are. *)
+      (** Releases, each with the value of it it waits for, by nondecreasing
+          value, replaced whole under the lock: the front in order, the back
+          reversed, and the front empty only when both are. *)
   mutable pairs : pair array;
       (** By producer index, how its queues wait for the values of the slot's
           device it was decided for. A cell holds an immutable pair, so a
           read without the lock sees its fields together. Grown by
           replacement, written under the lock, and read without it. Emptied,
           its mappings given back, once the device is Stopped. *)
-  mutable retired : (int * (region * device)) list; [@atomic]
-      (** Its mappings of words of a slot's earlier devices, which a pair of
-          a later device replaced, each with the value after every submit
-          that may wait through it ({!Dev.next_value}), written under the
-          lock. *)
   mutable words : int; [@atomic]
       (** How its queues read rig's array of words: [0] undecided, [-1] they
           do not, or the array's address as its work addresses it, through
@@ -205,10 +215,12 @@ and live = {
           lock: the mapping goes back with the entry, or once it is Stopped,
           whichever comes first. Emptied, it goes back to its smallest
           size. *)
-  mutable slots : slot array;
-      (** Its staging memory ({!Copy}): every slot made, held or not, under
+  mutable halves : half array;
+      (** Its staging memory ({!Copy}): every half made, held or not, under
           the lock. The host's serves every device that maps host memory. *)
-  mutable claims : int;  (** The claims of its slots so far, under the lock. *)
+  mutable takes : int;  (** The takes of its halves so far, under the lock. *)
+  mutable laps : int;
+      (** The laps its halves started so far, under the lock. *)
 }
 
 (** The type for how a device's queues wait for the values of a producer
@@ -245,6 +257,10 @@ and entry = {
   mutable proxy : int;
       (** The C proxy of the bigarrays over it, [0] before the first. *)
   id : int;  (** Unique for the life of the process. *)
+  mutable reached : bool;
+      (** Whether a PCI function other than its owner's reaches it by DMA
+          ({!Rig.Buffer.dma}), so that it never returns to the cache. Set
+          under [owner]'s lock. *)
 }
 
 (** The type for the entries of one key of a device's cache: the first [n]
@@ -275,6 +291,10 @@ and pending =
       (** A mapping, and the memory it maps, given back after its last
           unmap. *)
   | Unload of loaded * entry option
+  | Unmap_word of (region * device)
+      (** A mapping of the word of a slot's earlier device, which a pair of a
+          later device replaced, given back after every submit that may wait
+          through it ({!Dev.next_value}). *)
   | Let_go of held
       (** A value a collected submission kept: dropped, it is let go. *)
 
@@ -337,14 +357,23 @@ and buffer = { mem : memory; offset : int; length : int; generation : int }
 (** {!Rig.Buffer.t}: live while [generation] is its allocation's, whose low
     bit says what it admits ({!Memory.admits}). *)
 
-(** The type for a slot of a device's staging memory ({!Copy}): two halves,
-    each made at the first piece that needs it, which change only while a
-    copy holds the slot and as a give or a release drops them. *)
-and slot = {
-  halves : buffer option array;
+(** The type for a half of a device's staging memory ({!Copy}), whose fields
+    change under its device's lock, and its [buffer] and [cursor] also
+    outside it while a copy holds it, which the give's lock publishes. *)
+and half = {
+  mutable buffer : buffer option;
+      (** Its allocation of 32 MiB, made at the first copy that needs it, and
+          dropped as a give or a release returns it. *)
   mutable held : bool;  (** Whether a copy holds it. *)
-  mutable last : int;  (** Its device's [claims] at its last claim. *)
-  owner : device;  (** The device whose [live] holds it. *)
+  mutable cursor : int;
+      (** The byte from which no unfinished work uses [buffer]. *)
+  mutable lap : int;
+      (** Its device's [laps] when [cursor] was last set to [0]. *)
+  mutable last : int;  (** Its device's [takes] at its last take. *)
+  mutable waits : bool;
+      (** Whether its holder waits for its uses before it writes it: its
+          last take restarted it with uses it did not see done. *)
+  stage : device;  (** The device whose [live] holds it. *)
 }
 
 type holds = { allocs : alloc Weak.t; taken : Bytes.t }

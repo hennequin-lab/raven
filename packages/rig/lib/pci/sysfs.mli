@@ -11,9 +11,16 @@
 type t
 (** The type for a machine's files. *)
 
-val v : string -> t
+val v : ?kernel:(string -> string -> unit) -> string -> t
 (** [v root] is the machine whose files are under the directory [root]: [/] for
-    this machine, a fixture's directory in tests. *)
+    this machine, a fixture's directory in tests. [kernel file s] is called
+    at each write of [s] to an attribute [file] of a driver, the bus or a
+    function other than its [config], once [file] is open and before [s] is
+    written, to act on it as Linux does inside the write: a fixture's kernel.
+    It may raise [Unix.Unix_error] as Linux's refusal of the write, and [s]
+    is then not written. The open truncated [file], so a fixture's kernel
+    that refuses restores [file] itself. It defaults to doing nothing, as for
+    this machine, whose kernel acts itself. *)
 
 (** {1:locks Locks}
 
@@ -61,6 +68,11 @@ val driver : 's lock -> string option
 
 val group : t -> string -> string option
 (** [group m bus] is the IOMMU group of the function at [bus]. *)
+
+val translates : t -> string -> bool
+(** [translates m bus] is [true] iff an IOMMU translates the addresses of the
+    requests of the function at [bus], outside VFIO's no-IOMMU mode and an
+    identity domain. *)
 
 val bars : 's lock -> (int * int) option array
 (** [bars l] is, for each of the six BARs of the function [l] locks, its bus
@@ -119,8 +131,11 @@ val detach : 's lock -> remove:bool -> unit
     once unbound, enables it and turns its bus mastering off. Behind an IOMMU
     that translates, it sets the [driver_override] of the other functions of
     the device to [vfio-pci] if [remove] and unbinds their drivers, then the
-    function's, which {!bind} then binds. Raises {!Fail.Failed} if the
-    function is still not takeable, or a file cannot be written. *)
+    function's, which {!bind} then binds. With [remove] and the function
+    bound to a kernel driver, it first sets the [driver_override] of each
+    other function on [vfio-pci] to [vfio-pci] and unbinds [vfio-pci]. Raises
+    {!Fail.Failed} if [vfio-pci] stays bound to such another function, if
+    the function is still not takeable, or if a file cannot be written. *)
 
 val bind : 's lock -> remove:bool -> unit
 (** [bind l ~remove] binds to [vfio-pci], behind an IOMMU that translates, the
@@ -137,9 +152,10 @@ val attach : 's lock -> siblings:bool -> unit
     another driver stays bound, and the bus is rescanned and its
     [driver_override] cleared if that is set. With [siblings], each other
     function of its device that [vfio-pci] holds, or whose [driver_override]
-    names it, is unbound from it, has its [driver_override] cleared and its
-    drivers probed. Raises {!Fail.Failed} if no driver takes the function or
-    such another one. *)
+    names it, has its [driver_override] set to [vfio-pci] and is unbound
+    from it first, and has its [driver_override] cleared and its drivers
+    probed last. Raises {!Fail.Failed} if [vfio-pci] stays bound to such
+    another one, or if no driver takes the function or such another one. *)
 
 val reset : t -> string -> unit
 (** [reset m bus] resets [bus] with the reset Linux has for it. *)
@@ -149,7 +165,8 @@ val resize : 's lock -> int -> unit
     supports that its bridge takes. A bound function keeps its size, and so
     does one whose resize the kernel refuses for another reason than room or
     permission, so its BAR may stay small. Raises {!Fail.Failed}, naming the
-    file, if the process may not write it. *)
+    file, if the process may not write it, and [Failure] for an error the
+    kernel gives only for a bug in this library. *)
 
 (** {1:peers Peer requests} *)
 
@@ -169,6 +186,14 @@ val forwards : provider:route -> client:route -> bool
 (** [forwards ~provider ~client] is [true] iff the bus carries the requests
     of [client]'s function to a BAR of [provider]'s, as {!Memory.reaches}
     states Linux's p2pdma decides. *)
+
+(** The type for how far apart two functions of a machine are:
+    {!Machine.distance}. *)
+type distance = Switch | Bridge | System
+
+val distance : route -> route -> distance
+(** [distance a b] is how far apart the functions of [a] and [b] are, as
+    {!Machine.distance} states. *)
 
 (** {1:open Open devices} *)
 

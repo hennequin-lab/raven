@@ -201,8 +201,9 @@ val stopped : device -> bool
 val free_slot : device -> bool
 (** [free_slot d] frees [d]'s slot if [d] is Stopped and nothing of it
     remains to give back: no token of its release list that its drains have
-    not routed, nothing in its cache, among its retiring memory or its
-    retired mappings, or waiting for a value. [d] must not be the process's first {!failure}, which
+    not routed, nothing in its cache or among its retiring memory, and no
+    release waiting for a value. [d] must not be the process's first
+    {!failure}, which
     keeps its slot. A [d] lost before it reached every value it was given
     leaves those values on the slot's line as a range that holds [d], so
     its dropped points raise its loss for good. It is whether this call
@@ -376,6 +377,12 @@ val is_done : int -> bool
     exception of the driver's that is no fault, as {!word} does. A point of
     a device that gave its slot to a later one is done unless that device's
     loss dropped it ({!free_slot}). *)
+
+val seen_done : int -> bool
+(** [seen_done p] is {!is_done}[ p] as the values rig has seen answer it: it
+    calls no driver and never raises, and it may be [false] for a point of a
+    device behind a transport that has reached it, since its word moves only
+    when rig reads it ({!word}). It allocates nothing. *)
 
 val reached_point : int -> bool
 (** [reached_point p] is {!Rig.Point.reached}: {!is_done}[ p], after a commit

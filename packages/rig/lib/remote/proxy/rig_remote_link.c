@@ -32,8 +32,9 @@
    a socket closed over unread bytes makes the system reset the connection,
    which may drop the abort before the peer reads it. The peer ends its
    stream once it has read the abort, failed and sent its own. A peer that
-   does not end it within [bound_s] seconds is left. A link's socket closes
-   once both its threads ended and no abort is being sent.
+   does not end it within [bound_s] seconds, or sends nothing for that
+   long, is left. A link's socket closes once both its threads ended and no
+   abort is being sent.
 
    Reasons are formatted here, because the threads that find a failure hold
    no runtime: a fixed phrase or the system's error after the link's name,
@@ -1047,14 +1048,19 @@ static int recv_bytes(struct rig_remote_link *l, uint64_t n, struct reader *rd) 
   pthread_mutex_lock(&l->mu);
   struct rig_remote_dev *d = dev_of(l, id);
   struct rig_remote_local *c = d != NULL ? d->locals : NULL;
-  if (c == NULL || c->value != v || c->bytes != n - 16) {
+  if (c == NULL || c->value != v || c->width * c->rows != n - 16) {
     pthread_mutex_unlock(&l->mu);
     return MALFORMED;
   }
   pthread_mutex_unlock(&l->mu);
   /* The copy stays pending while its bytes land, so a stop meanwhile leaves
-     the word below it and rig keeps the memory. */
-  r = recv_all(l, c->at, c->bytes, rd);
+     the word below it and rig keeps the memory. Its rows land where they
+     lie, one after another. */
+  if (c->pitch == c->width)
+    r = recv_all(l, c->at, c->width * c->rows, rd);
+  else
+    for (uint64_t i = 0; r == 0 && i < c->rows; i++)
+      r = recv_all(l, c->at + i * c->pitch, c->width, rd);
   pthread_mutex_lock(&l->mu);
   d->locals = c->next;
   if (d->locals == NULL) d->locals_last = NULL;
@@ -1120,19 +1126,27 @@ static int recv_frame(struct rig_remote_link *l, int kind, uint64_t n, struct re
 }
 
 /* Reads and discards the peer's bytes until its stream ends, a receive
-   fails, or [bound_s] seconds pass, so that no byte left unread makes the
-   system reset the connection before the peer has read this end's abort.
-   The peer ends its stream once it has read the abort and sent its own. */
-static void drain(struct rig_remote_link *l) {
+   fails, [bound_s] seconds pass, or no byte has come for [bound_s] seconds,
+   so that no byte left unread makes the system reset the connection before
+   the peer has read this end's abort. The peer ends its stream once it has
+   read the abort and sent its own. A peer silent that long, such as a
+   stopped process, is gone by the bound that fails a job, and reads
+   nothing. */
+static void drain(struct rig_remote_link *l, struct reader *rd) {
   unsigned char b[READ_AHEAD];
-  int64_t until = now_ns() + bound_s() * 1000000000LL;
+  int64_t bound = bound_s() * 1000000000LL;
+  int64_t until = now_ns() + bound;
   for (;;) {
     long m = (long)recv(l->fd, (char *)b, sizeof b, 0);
     if (m == 0) return;
-    if (m > 0) continue;
+    if (m > 0) {
+      rd->last = now_ns();
+      continue;
+    }
     int e = rig_remote_sock_error();
     if (!again(e)) return;
-    int64_t left = (until - now_ns()) / 1000000;
+    int64_t end = rd->last + bound < until ? rd->last + bound : until;
+    int64_t left = (end - now_ns()) / 1000000;
     if (left <= 0) return;
     rig_remote_pollfd pf = {0};
     pf.fd = l->fd;
@@ -1165,7 +1179,7 @@ static void *receiver(void *arg) {
   pthread_mutex_unlock(&l->mu);
   /* A stream that ended, broke or fell silent holds nothing to drain. */
   int open = r == 1 || r == FAILING || r == MALFORMED || r == TOO_LARGE;
-  if (open && failing(l->job)) drain(l);
+  if (open && failing(l->job)) drain(l, &rd);
   thread_ends(l);
   return NULL;
 }

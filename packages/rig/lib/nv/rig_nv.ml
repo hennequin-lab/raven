@@ -212,6 +212,8 @@ type 'm path = {
   reaches : int -> bool;
   map_peer : 'm memory -> 'm memory option;
   free : 'm memory -> unit;
+  bus : string option;
+  dma : 'm memory -> fn:string -> (Rig_edge.dma, string) result;
   register : int -> (unit, string) result;
   unregister : int -> (unit, string) result;
   check : unit -> unit;
@@ -311,15 +313,21 @@ let t_idle = 8
 let t_schedule = 9
 let t_stamp = 10
 let t_copy_stamp = 11
+let t_fill = 12
+let t_fill_bytes = 13
+let t_box = 14
 
 (* rig_nv_stubs.h's launch values, by slot: the grid's sizes along X, Y and Z,
    the group's, bank 0's address, the next descriptor's, the dynamic shared
-   memory. *)
+   memory, and the address and value of the release of a launch that ends a
+   submission. *)
 let v_grid_x = 0
 let v_block_x = 3
 let v_bank0 = 6
 let v_next = 7
 let v_shared = 8
+let v_word = 9
+let v_value = 10
 
 (* The sizes in the order of rig_nv_stubs.h's launch limits. *)
 let dims = Abi.Qmd.[ Grid X; Grid Y; Grid Z; Block X; Block Y; Block Z ]
@@ -428,8 +436,8 @@ external hand : int -> int -> int -> int -> int -> bool -> int
 external retired : int -> int -> int = "caml_rig_nv_retired" [@@noalloc]
 external rings_retired : int -> bool = "caml_rig_nv_retiring" [@@noalloc]
 
-external install_copy : int -> nativeint -> int -> string -> unit
-  = "caml_rig_nv_copy_kernel"
+external install_kernels : int -> nativeint -> nativeint -> int -> string -> unit
+  = "caml_rig_nv_kernels"
 [@@noalloc]
 
 external raise_word : int -> unit = "caml_rig_nv_raise" [@@noalloc]
@@ -531,6 +539,7 @@ type 'm dev = {
   key : 'm Type.Id.t;
   index : int;
   reaches : int -> bool; (* the path's *)
+  bus : string option; (* the path's *)
   capability : Abi.Gpu.t;
   flush : int option; (* the path's flush word *)
   word : 'm reg; (* kept, with the C state, for the process *)
@@ -583,9 +592,8 @@ let queues =
       { name = "COPY:0"; runs = [ Words; Copy ] };
     ]
 
-(* Its channels wait on any 64-bit word the device maps, whoever writes it, up
-   to rig_nv_ring.c's MAX_WAITS. *)
-let waits = { Rig_edge.stores = true; hosts = true; most = 256 }
+(* Its channels wait on any 64-bit word the device maps, whoever writes it. *)
+let waits = { Rig_edge.stores = true; hosts = true }
 
 let capability (T d) = d.capability
 
@@ -604,6 +612,7 @@ let facts (T d) =
     alignment = region_alignment;
     capability = Abi.declare d.capability;
     word = R d.word;
+    bus = d.bus;
     edge = Nativeint.of_int d.self;
   }
 
@@ -805,12 +814,19 @@ let template self k (t : Template.t) = set_template self k t.bytes (patches t)
 
 let templates self (g : gpu) =
   (* The writer's values, by slot: two addresses or an address and a value, then
-     a size. *)
+     a size, then a box's rows and pitches. *)
   let a = Template.Slot 0 and b = Template.Slot 1 and n = Template.Slot 2 in
+  let rows = Template.Slot 3
+  and dst_pitch = Template.Slot 4
+  and src_pitch = Template.Slot 5 in
   template self t_acquire (Method.acquire a b);
   template self t_release (Method.release a b);
   template self t_copy_release (Method.copy_release a b);
   template self t_copy (Method.copy ~dst:a ~src:b n);
+  template self t_box
+    (Method.box ~dst:a ~src:b ~dst_pitch ~src_pitch ~rows n);
+  template self t_fill (Method.fill Four ~dst:a b n);
+  template self t_fill_bytes (Method.fill One ~dst:a b n);
   template self t_local (Method.local_memory a ~per_tpc:b);
   template self t_setup
     (Template.concat
@@ -893,7 +909,13 @@ let descriptors l base code per_thread (k : Cubin.kernel) =
   in
   let shared = { d with Abi.Qmd.shared = Some (Slot v_shared) } in
   let chain (d : Abi.Qmd.t) = { d with chain = Some (Slot v_next) } in
-  let qmds = List.map (Abi.Qmd.make l) [ d; chain d; shared; chain shared ] in
+  let released (d : Abi.Qmd.t) =
+    { d with releases = [ Abi.Qmd.Release (Slot v_word, Slot v_value) ] }
+  in
+  let qmds =
+    List.map (Abi.Qmd.make l)
+      [ d; chain d; shared; chain shared; released d; released shared ]
+  in
   let bank0_bytes =
     List.fold_left
       (fun n (b : Cubin.bank) -> if b.index = 0 then b.bytes else n)
@@ -1163,23 +1185,25 @@ let start (type m) ~word (p : m path) (module R : D.RELEASE) ~taken =
       if set_clock self source bar then Ok ()
       else Error "the GPU's timer could not be read"
     in
-    (* The private copy kernel. On sm_80, sm_86, sm_87 and sm_89, a copy of
-       at least 256 KiB between two of the device's own [Device] allocations
-       runs as this kernel on the compute channel (rig_nv_ring.c's
-       [kernel_copies] and [route]). Smaller copies, copies that touch host,
-       [Pinned], [Mapped] or a peer's memory, and every copy on other
-       architectures, run on the copy channel. The kernel's image takes
-       [Cubin.size] bytes of [Pinned] memory, and its descriptors lie in host
-       memory until the channels end. *)
+    (* The private copy and fill kernels. On sm_80, sm_86, sm_87 and sm_89,
+       a copy of one row of at least 256 KiB between two of the device's own
+       [Device] allocations, and a fill of as many bytes of one, run as these
+       kernels on the compute channel (rig_nv_ring.c's [kernel_copies] and
+       [route]). Smaller copies and fills, boxes of more rows, copies and
+       fills that touch host, [Pinned], [Mapped] or a peer's memory, and
+       every copy and fill on other architectures, run on the copy channel.
+       The kernels' image takes [Cubin.size] bytes of [Pinned] memory, and
+       their descriptors lie in host memory until the channels end. *)
     let* copy_kernel =
       match Copy_kernel.find (arch_of p.gpu.sm_version) with
       | None -> Ok None
       | Some bin ->
           let* c = Cubin.of_string bin in
           let k = Option.get (Cubin.kernel c "copy_bytes") in
+          let f = Option.get (Cubin.kernel c "fill_bytes") in
           let* code = alloc Pinned (Cubin.size c) "copy kernel" in
           let* code_host = host "copy kernel" code in
-          Ok (Some (c, k, code, code_host))
+          Ok (Some (c, k, f, code, code_host))
     in
     (* rig's word goes back with the device's mapping of it; rig frees a
        word of the device's own, with its page, once no queue waits on it. *)
@@ -1189,7 +1213,7 @@ let start (type m) ~word (p : m path) (module R : D.RELEASE) ~taken =
     in
     let owned =
       match copy_kernel with
-      | Some (_, _, code, _) -> code :: owned
+      | Some (_, _, _, code, _) -> code :: owned
       | None -> owned
     in
     let g = p.gpu in
@@ -1203,6 +1227,7 @@ let start (type m) ~word (p : m path) (module R : D.RELEASE) ~taken =
         key = p.key;
         index = p.index;
         reaches = p.reaches;
+        bus = p.bus;
         capability =
           {
             Abi.Gpu.compute_class = g.compute_class;
@@ -1237,13 +1262,16 @@ let start (type m) ~word (p : m path) (module R : D.RELEASE) ~taken =
     let* () =
       match copy_kernel with
       | None -> Ok ()
-      | Some (c, k, code, code_host) ->
-          let* l = Launch.make d.capability k in
+      | Some (c, k, f, code, code_host) ->
+          let* lk = Launch.make d.capability k in
+          let* lf = Launch.make d.capability f in
           let bytes = image_bytes c ~base:code.address in
-          (* This kernel has no stack, calls or local instructions. Its
+          (* These kernels have no stack, calls or local instructions. Their
              descriptors need none of the public launch's local reserve. *)
-          let launch = descriptors l code.address (code.address + k.code) 0 k in
-          install_copy self launch code_host bytes;
+          let launch l (k : Cubin.kernel) =
+            descriptors l code.address (code.address + k.code) 0 k
+          in
+          install_kernels self (launch lk k) (launch lf f) code_host bytes;
           Ok ()
     in
     Ok (T d)
@@ -1360,6 +1388,12 @@ let map_host (T d) a n =
   | Some map ->
       let m = placed Below_windows n (map a n) in
       Option.map (region d p None n) m
+
+(* rig asks only of the device's own regions. *)
+let dma (T d) (R r) ~fn =
+  match Type.Id.provably_equal d.key r.dev.key with
+  | None -> invalid_arg "Rig_nv.dma: another driver's region"
+  | Some Type.Equal -> (live d).path.dma r.mem ~fn
 
 (* Rings *)
 
@@ -1715,13 +1749,14 @@ let halt d l =
          l.sets)
   in
   let device = l.path.device in
+  (* The first set the RM does not free ends the frees: a GPU that cannot
+     free one frees none of the others either. *)
   let freed =
-    List.for_all Fun.id
-      (List.map
-         (fun s ->
-           freed l.path ~parent:device s.debugger
-           && freed l.path ~parent:device s.group)
-         l.sets)
+    List.for_all
+      (fun s ->
+        freed l.path ~parent:device s.debugger
+        && freed l.path ~parent:device s.group)
+      l.sets
   in
   (* No work on another device uses this GPU's memory once it is lost
      ([Rig]'s loss section), so their submissions stop reading its flush word

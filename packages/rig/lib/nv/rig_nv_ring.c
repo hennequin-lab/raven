@@ -16,10 +16,10 @@
    invalidation come after the waits, once every earlier value's work is
    done.
 
-   Routes: a copy within this device's Device memory from 256 KiB runs the
-   driver's copy kernel on COMPUTE, as a launch; every other part runs on
-   its queue's channel. Each part's route is decided once, before any word
-   is written.
+   Routes: a copy or a fill of one row within this device's Device memory
+   from 256 KiB runs the driver's copy or fill kernel on COMPUTE, as a
+   launch; every other part runs on its queue's channel. Each part's route is decided
+   once, before any word is written.
 
    Joins: a part that a later part on the other channel runs after (one
    its [after] names, or its queue's previous part), and a channel's last
@@ -31,7 +31,16 @@
    (COMPUTE when there is none, or when v's low 32 bits are 0) waits for
    the other channel's last part, then releases v into the timeline word:
    on COMPUTE a release that waits for the channel to be idle, on COPY a
-   release after its copies completed.
+   release after its copies completed. An untimed submission on COMPUTE
+   alone whose last part is a launch, of a value whose low 32 bits are not
+   0, has that launch's descriptor release v instead, as the launch
+   completes: the launch starts once every earlier launch of the
+   submission completed, chained or after a wait for idle. NVIDIA does not
+   state that a descriptor writes its 64-bit release as one store; with v's
+   low 32 bits not 0, v-1 and v share their high word, so one written in two
+   stores still moves the word from v-1 to v. That release leaves the
+   channel running, so the channel's next submission waits for
+   v first, as one after the other channel's release does.
 
    Order: the parts on one channel run in array order. COPY runs its copies
    one after another; on COMPUTE a part placed after launches the channel
@@ -60,10 +69,6 @@
 
 #include "rig_nv_stubs.h"
 
-/* The waits a submission may carry: rig_nv_room, which does not see
-   them, keeps room for this many on each channel. */
-#define MAX_WAITS 256
-
 static int other(int q) { return q == COMPUTE ? COPY : COMPUTE; }
 
 /* Segments */
@@ -79,13 +84,13 @@ static void close_segment(const struct device *d, struct channel *c) {
   c->open_words = 0;
 }
 
-/* Writes template [k] with the values [a], [b], [n] into the open segment
-   of [c]. A segment never wraps: one whose words would pass the ring's end,
-   including one that ends exactly there, is closed first, and the words go
-   at the start of the ring when they do not fit before its end. A segment
-   whose words would pass SEGMENT_BYTES_MAX is closed first too. */
-static void emit(const struct device *d, struct channel *c, int k, uint64_t a,
-                 uint64_t b, uint64_t n) {
+/* Writes template [k] with its [values] into the open segment of [c]. A
+   segment never wraps: one whose words would pass the ring's end, including
+   one that ends exactly there, is closed first, and the words go at the
+   start of the ring when they do not fit before its end. A segment whose
+   words would pass SEGMENT_BYTES_MAX is closed first too. */
+static void emit_values(const struct device *d, struct channel *c, int k,
+                        const uint64_t values[TEMPLATE_VALUES]) {
   const struct template *t = &d->t[k];
   uint64_t bytes = t->nbytes;
   if (4 * c->open_words + bytes > SEGMENT_BYTES_MAX) close_segment(d, c);
@@ -97,10 +102,16 @@ static void emit(const struct device *d, struct channel *c, int k, uint64_t a,
     c->open = c->written;
   }
   uint64_t at = c->written & (c->size - 1);
-  const uint64_t values[3] = {a, b, n};
   rig_nv_fill(t, values, c->segments + at);
   c->written += bytes;
   c->open_words += bytes / 4;
+}
+
+/* [emit_values] of template [k] with the values [a], [b], [n]. */
+static void emit(const struct device *d, struct channel *c, int k, uint64_t a,
+                 uint64_t b, uint64_t n) {
+  const uint64_t values[TEMPLATE_VALUES] = {a, b, n};
+  emit_values(d, c, k, values);
 }
 
 /* Copies [n] words of ring entries, two words each, low first, after the
@@ -133,17 +144,25 @@ static void reclaim(const struct device *d, struct channel *c,
   }
 }
 
-/* Below this size, launching the kernel costs more than the copy saves. */
+/* Below this size, launching a kernel costs more than it saves over the
+   copy engine, which writes bytes as fast whether it copies or fills. */
 enum { COPY_KERNEL_BYTES = 256 * 1024 };
 
-/* The copy kernel's parameters: destination, source and bytes. */
+/* The kernels' parameters: destination, then source or byte, then bytes. */
 enum { COPY_PARAMS = 3 * sizeof(uint64_t) };
 
-/* Whether the driver's copy kernel runs [p]: a copy within this device's
-   Device memory, large enough to pay for its launch. */
+/* The driver's kernel for the copy part [p], a copy or a fill, if it has
+   one. */
+static const struct launch *kernel_of(const struct device *d,
+                                      const struct rig_part *p) {
+  return p->copy.fill ? d->fill_launch : d->copy_launch;
+}
+
+/* Whether the driver's kernel runs [p]: a copy or a fill of one row within
+   this device's Device memory, large enough to pay for its launch. */
 static int kernel_copies(const struct device *d, const struct rig_part *p) {
-  return p->kind == RIG_COPY && p->copy.device_memory &&
-         p->copy.bytes >= COPY_KERNEL_BYTES && d->copy_launch != NULL;
+  return p->kind == RIG_COPY && p->copy.rows == 1 && p->copy.device_memory &&
+         p->copy.width >= COPY_KERNEL_BYTES && kernel_of(d, p) != NULL;
 }
 
 /* Decides the routes of [p]'s parts into [r], the submission's scratch. The
@@ -224,7 +243,8 @@ static int runs(const struct rig_part *p, int n, const uint8_t *args) {
     if (x->queue != COMPUTE && x->queue != COPY) return 0;
     if (x->kind != RIG_WORDS && x->kind != RIG_COPY && x->kind != RIG_LAUNCH)
       return 0;
-    if (x->kind == RIG_COPY && x->copy.bytes > 0 && x->queue != COPY)
+    if (x->kind == RIG_COPY && x->copy.width > 0 && x->copy.rows > 0 &&
+        x->queue != COPY)
       return 0;
     if (x->kind == RIG_LAUNCH &&
         (x->queue != COMPUTE || x->launch.launch == NULL ||
@@ -239,6 +259,43 @@ static int runs(const struct rig_part *p, int n, const uint8_t *args) {
 
 static uint64_t bytes_of(const struct device *d, int k) {
   return d->t[k].nbytes;
+}
+
+static uint64_t ceil_div(uint64_t n, uint64_t k) { return (n + k - 1) / k; }
+
+/* A fill of [n] bytes at [dst] as the copy engine runs it: [*head] bytes of
+   one-byte components up to a multiple of 4, [*body] bytes of four-byte
+   components, then the [*tail] bytes left, at most three. */
+static void fill_split(uint64_t dst, uint64_t n, uint64_t *head,
+                       uint64_t *body, uint64_t *tail) {
+  uint64_t h = (4 - (dst & 3)) & 3;
+  if (h > n) h = n;
+  *head = h;
+  *body = (n - h) & ~(uint64_t)3;
+  *tail = n - h - *body;
+}
+
+/* Whether the copy part [p] goes as multi-line launches of up to LINES_MAX
+   rows each: it has rows, each fits one launch, and its pitches fit the
+   launch's fields. A run goes as single lines, as NVIDIA's UVM driver
+   issues them. */
+static int multi_line(const struct rig_part *p) {
+  return p->copy.rows > 1 && p->copy.width <= COPY_MAX &&
+         p->copy.src_pitch <= LINES_MAX && p->copy.dst_pitch <= LINES_MAX;
+}
+
+/* The bytes of the templates [place_copy] places for the copy part [p]. */
+static uint64_t copy_bytes(const struct device *d, const struct rig_part *p) {
+  uint64_t width = p->copy.width, rows = p->copy.rows;
+  if (width == 0 || rows == 0) return 0;
+  if (p->copy.fill) {
+    uint64_t head, body, tail;
+    fill_split(p->copy.dst + p->copy.dst_offset, width, &head, &body, &tail);
+    return (uint64_t)((head > 0) + (tail > 0)) * bytes_of(d, T_FILL_BYTES) +
+           ceil_div(body, COPY_MAX) * bytes_of(d, T_FILL);
+  }
+  if (multi_line(p)) return ceil_div(rows, LINES_MAX) * bytes_of(d, T_BOX);
+  return rows * ceil_div(width, COPY_MAX) * bytes_of(d, T_COPY);
 }
 
 /* The channel that releases [v]: the last part's, or COMPUTE when there is
@@ -277,14 +334,15 @@ static uint64_t end_bytes(const struct device *d, int q) {
   return release_bytes(d, q) + stamp_bytes(d, q);
 }
 
-/* Adds what channel [q] takes when a submission uses it, besides its parts:
-   the words a channel may owe, its first stamp, MAX_WAITS waits, and a wrap
-   of the segment ring that wastes a template's words and splits a
-   segment. */
-static void channel_cost(const struct device *d, int q, struct cost *k) {
+/* Adds what channel [q] takes when a submission of [nwaits] waits uses it,
+   besides its parts: the words a channel may owe, its first stamp, the wait
+   for the value before and for the other channel, the waits, and a wrap of
+   the segment ring that wastes a template's words and splits a segment. */
+static void channel_cost(const struct device *d, int q, int nwaits,
+                         struct cost *k) {
   k->entries[q] += 3;
   k->bytes[q] += stamp_bytes(d, q) +
-                 (2 + MAX_WAITS) * bytes_of(d, T_ACQUIRE) +
+                 (2 + (uint64_t)nwaits) * bytes_of(d, T_ACQUIRE) +
                  bytes_of(d, q == COMPUTE ? T_SETUP : T_SETUP_COPY) +
                  4 * TEMPLATE_WORDS;
   if (q == COMPUTE)
@@ -294,16 +352,16 @@ static void channel_cost(const struct device *d, int q, struct cost *k) {
 /* Adds what a part on channel [q] takes that places [words] ring words,
    waits for [joins] parts of the other channel, schedules a launch of a
    [qmd]-byte descriptor and a [bank]-byte constant bank (both 0 for none),
-   and copies [pieces] pieces of at most COPY_MAX bytes. Its ring words
+   and places [copies] bytes of the copy engine's launches. Its ring words
    take an entry each two, after the entry that closes the segment before
    them; the driver's own words go into segments, whose closes
    [segment_closes] counts. */
 static void part_cost(const struct device *d, int q, uint64_t words,
                       uint64_t joins, uint64_t qmd, uint64_t bank,
-                      uint64_t pieces, struct cost *k) {
+                      uint64_t copies, struct cost *k) {
   if (words > 0) k->entries[q] += 1 + words / 2;
-  k->bytes[q] += joins * bytes_of(d, T_ACQUIRE) +
-                 pieces * bytes_of(d, T_COPY) + release_bytes(d, q);
+  k->bytes[q] +=
+      joins * bytes_of(d, T_ACQUIRE) + copies + release_bytes(d, q);
   if (qmd + bank > 0) {
     k->bytes[q] += bytes_of(d, T_SCHEDULE);
     k->launched += qmd + bank;
@@ -319,10 +377,12 @@ static uint64_t segment_closes(uint64_t bytes) {
   return bytes / (SEGMENT_BYTES_MAX / 2);
 }
 
-/* What [p], routed by [routes], takes, with the most a wrap past the launch
-   ring's end wastes: the largest of its launches' descriptors and banks. */
-static struct cost need(const struct device *d, const struct route *routes,
-                        const struct rig_part *p, int n) {
+/* What [p], routed by [routes], takes after [nwaits] waits, with the most a
+   wrap past the launch ring's end wastes: the largest of its launches'
+   descriptors and banks. */
+static struct cost need(const struct device *d, int nwaits,
+                        const struct route *routes, const struct rig_part *p,
+                        int n) {
   uint64_t v = atomic_load_explicit(&d->last, memory_order_relaxed) + 1;
   int r = releaser(routes, n, v);
   int used[CHANNELS] = {0, 0};
@@ -334,15 +394,15 @@ static struct cost need(const struct device *d, const struct route *routes,
     int q = x->channel;
     used[q] = 1;
     const struct launch *l = NULL;
-    uint64_t params = 0, qmd = 0, bank = 0, pieces = 0;
+    uint64_t params = 0, qmd = 0, bank = 0, copies = 0;
     if (p[i].kind == RIG_LAUNCH) {
       l = p[i].launch.launch;
       params = p[i].launch.args.params;
     } else if (x->kernel) {
-      l = d->copy_launch;
+      l = kernel_of(d, &p[i]);
       params = COPY_PARAMS;
     } else if (p[i].kind == RIG_COPY)
-      pieces = (p[i].copy.bytes + COPY_MAX - 1) / COPY_MAX;
+      copies = copy_bytes(d, &p[i]);
     if (l != NULL) {
       qmd = l->qmd[0][0].nbytes + QMD_ALIGN - 1;
       bank = bank_bytes(l, params) + BANK_ALIGN - 1;
@@ -350,10 +410,10 @@ static struct cost need(const struct device *d, const struct route *routes,
       if (bank > wasted) wasted = bank;
     }
     part_cost(d, q, words_of(&p[i]),
-              (uint64_t)p[i].nafter + (x->join >= 0), qmd, bank, pieces, &k);
+              (uint64_t)p[i].nafter + (x->join >= 0), qmd, bank, copies, &k);
   }
   for (int q = 0; q < CHANNELS; q++)
-    if (used[q]) channel_cost(d, q, &k);
+    if (used[q]) channel_cost(d, q, nwaits, &k);
   k.bytes[r] += end_bytes(d, r);
   for (int q = 0; q < CHANNELS; q++)
     k.entries[q] += segment_closes(k.bytes[q]);
@@ -479,12 +539,12 @@ static void ask(const struct device *d, const struct cost *k) {
       k->launched > d->ch[COMPUTE].launches_size ? k->launched : 0;
 }
 
-int rig_nv_room(void *self, const struct rig_part *p, int n,
+int rig_nv_room(void *self, int nwaits, const struct rig_part *p, int n,
                 void *scratch, const uint8_t *args) {
   struct device *d = ((struct rig_nv_edge *)self)->d;
   if (!runs(p, n, args)) return RIG_NEVER;
   route(d, scratch, p, n);
-  struct cost k = need(d, scratch, p, n);
+  struct cost k = need(d, nwaits, scratch, p, n);
   if (!enters(ENTRIES_MAX, ENTRIES_MAX, &k)) return RIG_NEVER;
   if (!holds(d, &k)) install(d);
   if ((d->draining || !entered(d, &k)) &&
@@ -788,17 +848,31 @@ static void values_of(const struct rig_block *b, uint64_t bank, uint64_t *v) {
   v[V_NEXT] = 0;
 }
 
-/* Writes [o]'s descriptor, chaining the descriptor at [next] if not 0, and
-   leaves no launch open. Built on the stack, then copied, so that the
-   ring's memory is only written. */
-static void settle(const struct channel *c, struct pending *o, uint64_t next) {
-  if (o->l == NULL) return;
+/* Writes [o]'s descriptor from [s], and leaves no launch open. Built on
+   the stack, then copied, so that the ring's memory is only written. */
+static void write_qmd(const struct channel *c, struct pending *o,
+                      const struct template *s) {
   uint8_t w[STRUCTURE_BYTES];
-  o->v[V_NEXT] = next == 0 ? 0 : gpu_at(c, next);
-  const struct template *s = &o->l->qmd[o->v[V_SHARED] > 0][next != 0];
   rig_nv_fill(s, o->v, w);
   memcpy(host_at(c, o->qmd), w, s->nbytes);
   o->l = NULL;
+}
+
+/* Writes [o]'s descriptor, chaining the descriptor at [next] if not 0. */
+static void settle(const struct channel *c, struct pending *o, uint64_t next) {
+  if (o->l == NULL) return;
+  o->v[V_NEXT] = next == 0 ? 0 : gpu_at(c, next);
+  write_qmd(c, o, &o->l->qmd[o->v[V_SHARED] > 0][next != 0]);
+}
+
+/* Writes [o]'s descriptor, which writes [v] at [word] as its launch
+   completes. */
+static void settle_releasing(const struct channel *c, struct pending *o,
+                             uint64_t word, uint64_t v) {
+  o->v[V_NEXT] = 0;
+  o->v[V_WORD] = word;
+  o->v[V_VALUE] = v;
+  write_qmd(c, o, &o->l->released[o->v[V_SHARED] > 0]);
 }
 
 /* Places a launch of [l] over [b] on COMPUTE, after [waited] says its part
@@ -842,8 +916,8 @@ static void launch(struct submission *s, const struct rig_part *p,
   rig_params(params, &a, args, slots);
 }
 
-/* Each thread copies vectors in a grid-stride loop; a bounded grid makes a
-   large copy take a fixed amount of scheduling work. */
+/* Each thread copies or sets vectors in a grid-stride loop; a bounded grid
+   makes a large copy take a fixed amount of scheduling work. */
 #define COPY_THREADS 256
 #define COPY_GROUPS 256
 #define COPY_VECTOR_BYTES 16
@@ -851,29 +925,71 @@ static void launch(struct submission *s, const struct rig_part *p,
 static void copy_compute(struct submission *s, const struct rig_part *p,
                          int waited) {
   uint64_t width = COPY_THREADS * COPY_VECTOR_BYTES;
-  uint64_t groups = (p->copy.bytes + width - 1) / width;
+  uint64_t groups = (p->copy.width + width - 1) / width;
   struct rig_block b = {
       .groups = {groups < COPY_GROUPS ? (uint32_t)groups : COPY_GROUPS, 1, 1},
       .threads = {COPY_THREADS, 1, 1}};
-  uint64_t params[3] = {p->copy.dst + p->copy.dst_offset,
-                        p->copy.src + p->copy.src_offset, p->copy.bytes};
-  memcpy(dispatch(s, s->d->copy_launch, &b, sizeof params, waited), params,
+  uint64_t from =
+      p->copy.fill ? p->copy.byte : p->copy.src + p->copy.src_offset;
+  uint64_t params[3] = {p->copy.dst + p->copy.dst_offset, from, p->copy.width};
+  memcpy(dispatch(s, kernel_of(s->d, p), &b, sizeof params, waited), params,
          sizeof params);
 }
 
-/* Places the words or the copy engine's copies of [p] on [c]. */
+/* Places on [c] the copy engine's fill of [n] bytes of [byte] at [dst],
+   as [fill_split] cuts it, the body in launches of at most COPY_MAX
+   bytes. */
+static void place_fill(const struct device *d, struct channel *c,
+                       uint64_t dst, uint8_t byte, uint64_t n) {
+  uint64_t head, body, tail;
+  fill_split(dst, n, &head, &body, &tail);
+  if (head > 0) emit(d, c, T_FILL_BYTES, dst, byte, head);
+  for (uint64_t at = 0; at < body; at += COPY_MAX) {
+    uint64_t k = body - at < COPY_MAX ? body - at : COPY_MAX;
+    emit(d, c, T_FILL, dst + head + at, byte * UINT64_C(0x01010101), k / 4);
+  }
+  if (tail > 0) emit(d, c, T_FILL_BYTES, dst + head + body, byte, tail);
+}
+
+/* Places on [c] the copy engine's launches for the copy part [p]: a box as
+   multi-line launches of up to LINES_MAX rows ([multi_line]), and a run,
+   or a box whose row or pitch exceeds a launch's fields, as launches of one
+   line of at most COPY_MAX bytes each. */
+static void place_copy(const struct device *d, struct channel *c,
+                       const struct rig_part *p) {
+  uint64_t dst = p->copy.dst + p->copy.dst_offset;
+  uint64_t width = p->copy.width, rows = p->copy.rows;
+  if (width == 0 || rows == 0) return;
+  if (p->copy.fill) {
+    place_fill(d, c, dst, p->copy.byte, width);
+    return;
+  }
+  uint64_t src = p->copy.src + p->copy.src_offset;
+  uint64_t sp = p->copy.src_pitch, dp = p->copy.dst_pitch;
+  if (multi_line(p)) {
+    for (uint64_t r = 0; r < rows; r += LINES_MAX) {
+      uint64_t k = rows - r < LINES_MAX ? rows - r : LINES_MAX;
+      const uint64_t v[TEMPLATE_VALUES] = {dst + r * dp, src + r * sp, width,
+                                           k, dp, sp};
+      emit_values(d, c, T_BOX, v);
+    }
+    return;
+  }
+  for (uint64_t r = 0; r < rows; r++)
+    for (uint64_t at = 0; at < width; at += COPY_MAX) {
+      uint64_t n = width - at < COPY_MAX ? width - at : COPY_MAX;
+      emit(d, c, T_COPY, dst + r * dp + at, src + r * sp + at, n);
+    }
+}
+
+/* Places the words or the copy engine's launches of [p] on [c]. */
 static void place(struct device *d, struct channel *c,
                   const struct rig_part *p) {
   if (p->kind == RIG_WORDS) {
     put_entries(d, c, p->words.at, p->words.n);
     return;
   }
-  uint64_t dst = p->copy.dst + p->copy.dst_offset;
-  uint64_t src = p->copy.src + p->copy.src_offset;
-  for (uint64_t at = 0; at < p->copy.bytes; at += COPY_MAX) {
-    uint64_t n = p->copy.bytes - at < COPY_MAX ? p->copy.bytes - at : COPY_MAX;
-    emit(d, c, T_COPY, dst + at, src + at, n);
-  }
+  place_copy(d, c, p);
 }
 
 int rig_nv_submit(void *self, uint64_t v, const struct rig_wait *waits,
@@ -924,15 +1040,20 @@ int rig_nv_submit(void *self, uint64_t v, const struct rig_wait *waits,
       }
     }
   }
-  settle(compute, &s.open, 0);
-  enter(&s, r);
   int o = other(r);
-  if (s.used[o])
-    emit(d, &d->ch[r], T_ACQUIRE, JOIN_GPU(d, o), joined(&s, last[o]), 0);
-  if (s.timed != NULL)
-    stamp(d, r, records(d, s.timed) + offsetof(struct stamps, end), v);
-  signal_word(d, r, d->word_gpu, v);
-  d->ch[r].released = v;
+  if (r == COMPUTE && s.open.l != NULL && !s.used[o] && s.timed == NULL &&
+      (uint32_t)v != 0)
+    settle_releasing(compute, &s.open, d->word_gpu, v);
+  else {
+    settle(compute, &s.open, 0);
+    enter(&s, r);
+    if (s.used[o])
+      emit(d, &d->ch[r], T_ACQUIRE, JOIN_GPU(d, o), joined(&s, last[o]), 0);
+    if (s.timed != NULL)
+      stamp(d, r, records(d, s.timed) + offsetof(struct stamps, end), v);
+    signal_word(d, r, d->word_gpu, v);
+    d->ch[r].released = v;
+  }
   for (int q = 0; q < CHANNELS; q++) {
     if (!s.used[q]) continue;
     struct channel *c = &d->ch[q];

@@ -217,6 +217,12 @@ val arch : t -> string
     such as ["gfx1100"], ["sm_89"] or ["Apple7"]; the machine's instruction
     set for a host, ["arm64"] or ["x86_64"]; and [""] for an io device. *)
 
+val bus : t -> string option
+(** [bus d] is the bus address of [d]'s PCI function on its machine, such as
+    ["0000:03:00.0"], as its driver states it ({!Rig_edge.type-facts}), or
+    [None] for a device that has none: {!host}, a memory device, an io
+    device, a Metal device and a device of another machine. *)
+
 val computes : t -> bool
 (** [computes d] is [true] iff [d] runs work, as every device but an io
     device does. *)
@@ -294,9 +300,11 @@ val reaches : t -> t -> bool
 
 (** {1:timeline Timelines}
 
-    {!submit} assigns the values of a device's timeline, and so do
-    {!Buffer.copy} and {!Image.load} for the copies the device runs, in the
-    order the device accepts the work, whichever domain submits it. The
+    {!submit} assigns the values of a device's timeline, and so do the
+    copies and fills of {!Buffer.section-copying} and {!Image.load} for the
+    work the device runs, and {!Buffer.submit_copy} and {!Buffer.submit_fill}
+    on {!host} for a copy or fill the host makes, in the order the device
+    accepts the work, whichever domain submits it. The
     device's {e submitted} value is the last value assigned on its timeline
     ({!submitted}). A device reports the values it has reached
     ({!signaled}), and a lost device may report more ({!section-loss}).
@@ -368,7 +376,11 @@ val signaled : t -> int
 (** [signaled d] is the last value [d] has reported. While [d] is live,
     [d] has reached it, and the writes of the work up to it are visible to
     the host. On a lost [d] it may move on to dropped values
-    ({!section-loss}). It commits no work and waits for no work
+    ({!section-loss}). Where [d]'s driver keeps a word of its own
+    ({!Rig_edge.type-facts}), [signaled] on a lost [d] runs its owed stop
+    if it can ({!section-stops}), and reads that word once the stop has
+    returned. Otherwise, and inside a lock ({!section-domains}), it answers
+    the last value read. It commits no work and waits for no work
     ({!section-timeline}).
 
     Raises {!Lost} if reading the value through [d]'s driver loses [d], as
@@ -396,10 +408,11 @@ val signaled : t -> int
        {!Point.reached}[ p] answers [true], follows [p]'s work.
        {!Buffer.read}'s function follows every device's last write of the
        buffer's memory, and {!Buffer.write}'s every use of it, as host code
-       after {!Buffer.wait}[ b Read] or [b Read_write] does. {!Buffer.copy},
-       {!Buffer.blit_to_bytes}, {!Buffer.blit_from_string} and
-       {!Buffer.fill} order themselves the same way, as work that reads the
-       buffer they copy from and writes the buffer they write.}
+       after {!Buffer.wait}[ b Read] or [b Read_write] does.
+       {!Buffer.submit_copy}, {!Buffer.copy}, {!Buffer.blit_to_bytes},
+       {!Buffer.blit_from_string}, {!Buffer.submit_fill} and {!Buffer.fill}
+       order their work the same way, as work that reads the buffer they
+       copy from and writes the buffer they write.}
     {- {e Host writes.} Work submitted after a host write to memory that its
        device addresses sees the write. For another GPU's memory that the
        device addresses through a borrow, this rests on peer access between
@@ -469,7 +482,7 @@ val signaled : t -> int
     they are. A function that takes no lock may be called from a callback at
     any point, and never raises it: {!name}, {!equal}, {!pp}, {!arch},
     {!computes}, {!runs_on_host}, {!alignment}, {!capability},
-    {!host_of}, {!reaches}, {!submitted}, {!signaled}, {!lost}, {!failure},
+    {!host_of}, {!reaches}, {!submitted}, {!lost}, {!failure},
     {!budget}, {!allocated}, {!Point.device}, {!Point.value},
     {!Point.reached}, {!Point.pp}, the properties and low-level values of
     {!Buffer}, {!Buffer.view}, {!Buffer.reached}, {!Buffer.of_bigarray},
@@ -477,7 +490,8 @@ val signaled : t -> int
     {!Image.threads}, {!Image.entry}, {!Submission}'s refs and parts,
     {!Submission.block}, {!Submission.address}, {!Submission.Run},
     {!Claim}, {!Profile} but {!Profile.take}, {!Local.new_key}, and
-    {!Local.get} of a value already made for the device. Nor does {!fail}.
+    {!Local.get} of a value already made for the device. Nor do
+    {!signaled} and {!fail}.
     Outside a lock, a call from a callback runs as any call does.
     If the callback lets the exception escape, it ends the interrupted call as
     an asynchronous exception ({!section-errors}). The callback must not block
@@ -595,19 +609,20 @@ val signaled : t -> int
     In a child of [fork], every driver's device inherited from the parent is
     lost, with the reason ["forked"] unless it was lost before, and its
     points count as never reached. The child never calls that device's
-    driver, and a submission on it made before the fork keeps nothing: the
-    child's next call on the device lets go of the value it keeps, without
-    waiting for its work. A value kept by a submission on {!host} returns as
-    in any process, so one kept after work a thread of the parent was
-    submitting on {!host} at the fork stays until the child's next submit
-    on {!host}. rig leaves a live io device as it was, and its library
-    decides what a fork does to it, as a child of [fork] keeps the open
-    files of its parent. An io device whose stop has not returned at the
-    fork, owed or under way, stays lost in the child, which runs no stop of
-    it and frees none of its memory, since that stop is the parent's. The
-    host's staging memory that a thread of the parent was copying through
-    at the fork ({!Buffer.section-copying}) stays in the child for good. A
-    device the child opens is its own. *)
+    driver, and a submission on it made before the fork keeps nothing: once
+    the submission is collected, the child's next call that moves collected
+    memory ({!section-reclaim}), on any device, lets go of the value it
+    keeps, without waiting for its work. A value kept by a submission on
+    {!host} returns as in any process, so one kept after work a thread of
+    the parent was submitting on {!host} at the fork stays until the
+    child's next submit on {!host}. rig leaves a live io device as it was,
+    and its library decides what a fork does to it, as a child of [fork]
+    keeps the open files of its parent. An io device whose stop has not
+    returned at the fork, owed or under way, stays lost in the child, which
+    runs no stop of it and frees none of its memory, since that stop is the
+    parent's. The host's staging memory that a thread of the parent was
+    copying through at the fork ({!Buffer.section-copying}) stays in the
+    child for good. A device the child opens is its own. *)
 
 (** {2:errors Errors and failure}
 
@@ -698,7 +713,7 @@ val failure : unit -> string option
        new buffer over it waits for no work of its earlier use.}
     {- {e Release.} Cached memory returns to the driver when the cache is
        freed ({!free_cache}), when the budget is lowered ({!set_budget}), or
-       when an allocation needs the room. Staging memory that no copy uses
+       when an allocation needs the room. Staging memory that no copy holds
        ({!Buffer.section-copying}) returns at these times too, once the work
        that used it is done. An allocation that finishes waiting while its
        device holds more than its budget skips the cache, as does an io
@@ -709,17 +724,20 @@ val failure : unit -> string option
 
     Collected memory moves to the cache or the driver only inside rig's
     calls, on any domain. {!Buffer.create}, {!Buffer.of_string},
-    {!Buffer.of_io} and {!Buffer.copy} first move the collected memory whose
+    {!Buffer.of_io}, {!Buffer.submit_copy} and {!Buffer.copy} first move the
+    collected memory whose
     points are reached or dropped on the devices they use, and let go of the
     values that collected submissions on those devices keep, once the work
     submitted on the device before the first such call after the collection
     is done, also when they then raise {!Lost}. {!free_cache} moves memory
     on its device, reclamation on every device, and a lost device's stop on
     its own. Each of these moves first releases the holds collected on any
-    device ({!Claim.hold}). Memory collected while a
-    domain blocks returns through other domains' calls. A device reports its
-    values up to [k] values late ({!section-timeline}), and memory and kept
-    values return by what it reports.
+    device ({!Claim.hold}), and moves the memory and lets go of the kept
+    values collected on any device whose stop returned, such as a closed
+    one. Memory collected while a domain blocks returns through other
+    domains' calls. A device reports its values up to [k] values late
+    ({!section-timeline}), and memory and kept values return by what it
+    reports.
 
     A device's {e budget} is the most bytes it holds at one time of the
     memory that counts in it: its live buffers, its loaded images' code and
@@ -750,7 +768,7 @@ val failure : unit -> string option
     {- An allocation that its budget or its driver refuses first reclaims.
        rig frees the cached memory charged to that budget, waits for the work
        that holds back other collected memory, from the second round on
-       returns staging memory that no copy uses and runs the collector, and
+       returns staging memory that no copy holds and runs the collector, and
        tries again. The allocation raises {!Out_of_memory}
        after three such rounds.}
     {- A growth of a device's queues ({!submit}) that its driver has no
@@ -775,7 +793,7 @@ val set_budget : t -> int -> unit
     Raises [Invalid_argument] if [n < 0]. *)
 
 val free_cache : t -> unit
-(** [free_cache d] first returns [d]'s staging memory that no copy uses
+(** [free_cache d] first returns [d]'s staging memory that no copy holds
     ({!Buffer.section-copying}), then moves [d]'s collected memory
     ({!section-reclaim}), then returns [d]'s cached memory to its driver
     once the work using it is done. On a lost [d] that has stopped
@@ -914,9 +932,9 @@ module Buffer : sig
       allocation shares one mapping, which lasts until the allocation
       returns or [d] has stopped. A borrow of an io device's memory is its
       pages, whose reads by the host or by work are as the io device states
-      once the object behind them changes, such as the end of the process
-      by [SIGBUS] for a truncated file ([Rig_disk]). A copy reads such
-      memory through the io device ({!section-copying}).
+      once the object behind them changes, such as a file that a truncation
+      cut short ([Rig_disk]). A copy reads such memory through the io device
+      ({!section-copying}).
 
       Raises [Invalid_argument] if [b] is dead or, on a device other than
       [b]'s, a {!Claim.with_} holds its memory exclusive; {!Lost} if [d] is
@@ -1089,11 +1107,11 @@ module Buffer : sig
       A copy is ordered as work that reads its source and writes its
       destination. Where the host addresses both sides, or one side is an io
       device's memory and the host addresses the other, the host or the io
-      device copies, and no timeline gets a value. Otherwise a device copies
-      on its {e copy engine}, the queue that its driver names in
-      [copy_engine] ({!Rig_edge.type-facts}), and the copy takes the next
-      value of that device's timeline ({!Rig.submitted}). On another machine,
-      a device of that machine copies.
+      device copies. Otherwise a device copies on its {e copy engine}, the
+      queue that its driver names in [copy_engine] ({!Rig_edge.type-facts}),
+      and the copy takes the next value of that device's timeline
+      ({!Rig.submitted}). On another machine, a device of that machine
+      copies.
 
       Memory an io device owns, its own or a borrow of its pages
       ({!borrow}), moves only through that io device's read or write. A
@@ -1106,23 +1124,38 @@ module Buffer : sig
 
       A copy that no device can run directly passes through {e staging
       memory}, host memory that rig makes in allocations of 32 MiB, each at
-      the first copy whose bytes need it. A copy uses one allocation, or two
-      for more than 32 MiB, that no other copy uses while it runs. Staging
-      memory so grows by 32 or 64 MiB for each copy running at once.
+      the first copy whose bytes need it. A copy holds one allocation, or two
+      for more than 32 MiB, until the transfers the host makes for it are
+      done. A copy of at most 32 MiB whose bytes the host writes into staging
+      memory puts them after the bytes earlier such copies put in an
+      allocation that no copy holds, where it has room, and waits for no work
+      there; once rig has seen that allocation's work done, it puts them at
+      its start. Where none has room, it takes an allocation whose work is
+      done, else the one whose bytes were placed from its start longest ago,
+      and waits for its work. A copy whose bytes a device writes into staging
+      memory takes an allocation whose work is done, or a new one, and no
+      copy puts bytes after them. Staging memory so grows by 32 or 64 MiB for
+      each copy holding it at once, and by as much for each copy whose bytes
+      a device wrote into it and whose work is still queued, or, on a device
+      whose word rig reads through its driver, until a wait reads it. A copy
+      of more than 32 MiB whose bytes the host writes waits before it reuses
+      one of its two allocations until the work that last read it is done;
+      where a device writes them, its queue waits.
 
       A copy's allocations serve the copies after it. Let [n] be the most
-      copies that have run through one staging memory at once. When a copy
-      returns, the allocations that none of the last [n] copies used return
-      as {!free} returns memory. Copies that run one after another, or
-      several at a time over and over, keep theirs.
+      allocations a staging memory has had at once. When a copy gives
+      its allocations back, every allocation that no copy holds and that no
+      copy took within the last [n] takes returns as {!free} returns memory.
+      Copies that run one after another, or several at a time over and over,
+      keep theirs.
 
-      Staging memory that no copy uses also returns with its device's
+      Staging memory that no copy holds also returns with its device's
       cache: at {!free_cache} of that device ({!host} for host memory), at a
       {!set_budget} that leaves the device over its budget, and from
       reclamation's second round ({!Rig.section-reclaim}). After copies to
-      many devices at once, their allocations so stay until [n] later copies
-      have run or one of these returns them. An allocation returns once the
-      work that used it is done.
+      many devices at once, their allocations so stay until [n] later
+      allocations have been taken or one of these returns them. An
+      allocation returns once the work that used it is done.
 
       A device that maps no host memory ([maps_host] in
       {!Rig_edge.type-facts}) stages through [Pinned] memory of its own,
@@ -1131,28 +1164,103 @@ module Buffer : sig
       from one device's staging memory into the other's.
 
       The blits copy between a buffer and an OCaml string or bytes, and
-      {!fill} sets a buffer's bytes. They are ordered as copies. Where the
-      host addresses the buffer ({!section-host_access}) and no io device
-      owns its memory, the host copies once the work the copy follows is
-      done. Otherwise the bytes pass
+      {!submit_fill} and {!fill} set a buffer's bytes. They are ordered as
+      copies. Where the host addresses the buffer ({!section-host_access})
+      and no io device owns its memory, the host copies or sets the bytes
+      once the work the copy follows is done. Otherwise the blits' bytes pass
       through staging memory, and a device copies them to or from the buffer
-      as {!copy} does. Each returns once its bytes are where they go.
+      as {!copy} does. A fill of memory an io device owns is the io device's
+      writes from host memory that holds the byte. Any other fill runs on the
+      copy engine of the buffer's device, or, for a borrow on a device that
+      runs no copy, of the device whose memory it borrows, and reads no
+      memory.
+
+      {!submit_copy} and {!submit_fill} return once their work is queued, as
+      {!Rig.submit} returns, with a point that is reached once the work is
+      done. {!copy}, {!fill} and the blits return once their bytes are where
+      they go.
 
       A copy, blit or fill holds a read claim on its buffers' memory until it
       returns, so that no donation writes the memory meanwhile
-      ({!Rig.section-claims}). *)
+      ({!Rig.section-claims}). Work that a copy left queued on a device holds
+      none, as no work on a device does: the stamps order a donation's write
+      after it. *)
+
+  type box = {
+    src_offset : int;  (** The byte of the source where the first row starts. *)
+    dst_offset : int;  (** The byte of the destination where it starts. *)
+    width : int;  (** The bytes of each row. *)
+    rows : int;  (** The number of rows. *)
+    src_pitch : int;
+        (** The bytes from the start of a row of the source to the start of
+            the next. *)
+    dst_pitch : int;  (** The same in the destination. *)
+  }
+  (** The type for boxes: [rows] rows of [width] bytes. Row [i] starts at
+      byte [src_offset + i * src_pitch] of the source and at byte
+      [dst_offset + i * dst_pitch] of the destination. A box {e fits} a
+      source and a destination when its fields are non-negative, each pitch
+      is at least [width], and, if it has bytes, its last row ends within
+      each side: [src_offset + (rows - 1) * src_pitch + width] is at most
+      the source's length, and likewise for the destination, computed
+      without overflow. A box of one row is a run of bytes ({!row}). *)
+
+  val row : ?src_offset:int -> ?dst_offset:int -> int -> box
+  (** [row ~src_offset ~dst_offset n] is the box of one row of [n] bytes,
+      at [src_offset] and [dst_offset] (default to [0]), with pitches of
+      [n]. *)
+
+  val submit_copy :
+    ?waits:Point.t array -> src:t -> dst:t -> box array -> Point.t
+  (** [submit_copy ~waits ~src ~dst boxes] copies the bytes of each box of
+      [boxes] from [src] into [dst], one box after the other, and is a point
+      that is reached once every byte is there. A byte of [dst] that two
+      boxes write holds the later box's byte. The copy follows the points of
+      [waits] (defaults to [[||]]) besides those its memory orders
+      ({!Rig.section-order}), and [submit_copy] reads [boxes] once.
+      {ul
+      {- Where a device copies directly, the copy is one submission on that
+         device. [submit_copy] returns once it is queued, and the point is
+         its point.}
+      {- Where the copy passes through staging memory, [submit_copy] returns
+         once the transfers the host makes are done and the others are
+         queued. The point is that of its last transfer, which follows the
+         others.}
+      {- Where the host or an io device copies, [submit_copy] returns once
+         the copy is done, and the point is a point of {!Rig.host} that is
+         reached. A copy of no bytes waits on the host for the points of
+         [waits] and returns such a point.}}
+      It blocks where {!Rig.submit} blocks, where the host copies after the
+      work the copy follows, where a transfer into staging memory waits for
+      the work that last read that memory, and where the host moves bytes
+      out of staging memory after a device's transfer into it, which it
+      waits for. So a copy from a device's memory into host memory that no
+      device borrows returns once its bytes are there. It allocates.
+
+      Memory outside the claims, such as a bigarray's ({!of_bigarray}) or
+      an exported array's ({!export}), is read and written by the copy until
+      its point is reached, so a program orders its own access through such
+      an array after the point.
+
+      Raises [Invalid_argument] if [src] or [dst] is dead, they overlap
+      ({!overlaps}), a box does not fit them, [dst] admits only [Read], one
+      side is an io device's memory and the other a borrow of it, a side's
+      memory is held exclusive, or the copy has bytes and no device can copy
+      between the two sides. Raises {!Lost} if a device that runs a transfer
+      is lost before its submission, or its submission loses it, or while
+      the host waits for a transfer it moves bytes after, or if a point of
+      [waits] is a lost device's and that device never reached it;
+      {!Out_of_memory} if staging memory cannot be allocated or mapped; and
+      what an io device's read or write raises. *)
 
   val copy : src:t -> dst:t -> unit
   (** [copy ~src ~dst] copies [src]'s bytes into [dst] and returns once they
-      are there.
+      are there: {!submit_copy}[ ~src ~dst [| row (length src) |]], then a
+      wait for its point, holding its read claims until it returns.
 
-      Raises [Invalid_argument] if [src] or [dst] is dead, they differ in
-      length or overlap ({!overlaps}), [dst] admits only [Read], one side is
-      an io device's memory and the other a borrow of it, a side's memory is
-      held exclusive, or the copy has bytes and no device can copy between
-      the two sides. Raises {!Lost} if a device that runs the copy is lost or
-      the copy loses it, {!Out_of_memory} if staging memory cannot be
-      allocated or mapped, and what an io device's read or write raises. *)
+      Raises [Invalid_argument] if they differ in length, and otherwise as
+      {!submit_copy} raises. Raises {!Lost} also if the copy is lost during
+      the wait. *)
 
   val blit_from_string : string -> int -> t -> int -> int -> unit
   (** [blit_from_string s i b j n] copies the [n] bytes of [s] from [i] into
@@ -1168,11 +1276,28 @@ module Buffer : sig
       Raises [Invalid_argument] if the ranges are not valid or [b] is dead,
       and otherwise as {!copy}[ ~src:b] raises. *)
 
-  val fill : t -> char -> unit
-  (** [fill b c] sets every byte of [b] to [c].
+  val submit_fill : ?waits:Point.t array -> t -> char -> Point.t
+  (** [submit_fill ~waits b c] sets every byte of [b] to [c], after the
+      points of [waits] (defaults to [[||]]), and is a point that is reached
+      once they are set, returned as {!submit_copy} returns it. The host sets
+      the bytes where it addresses [b], and writes them through the io
+      device for an io device's memory. Otherwise the copy engine of [b]'s
+      device sets them, reading no memory, or, where [b] is a borrow on a
+      device that runs no copy, the copy engine of the device whose memory it
+      borrows.
 
-      Raises [Invalid_argument] if [b] is dead or admits only [Read], and
-      otherwise as {!copy}[ ~dst:b] raises. *)
+      Raises [Invalid_argument] if [b] is dead or admits only [Read], its
+      memory is held exclusive, or [b] has bytes, the host does not address
+      it and no device sets them. Raises {!Lost} as {!submit_copy} does, and
+      what an io device's write raises. *)
+
+  val fill : t -> char -> unit
+  (** [fill b c] sets every byte of [b] to [c] and returns once they are
+      set: {!submit_fill}[ b c], then a wait for its point, holding its read
+      claim until it returns.
+
+      Raises as {!submit_fill} raises, and {!Lost} also if the fill is lost
+      during the wait. *)
 
   (** {1:low Low level}
 
@@ -1204,6 +1329,41 @@ module Buffer : sig
   val offset : t -> int
   (** [offset b] is the number of bytes of [b]'s memory before [b]'s first
       byte. *)
+
+  (** The type for how another PCI function of a buffer's machine, such as a
+      network adapter, reaches its memory by DMA ({!dma}). *)
+  type dma = Rig_edge.dma =
+    | Bus of (int * int) list
+        (** The memory's bus addresses on its machine, as (address, bytes)
+            pairs in order, each a multiple of 4096. They hold until the
+            process exits. *)
+    | Dmabuf of { fd : int; offset : int }
+        (** A new dma-buf file descriptor, close-on-exec, which the caller
+            owns and closes, and the offset of the allocation's first byte
+            in it. The dma-buf keeps the memory until its last reference
+            goes, such as a NIC's registration of it. *)
+
+  val dma : t -> fn:string -> (dma, string) result
+  (** [dma b ~fn] is how the PCI function at the bus address [fn] of [b]'s
+      machine, such as a network adapter, reaches the whole allocation [b]'s
+      memory lies in, which starts {!offset} bytes before [b]'s first byte,
+      as the driver of the device whose memory it is describes it, or
+      [Error why] where that driver cannot ({!Rig_edge.Driver.val-dma}). A
+      borrow's answer is its memory's owner's.
+
+      The memory is then outside the claims for good ({!Claim.share}), also
+      where the driver refused, and once described the allocation never
+      returns to its device's cache.
+
+      {b Warning.} No stamp records [fn]'s reads and writes. The caller lets
+      [fn] read the memory only once the work that last wrote it is reached,
+      and lets work use bytes [fn] wrote only after [fn]'s writes are done,
+      submitting that work afterwards. A [Dmabuf] descriptor is the caller's
+      to close.
+
+      Raises [Invalid_argument] if [b] is dead or empty, or is {!host}'s, a
+      memory device's or an io device's memory, or if a {!Claim.with_} holds
+      it exclusive, and {!Lost} if the device whose memory it is is lost. *)
 
   val handle : t -> nativeint
   (** [handle b] is the driver's object for [b]'s memory
@@ -1965,8 +2125,9 @@ end
     {- Memory that something outside rig can read or write is
        {e outside the claims}
        and never exclusive. This holds for memory {!Buffer.of_bigarray} and
-       {!Buffer.of_io} make, memory {!Buffer.export} exported, and memory
-       {!Claim.share} marked. Memory that admits only [Read]
+       {!Buffer.of_io} make, memory {!Buffer.export} exported, memory
+       {!Buffer.dma} described or refused, and memory {!Claim.share}
+       marked. Memory that admits only [Read]
        ({!Buffer.val-access}) is never exclusive either.}
     {- {!Claim.consume} consumes an allocation. A call that uses a dead
        buffer's bytes raises [Invalid_argument] with the reason given to the
@@ -2140,7 +2301,9 @@ module Profile : sig
             run, in the order of its parts, joined by [", "], or, with no
             launch, after its first part's kind, ["copies"], ["fills"] or
             ["words"]. A device whose driver cannot time a submission's work
-            records none of it.
+            records none of it, nor does one whose driver finds the work's
+            converted times outside the host's window around it, from the
+            submit to their conversion, by more than the driver states.
 
             Its driver converts the device's clock to the host's through
             measures of one against the other. A time's error is the
@@ -2191,8 +2354,9 @@ module Profile : sig
       }
         (** A transfer of [bytes] from [src]'s memory to [dst]'s: a copy part
             of a submission ({!Submission.copy}), rig's own and those of a
-            {!Buffer.copy} among them, or a copy the host or an io device
-            runs. [src] and [dst] are the devices in whose {!allocated} count
+            {!Buffer.submit_copy} among them, or a copy the host or an io
+            device runs. A box ({!Buffer.type-box}) records the bytes of its
+            rows. [src] and [dst] are the devices in whose {!allocated} count
             the memory the bytes leave and reach lies ({!section-reclaim}),
             or the device whose memory it is where it counts in none. So a
             {!Buffer.borrow} names the device whose memory it borrows, and
@@ -2206,7 +2370,10 @@ module Profile : sig
             and otherwise when {!take} reads that it is done, so the event
             then lasts at least as long as the copy. A copy through staging
             memory records each piece into and out of it, with {!host} as
-            one side, and no event of its own. *)
+            one side, and no event of its own. A fill
+            ({!Buffer.submit_fill}) moves no bytes from memory and records
+            none: where a device runs it, its submission's [Work] is named
+            ["copies"]. *)
 
   val take : (unit -> 'a) -> 'a * event list
   (** [take f] is [f ()] and the events recorded while it ran, in time order

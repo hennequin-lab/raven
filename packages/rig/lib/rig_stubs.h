@@ -126,7 +126,9 @@ static inline uint64_t rig_line_base(int index) {
    [closed] says that the list takes no more tokens, as its device's slot
    is being freed: a token counts itself before it reads [closed], and the
    free closes the list before it reads [count], so one of the two sees the
-   other. */
+   other. [ended] says that the device's stop returned, or that a fork
+   orphaned it: no call on the device is due, so a token linked from then
+   on asks a drain of any device to drain it. */
 struct release_node;
 
 struct release_list {
@@ -134,7 +136,13 @@ struct release_list {
   _Atomic(struct release_node *) hand;
   _Atomic intnat count;
   _Atomic int closed;
+  _Atomic int ended;
 };
+
+/* Marks [l]'s list ended, as its device's stop returned or a fork orphaned
+   it, and asks the next drain of any device to drain the devices whose
+   stop returned ([rig_heap.c]). */
+void rig_release_ended(struct release_list *l);
 
 /* A device's record, which lives as long as the program holds the device.
    The mutex guards [turn], [inside], the record of waits, the moves of the
@@ -277,9 +285,17 @@ int rig_sides_overlap(const struct rig_side *a, const struct rig_side *b);
 
 /* A copy part of a submission: its index and, for its source and its
    destination, the run's slot, or -1 for a buffer the submission names,
-   whose side is in [ends]. */
+   whose side is in [ends]. A fill, [fill] 1, sets its destination's bytes
+   to [byte] and has no source: [src] is -1 and [ends[0]] zero. A box,
+   [boxed] 1, copies the rows of [box] between its two buffers, whose
+   offsets it counts from each buffer's first byte; otherwise the copy is
+   of its whole source, of its destination's length. */
 struct rig_copy {
-  int part, src, dst;
+  int part, src, dst, fill, boxed;
+  uint8_t byte;
+  struct {
+    uint64_t src_offset, dst_offset, width, rows, src_pitch, dst_pitch;
+  } box;
   struct rig_side ends[2]; /* the source's, the destination's */
 };
 

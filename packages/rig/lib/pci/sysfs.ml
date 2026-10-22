@@ -17,12 +17,14 @@ type t = {
   lockdown : string;
   bus_files : string; (* rescan and drivers_probe *)
   vfio : string;
+  kernel : string -> string -> unit; (* a fixture's, acting on a write *)
 }
 
-let v root =
+let v ?(kernel = fun _ _ -> ()) root =
   let ( / ) = Filename.concat in
   {
     root;
+    kernel;
     devices = root / "sys/bus/pci/devices";
     groups = root / "sys/kernel/iommu_groups";
     lockdown = root / "sys/kernel/security/lockdown";
@@ -73,10 +75,12 @@ let read file =
 (* Writes [s] to [file] in one write, which sysfs takes whole or refuses. A
    buffered channel would see the refusal only at its close, which drops it.
    Sysfs ignores the truncation, as a shell's redirection relies on; a plain
-   file holds [s] alone after it. *)
-let put file s =
+   file holds [s] alone after it. [m]'s kernel acts on [s] before the write,
+   as Linux does inside it. *)
+let put m file s =
   let fd = Unix.openfile file [ O_WRONLY; O_TRUNC; O_CLOEXEC ] 0 in
   Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
+  m.kernel file s;
   ignore (Unix.single_write_substring fd s 0 (String.length s))
 
 let refused file (e : Unix.error) =
@@ -88,8 +92,8 @@ let refused file (e : Unix.error) =
         why
   | _ -> Fail.fail "%s" why
 
-let write file s =
-  try put file s with Unix.Unix_error (e, _, _) -> refused file e
+let write m file s =
+  try put m file s with Unix.Unix_error (e, _, _) -> refused file e
 
 let readlink link =
   try Unix.readlink link
@@ -235,6 +239,8 @@ let iommu_of m bus =
       let file = strf "%s/%s/type" m.groups g in
       if Sys.file_exists file && read file = "identity" then Identity
       else Translating
+
+let translates m bus = iommu_of m bus = Translating
 
 (* The kernel's lockdown file lists the modes with the current one in
    brackets. *)
@@ -396,7 +402,7 @@ let keep_off { files = m; bus; _ } ~remove =
   let s = state m bus in
   if s.iommu = Translating then begin
     Option.iter (Fail.fail "%s") (vfio_refusal m bus ~remove);
-    if s.driver <> Some vfio_pci then write (override m bus) vfio_pci
+    if s.driver <> Some vfio_pci then write m (override m bus) vfio_pci
   end
   else if s.driver <> Some vfio_pci then begin
     if (not remove) && s.siblings <> [] && s.bus_reset then begin
@@ -414,27 +420,50 @@ let keep_off { files = m; bus; _ } ~remove =
     let siblings = if remove then [] else s.siblings in
     let detached = { s with driver = None; siblings; enabled = true } in
     Result.iter_error (Fail.fail "%s") (addressing m bus detached);
-    write (override m bus) no_driver
+    write m (override m bus) no_driver
   end
 
 let unbind m f =
   match driver_of m f with
   | Some d when d <> vfio_pci ->
-      write (path m f "driver/unbind") f;
+      write m (path m f "driver/unbind") f;
       if driver_of m f <> None then
         Fail.fail "the driver %s stays bound to %s" d f
   | _ -> ()
+
+(* A GPU's kernel driver may read the driver data of its device's other
+   functions as its own driver's: NVIDIA's nv_audio_dynamic_power
+   (kernel-open/nvidia/nv.c) reads an audio function's as an ALSA card, and
+   walks vfio-pci's as one. An unbound function's is NULL, which it skips. So
+   a function's other functions leave vfio-pci before its kernel driver
+   probes or unbinds. Each keeps an override that names vfio-pci, so that a
+   change that fails after this leaves it for {!attach} to find. *)
+let release m f =
+  write m (override m f) vfio_pci;
+  if driver_of m f = Some vfio_pci then begin
+    write m (path m f "driver/unbind") f;
+    if driver_of m f <> None then
+      Fail.fail "the driver %s stays bound to %s" vfio_pci f
+  end
 
 (* A function detach leaves on no driver masters the bus no more: without an
    IOMMU it could write any host memory. Behind one that translates, the
    functions it moves stay unbound until {!bind}. The other functions go
    first, so that one whose driver stays bound leaves the GPU bound too,
-   which {!attach} gives back as it is. *)
+   which {!attach} gives back as it is. With [remove], one that vfio-pci
+   holds, as an attach that stopped part-way or an administrator leaves it,
+   is released before the function's kernel driver unbinds. *)
 let detach { files = m; bus; _ } ~remove =
   let s = state m bus in
+  (match s.driver with
+  | Some d when remove && d <> vfio_pci ->
+      List.iter
+        (fun f -> if driver_of m f = Some vfio_pci then release m f)
+        s.siblings
+  | _ -> ());
   (if s.iommu = Translating then begin
      let others = List.filter (( <> ) bus) (to_move m bus ~remove) in
-     List.iter (fun f -> write (override m f) vfio_pci) others;
+     List.iter (fun f -> write m (override m f) vfio_pci) others;
      List.iter (unbind m) others;
      unbind m bus
    end
@@ -444,9 +473,9 @@ let detach { files = m; bus; _ } ~remove =
   | Error _ -> (
       unbind m bus;
       if remove then
-        List.iter (fun s -> write (path m s "remove") "1") (siblings m bus);
+        List.iter (fun s -> write m (path m s "remove") "1") (siblings m bus);
       if driver_of m bus = None && not (enabled m bus) then
-        write (path m bus "enable") "1";
+        write m (path m bus "enable") "1";
       let s = state m bus in
       match (addressing m bus s, s) with
       | Ok _, _ -> ()
@@ -462,8 +491,8 @@ let detach { files = m; bus; _ } ~remove =
    probe. *)
 let bind { files = m; bus; _ } ~remove =
   let probe f =
-    write (override m f) vfio_pci;
-    write (Filename.concat m.bus_files "drivers_probe") f;
+    write m (override m f) vfio_pci;
+    write m (Filename.concat m.bus_files "drivers_probe") f;
     if driver_of m f <> Some vfio_pci then
       Fail.fail
         "vfio-pci did not take %s at its probe, for the reason the kernel's \
@@ -473,7 +502,7 @@ let bind { files = m; bus; _ } ~remove =
   in
   if iommu_of m bus = Translating then List.iter probe (to_move m bus ~remove)
 
-let reset m bus = write (path m bus "reset") "1"
+let reset m bus = write m (path m bus "reset") "1"
 
 (* A rescan brings back the functions [detach] removed. The function itself is
    on the bus already, so its driver is probed for it. A detach that stopped
@@ -481,42 +510,61 @@ let reset m bus = write (path m bus "reset") "1"
    its driver off it at the next probe. With [siblings], each other function of
    the device that vfio-pci holds or that its override keeps for vfio-pci, as a
    detach behind a translating IOMMU leaves it, goes back to its driver the
-   same way. *)
+   same way. Each is released before the function's probe, and has its
+   override cleared and its driver probed after it. An attach that fails at
+   the probe, as when the GPU's driver is not loaded, leaves them for the
+   next attach. *)
 let give_back m f =
-  if driver_of m f = Some vfio_pci then write (path m f "driver/unbind") f;
-  write (override m f) "\n";
-  write (Filename.concat m.bus_files "drivers_probe") f;
+  write m (override m f) "\n";
+  write m (Filename.concat m.bus_files "drivers_probe") f;
   if driver_of m f = None then
     Fail.fail "no kernel driver took %s; load its module first" f
 
 let attach { files = m; bus; _ } ~siblings:others =
+  let held =
+    if not others then []
+    else
+      List.filter
+        (fun f ->
+          driver_of m f = Some vfio_pci || read (override m f) = vfio_pci)
+        (siblings m bus)
+  in
+  List.iter (release m) held;
   (match driver_of m bus with
   | Some d when d <> vfio_pci ->
       if not (List.mem (read (override m bus)) [ ""; "(null)" ]) then begin
-        write (Filename.concat m.bus_files "rescan") "1";
-        write (override m bus) "\n"
+        write m (Filename.concat m.bus_files "rescan") "1";
+        write m (override m bus) "\n"
       end
   | bound ->
-      if bound = Some vfio_pci then write (path m bus "driver/unbind") bus;
-      if enabled m bus then write (path m bus "enable") "0";
-      write (Filename.concat m.bus_files "rescan") "1";
-      write (override m bus) "\n";
-      write (Filename.concat m.bus_files "drivers_probe") bus;
+      if bound = Some vfio_pci then write m (path m bus "driver/unbind") bus;
+      if enabled m bus then write m (path m bus "enable") "0";
+      write m (Filename.concat m.bus_files "rescan") "1";
+      write m (override m bus) "\n";
+      write m (Filename.concat m.bus_files "drivers_probe") bus;
       if driver_of m bus = None then
         Fail.fail "no kernel driver took %s; load its module first" bus);
-  if others then
-    List.iter
-      (fun f ->
-        if driver_of m f = Some vfio_pci || read (override m f) = vfio_pci then
-          give_back m f)
-      (siblings m bus)
+  List.iter (give_back m) held
 
 (* [resourceN_resize] holds a bitmap of the sizes BAR [N] supports, bit [k] for
    [2^k] MiB, and takes the [k] to set. A bridge whose window cannot hold a size
    refuses it with ENOSPC, and a smaller one may fit. A file the process may not
-   write is refused, naming it. Any other refusal holds for every size, so the
-   BAR keeps its own. The bitmap is an [int], whose highest bit is [largest]. *)
+   write is refused, naming it. Linux 6.12's other refusals hold for every size,
+   so the BAR keeps its own: EBUSY for a BAR in use, ENOTSUPP where the
+   firmware's assignment must stay or the function has no resizable BAR, ENOENT
+   where no bridge window can be released, ENOMEM, ENODEV for a function that
+   left the bus, and EINVAL where the boot console cannot leave a VGA function.
+   Any other errno comes from a mistake of this library's and raises. The
+   bitmap is an [int], whose highest bit is [largest]. *)
 let largest = Sys.int_size - 2
+
+(* Linux's own errno for an operation a device does not support, which [Unix]
+   does not name. *)
+let enotsupp = Unix.EUNKNOWNERR 524
+
+let keeps_size : Unix.error -> bool = function
+  | EBUSY | ENOENT | ENOMEM | ENODEV | EINVAL -> true
+  | e -> e = enotsupp
 
 let resize { files = m; bus; _ } i =
   let file = path m bus (strf "resource%d_resize" i) in
@@ -526,12 +574,13 @@ let resize { files = m; bus; _ } i =
       if k >= 0 then
         if sizes land (1 lsl k) = 0 then try_from (k - 1)
         else
-          match put file (string_of_int k) with
+          Fail.bug ("writing " ^ file) @@ fun () ->
+          match put m file (string_of_int k) with
           | () -> ()
           | exception Unix.Unix_error (ENOSPC, _, _) -> try_from (k - 1)
           | exception Unix.Unix_error (((EACCES | EPERM) as e), _, _) ->
               refused file e
-          | exception Unix.Unix_error _ -> ()
+          | exception Unix.Unix_error (e, _, _) when keeps_size e -> ()
     in
     try_from largest
 
@@ -723,6 +772,17 @@ let forwards ~provider ~client =
   match up false provider.nodes with
   | Some false -> true
   | Some true | None -> through_host ~provider ~client
+
+(* Two functions meet below a bridge both routes pass, a root port included,
+   else at their host bridge if they share one. *)
+type distance = Switch | Bridge | System
+
+let distance a b =
+  let bridges r = List.map fst (List.tl r.nodes) in
+  let theirs = bridges b in
+  if List.exists (fun n -> List.mem n theirs) (bridges a) then Switch
+  else if a.host = b.host then Bridge
+  else System
 
 (* Open devices *)
 

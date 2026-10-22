@@ -80,6 +80,8 @@ let path_of gpu : unit A.path =
     reaches = (fun _ -> unused ());
     map_peer = (fun _ -> unused ());
     free = (fun _ -> unused ());
+    bus = None;
+    dma = (fun _ ~fn:_ -> unused ());
     queue = (fun _ ~ring:_ ~bytes:_ ~read:_ ~write:_ -> unused ());
     retire = (fun _ -> unused ());
     most_ring = (fun _ -> unused ());
@@ -164,6 +166,21 @@ let load g bin =
       let r = Option.get (A.alloc g Device n) in
       let m, bytes = lay r in
       (m, r, bytes)
+
+(* [bin] as [load] lays it, its bytes copied to its memory's start on the copy
+   queue from [Pinned] memory, so that its kernels run. *)
+let placed g bin =
+  let m, r, bytes = load g bin in
+  let n = String.length bytes in
+  let src = Option.get (A.alloc g Pinned n) in
+  H.write (host src) bytes;
+  let v = A.signaled g + 1 in
+  (match E.submit g ~v [| E.copy ~dst:(address r) ~src:(address src) n |] with
+  | `Ok -> ()
+  | `Failed why -> fail why);
+  S.reached g v;
+  A.free g src;
+  (m, r)
 
 (* Misuse *)
 
@@ -575,11 +592,11 @@ let held_growth () =
   let out = Option.get (A.alloc g Pinned (4 * n)) in
   H.set64 (host flag) 0;
   H.write (host out) (String.make (4 * n) '\000');
+  let m, r = placed g (read_fixture "hidden_gfx1201.hsaco") in
+  let wide = found (A.entry m "wide") in
   let v = A.signaled g + 1 in
   equal answer ~msg:"the hold" `Ok
     (E.submit g ~v ~waits:[| (address flag, 1) |] [||]);
-  let m, r, _ = load g (read_fixture "hidden_gfx1201.hsaco") in
-  let wide = found (A.entry m "wide") in
   let params i = le64 (4 * i) ^ le32s [ i + 1; 0 ] in
   let launches =
     Array.init n (fun i ->
@@ -901,13 +918,43 @@ let wide_launches n =
   equal string ~msg:"the stored words" (tokens n)
     (stores_wide t (image ~of_:hidden_code t) n)
 
-(* Two domains submit to one device: launches of 8 KiB of arguments, from one
-   to past half of what its segment holds after two growths; words that do
-   nothing, past what its compute ring holds, then past what the ring the first
-   growth makes holds; and copies of 16 bytes, past what its copy ring holds.
-   Each submission runs whole, launches and copies storing their bytes,
-   whatever growth the other's needed. *)
-type grower = { t : S.t; wide : Rig.Image.t }
+(* Two domains submit to one device opened with first rings of 16 KiB and a
+   first segment of 32 KiB ([A.set_first_sizes]): launches of 8 KiB of
+   arguments, words that do nothing and copies of 16 bytes. A small draw is one
+   submission that fits; a past draw on a worker domain is two, each past what
+   the device's segment, compute ring or copy ring holds before it, so the
+   first grows that kind and the second grows it again, until it has grown to
+   16 times its first size. Each submission runs whole, launches and copies storing their bytes,
+   whatever growth the other's needed. A copy ring that keeps its first size
+   takes small draws only: the rings group states its [`Never]. *)
+type grower = {
+  t : S.t;
+  wide : Rig.Image.t;
+  home : Domain.id; (* the test's domain, which starts the device *)
+  first : int array; (* each kind's first size, in [sizes]' order *)
+  seen : int list Atomic.t array; (* each kind's sizes after a call *)
+}
+
+let ring_bytes = 16 lsl 10
+let segment_bytes = 32 lsl 10
+
+(* The kinds that grow, in [sizes]' order. *)
+let kinds = [| "the segment"; "the compute ring"; "the copy ring" |]
+
+(* Each kind's size: the segment's bytes, then the compute and copy rings'
+   words. *)
+let sizes (t : S.t) =
+  [| A.segment t.g; snd (A.ring t.g "COMPUTE:0"); snd (A.ring t.g "COPY:0") |]
+
+(* Adds each kind's size now to the sizes [x] has seen, from either domain. *)
+let observe x =
+  let rec add seen n =
+    let l = Atomic.get seen in
+    if not (List.mem n l || Atomic.compare_and_set seen l (n :: l)) then
+      add seen n
+  in
+  let now = sizes x.t in
+  Array.iteri (fun i seen -> add seen now.(i)) x.seen
 
 (* Whether [g]'s copy ring keeps the 16 MiB it opens with, and room answers
    [`Never] past it: on SDMA 4 over PCI, whose path programs one copy queue
@@ -918,62 +965,155 @@ let copy_ring_fixed g =
   let major, _, _ = (A.capability g).gpu.sdma in
   major = 4
 
+(* Whether the copy ring keeps its first size, on a device of its own. *)
 let copy_fixed = lazy (S.with_ (fun t -> copy_ring_fixed t.g))
 
-(* A submission of [n] words of [t]'s compute queue that do nothing
-   ([nop_words]). *)
-let nops_on t n = Rig.Point.wait (S.submit_work t [ nop_words t n ])
+type draw = Small | Past
 
-(* What a submission of [n] copies of 16 bytes on [t] stores, copy [i] taking
-   bytes [16 i] to [16 i + 15] of a pattern. *)
-let copies_on t n =
-  let src = buffer ~memory:Pinned t (16 * n)
-  and dst = buffer ~memory:Pinned t (16 * n) in
-  put src (pattern (16 * n) 7);
-  let part i = copy ~dst:(view dst (16 * i) 16) (view src (16 * i) 16) in
-  Rig.Point.wait (S.submit_work t (List.init n part));
-  get dst
+let draw =
+  Gen.of_list
+    ~pp:(fun ppf d ->
+      Format.pp_print_string ppf
+        (match d with Small -> "small" | Past -> "past"))
+    [ Small; Past; Past; Past ]
 
-(* The reference side holds whether the copy ring keeps its first size. *)
-let grower = abstract "g" ~release:(fun x -> S.close x.t)
+(* The answers of draw [d] for kind [k] of [x]: [run small], or for a past
+   draw on a worker domain [run (past now)] twice, [now] what kind [k] holds
+   before each, while it has not grown to 16 times its first. A draw on the
+   test's domain, which runs alone, is small, so the growths happen beside
+   the other domain's work. *)
+let drawn x d k ~small ~past run =
+  let d = if Domain.self () = x.home then Small else d in
+  let once () =
+    let now = (sizes x.t).(k) in
+    run (if now < 16 * x.first.(k) then past now else small)
+  in
+  match d with
+  | Small -> [ run small ]
+  | Past ->
+      let a = once () in
+      [ a; once () ]
 
-(* What a copy draw answers where the copy ring keeps its first size and the
-   copies exceed it. *)
-let never_fits = "never fits"
+(* A draw's answer: its submissions' one answer, or each in turn. *)
+let draw_answer l =
+  let a = List.hd l in
+  if List.for_all (( = ) a) l then a else String.concat ", then " l
 
-let launches =
-  Gen.with_pp Format.pp_print_int (Gen.of_list [ 1; 100; 200; 600 ])
+let stored = "stored"
 
-let nops =
-  Gen.with_pp Format.pp_print_int
-    (Gen.of_list [ 16; 1 lsl 22; (1 lsl 24) + 16 ])
+(* The copy ring's words per copy of 16 bytes, as AMD's room counts them:
+   SDMA's linear copy and the fence after it. *)
+let copy_words = 7 + 4
 
-let copies = Gen.with_pp Format.pp_print_int (Gen.of_list [ 1; 200_000 ])
+(* A launch's bytes of the segment, at least: its 8 KiB of arguments. *)
+let launch_bytes = 8192
+
+(* Past half the segment, as a submission's arguments never wrap. *)
+let launches_on x d =
+  draw_answer
+  @@ drawn x d 0 ~small:1
+    ~past:(fun b -> (b / 2 / launch_bytes) + 1)
+    (fun n ->
+      let r =
+        if stores_wide x.t x.wide n = tokens n then stored else "wrong"
+      in
+      observe x;
+      r)
+
+(* Past the compute ring, a power of two of words. *)
+let nops_on x d =
+  ignore
+    (drawn x d 1 ~small:16
+       ~past:(fun w -> w + 16)
+       (fun n ->
+         Rig.Point.wait (S.submit_work x.t [ nop_words x.t n ]);
+         observe x)
+      : unit list)
+
+(* Past half the copy ring, as SDMA packets never wrap, but on a copy ring
+   that keeps its first size. Copy [i] of [n] takes bytes [16 i] to
+   [16 i + 15] of a pattern. *)
+let copies_on x d =
+  let d = if Lazy.force copy_fixed then Small else d in
+  draw_answer
+  @@ drawn x d 2 ~small:1
+    ~past:(fun w -> (w / 2 / copy_words) + 1)
+    (fun n ->
+      let t = x.t in
+      let src = buffer ~memory:Pinned t (16 * n)
+      and dst = buffer ~memory:Pinned t (16 * n) in
+      put src (pattern (16 * n) 7);
+      let part i = copy ~dst:(view dst (16 * i) 16) (view src (16 * i) 16) in
+      Rig.Point.wait (S.submit_work t (List.init n part));
+      observe x;
+      if get dst = pattern (16 * n) 7 then stored else "wrong")
+
+(* The device a program's starts give, opened at its first with the first
+   sizes above, but a copy ring that keeps its first at 16 MiB: a second start
+   gives it again, so that a program's calls reach one device, which a path
+   that opens a GPU once per process also holds. The release closes it. *)
+let started = ref None
+
+let start () =
+  match !started with
+  | Some x -> x
+  | None ->
+      let copy = if Lazy.force copy_fixed then 16 lsl 20 else ring_bytes in
+      let was =
+        A.set_first_sizes ~compute:ring_bytes ~copy ~segment:segment_bytes
+      in
+      let t =
+        Fun.protect
+          ~finally:(fun () ->
+            let compute, copy, segment = was in
+            ignore
+              (A.set_first_sizes ~compute ~copy ~segment : int * int * int))
+          S.open_
+      in
+      let first = sizes t in
+      let x =
+        {
+          t;
+          wide = image ~of_:hidden_code t;
+          home = Domain.self ();
+          first;
+          seen = Array.map (fun n -> Atomic.make [ n ]) first;
+        }
+      in
+      started := Some x;
+      x
+
+(* Covers each kind's growth and its second, two and three sizes seen, but
+   a copy ring that keeps its first. *)
+let release x =
+  started := None;
+  Array.iteri
+    (fun i seen ->
+      if not (i = 2 && Lazy.force copy_fixed) then begin
+        let n = List.length (Atomic.get seen) in
+        cover (kinds.(i) ^ " grew") (n >= 2);
+        cover (kinds.(i) ^ " grew twice") (n >= 3)
+      end)
+    x.seen;
+  S.close x.t
+
+let grower = abstract "g" ~release
 
 let growth_commands =
   [
-    command "start"
-      (Gen.unit @-> makes grower)
-      (fun () -> Lazy.force copy_fixed)
-      (fun () ->
-        let t = S.open_ () in
-        { t; wide = image ~of_:hidden_code t });
+    command "start" (Gen.unit @-> makes grower) (fun () -> ()) start;
     command "launches"
-      (grower ^-> launches @-> returns string)
-      (fun _ n -> tokens n)
-      (fun x n -> stores_wide x.t x.wide n);
+      (grower ^-> draw @-> returns string)
+      (fun _ _ -> stored)
+      launches_on;
     command "nops"
-      (grower ^-> nops @-> returns unit)
+      (grower ^-> draw @-> returns unit)
       (fun _ _ -> ())
-      (fun x n -> nops_on x.t n);
+      nops_on;
     command "copies"
-      (grower ^-> copies @-> returns string)
-      (fun fixed n ->
-        if fixed && n > 1 then never_fits else pattern (16 * n) 7)
-      (fun x n ->
-        match copies_on x.t n with
-        | s -> s
-        | exception Invalid_argument _ -> never_fits);
+      (grower ^-> draw @-> returns string)
+      (fun () _ -> stored)
+      copies_on;
   ]
 
 let launching =
@@ -986,7 +1126,7 @@ let launching =
       cases ~name:string_of_int
         "a submission of launches of 8 KiB of arguments each runs whole"
         [ 1; 128; 300; 1000 ] wide_launches;
-      stateful ~count:6 ~steps:8 ~domains:2
+      stateful ~count:18 ~steps:8 ~domains:2
         "submissions from two domains run whole while the segment and rings \
          grow"
         growth_commands;
@@ -1099,7 +1239,6 @@ let work =
           equal int ~msg:"alignment" 4096 f.alignment;
           equal bool ~msg:"waits on words as on the host" f.waits.hosts
             f.waits.stores;
-          equal int ~msg:"most waits" 255 f.waits.most;
           equal (option int) ~msg:"hang bound" (Some 30_000) f.hang_ms;
           greater int ~msg:"clock" ~than:0 c.clock_hz;
           equal int ~msg:"shader engines"
@@ -1155,6 +1294,124 @@ let memory =
     [
       test "copies around the copy engine's packet size are the identity"
         around_the_packet;
+    ]
+
+(* Another function's DMA
+
+   The GPU's own function stands for the other one, as every machine has it.
+   The bus carries a function's requests to its own BAR, which a process
+   that cannot read the function's ACS controls cannot tell: such an export
+   of GPU memory is refused, and the test skips. Through amdgpu the device
+   exports a dma-buf, which amdgpu maps for the host whatever its memory:
+   KFD sets no AMDGPU_GEM_CREATE_NO_CPU_ACCESS (amdgpu_amdkfd_gpuvm.c), which
+   alone makes amdgpu_gem_object_mmap refuse. A host read of VRAM outside
+   the BAR moves the object into it first, so on a GPU whose BAR is smaller
+   than its memory the read checks the bytes after a move. Over PCI it
+   gives bus ranges and keeps the GPU taken until its process exits, so a
+   child of the suite makes that export, and the GPU opens again once the
+   child is gone. *)
+
+module B = Rig.Buffer
+module Dmabuf = Rig_gpu_support.Dmabuf
+
+let dma_child = "--dma-over-pci"
+let dma_sizes = [ 1; 4095; 4096; 4097; 1 lsl 22 ]
+let small_bar = "memory BAR is smaller than its memory"
+
+(* An [fn] that is no bus address, or no function of the machine, is refused
+   naming it. *)
+let refuses_strangers d =
+  List.iter
+    (fun fn ->
+      match B.dma (B.create d 64) ~fn with
+      | Ok _ -> failf "%s reaches the memory" fn
+      | Error why -> contains ~msg:fn ~sub:fn why)
+    [ "41:00.0"; "ffff:ff:1f.7" ]
+
+let gpu_bus d =
+  let fn = require_some ~msg:"the device's bus" (Rig.bus d) in
+  equal ~msg:"GPU 0's function" (option string)
+    (List.nth_opt (require_ok (Rig_amd_amdgpu.buses ())) 0)
+    (Some fn);
+  fn
+
+let exported d fn ~memory n =
+  let b = B.create ~memory d n in
+  B.fill b 'y';
+  match B.dma b ~fn with
+  | Error why
+    when memory <> Pinned && Rig_gpu_support.has ~sub:"ACS controls" why ->
+      skip ~reason:why ()
+  | Error why -> failf "%d bytes: %s" n why
+  | Ok (Bus _) -> fail "the amdgpu path gives a dma-buf"
+  | Ok (Dmabuf { fd; offset }) -> (
+      Fun.protect ~finally:(fun () -> Dmabuf.close fd) @@ fun () ->
+      equal ~msg:"close-on-exec" bool true (Dmabuf.cloexec fd);
+      equal ~msg:"the region's offset" int 0 offset;
+      (match Dmabuf.size fd with
+      | Some bytes -> at_least ~msg:"its bytes" int ~than:n bytes
+      | None -> fail "the descriptor is no dma-buf");
+      match Dmabuf.read fd ~at:offset n with
+      | Some s -> equal ~msg:"its bytes, mapped" string (String.make n 'y') s
+      | None -> fail "amdgpu maps no dma-buf of this memory")
+
+(* Pinned memory first: only an export of the GPU's memory, Device or Mapped,
+   checks the route, which a process without CAP_SYS_ADMIN may not tell. *)
+let exports_dmabuf () =
+  S.with_ @@ fun { d; _ } ->
+  let fn = gpu_bus d in
+  exported d fn ~memory:Pinned 4097;
+  refuses_strangers d;
+  List.iter (exported d fn ~memory:Device) dma_sizes;
+  exported d fn ~memory:Mapped 4097
+
+(* In the child: the bytes at the ranges are the buffer's, through BAR 0, the
+   memory BAR, and a reopen of the GPU in the process is refused. The export is
+   refused, and the test skips, where the memory BAR is smaller than the GPU's
+   memory, as on a host that caps the BAR. *)
+let exports_bus () =
+  let t = S.open_ () in
+  let fn = gpu_bus t.d in
+  let n = 1 lsl 16 in
+  let b = B.create t.d n in
+  B.fill b 'x';
+  (match B.dma b ~fn with
+  | Error why when Rig_gpu_support.has ~sub:small_bar why ->
+      S.close t;
+      Rig_gpu_support.skipped why
+  | Error why -> failf "refused: %s" why
+  | Ok (Dmabuf _) -> fail "the path over PCI gives bus ranges"
+  | Ok (Bus runs) ->
+      satisfies ~msg:"the ranges" ~claim:"pages that hold the buffer"
+        (list (pair int int))
+        (fun runs ->
+          List.for_all (fun (a, k) -> a mod 4096 = 0 && k mod 4096 = 0) runs
+          && List.fold_left (fun s (_, k) -> s + k) 0 runs >= n)
+        runs;
+      equal ~msg:"the bytes through the BAR" string (String.make n 'x')
+        (Rig_gpu_support.bar_bytes fn ~bar:0 runs n));
+  refuses_strangers t.d;
+  S.close t;
+  match Rig.open_ (S.gpu ()) with
+  | Ok d ->
+      Rig.close d;
+      fail "the GPU opened again in the process"
+  | Error why -> contains ~sub:"given to another PCI function" why
+
+let exports () =
+  if S.driverless () then begin
+    Rig_gpu_support.child dma_child;
+    S.with_ ignore
+  end
+  else exports_dmabuf ()
+
+let dma =
+  group ~timeout:120. "another function's DMA"
+    [
+      test
+        "dma exports a dma-buf through amdgpu, or bus ranges over PCI that \
+         keep the GPU until the process exits"
+        exports;
     ]
 
 let spin t p flag n =
@@ -1641,17 +1898,29 @@ let held (w0, t) =
     (H.read (host dst) 64);
   List.iter (A.free g) [ word; src; dst ]
 
-(* A submission waits on as many words as its facts state. *)
-let wait_bound () =
-  S.with_ @@ fun { g; _ } ->
+(* A submission waits in its compute queue on every producer it follows,
+   however many: 300 Polled devices' values, more than a fixed reserve of
+   waits held, none of them reached when the submit returns. *)
+let many_waits () =
+  S.with_ @@ fun { d; g } ->
   waits_on g;
-  let most = (A.facts g).waits.most in
-  let v = A.signaled g + 1 in
-  let word = Option.get (A.alloc g Pinned 8) in
-  H.write (host word) (le64 1);
-  let waits = Array.make most (address word, 1) in
-  equal answer ~msg:(strf "%d waits" most) `Ok (E.submit g ~v ~waits [||]);
-  S.reached g v
+  if not (A.facts g).maps_host then
+    skip ~reason:"the GPU maps no host word to wait on" ();
+  let module P = Rig_support.Polled in
+  let producers = List.init 300 (fun i -> P.open_ (strf "amd:wait-%d" i)) in
+  let close () = List.iter (fun (p, _) -> Rig.close p) producers in
+  Fun.protect ~finally:close @@ fun () ->
+  let point (p, _) =
+    let run = Rig.Submission.Run.make (Rig.Submission.make p [||]) in
+    Rig.submit run ~buffers:[||]
+  in
+  let points = Array.of_list (List.map point producers) in
+  let s = Rig.Submission.make d [||] in
+  let v = Rig.submit (Rig.Submission.Run.make s) ~waits:points ~buffers:[||] in
+  let reached = List.filter (fun (_, p) -> P.queued p = 0) producers in
+  equal int ~msg:"producers reached on the host" 0 (List.length reached);
+  List.iter (fun (_, p) -> ignore (P.run p)) producers;
+  Rig.Point.wait v
 
 let waits =
   group ~timeout:120. "waits"
@@ -1659,7 +1928,7 @@ let waits =
       cases ~name:crossing_name
         "a wait holds the work until the word reaches it, across 2^32 (sampled)"
         crossing held;
-      test "a submission waits on 255 words" wait_bound;
+      test "a submission waits in its queue on 300 producers" many_waits;
     ]
 
 (* Joins past 512 parts
@@ -1867,6 +2136,64 @@ let regrown_compute () =
   regrown_past g "COMPUTE:0" fill ~first:size ~past:(4 * size) ~after;
   Option.iter (A.free g) ib
 
+(* A growth destroys the queue an install replaced beside the installed one,
+   on which a value waits: the compute ring grows and its queue is installed,
+   the queue's first work is a value held behind a word, the ring grows again
+   past it at once, which destroys the replaced queue, and once the word lets
+   the value go it is reached, and a write after it, on the larger queue,
+   lands. The device opens on a small compute ring, so that both growths make
+   larger ones. *)
+let regrown_beside_held () =
+  let c, k, s =
+    A.set_first_sizes ~compute:ring_bytes ~copy:(16 lsl 20)
+      ~segment:(2 lsl 20)
+  in
+  ignore (A.set_first_sizes ~compute:ring_bytes ~copy:k ~segment:s);
+  let t =
+    Fun.protect
+      ~finally:(fun () ->
+        ignore (A.set_first_sizes ~compute:c ~copy:k ~segment:s))
+      S.open_
+  in
+  Fun.protect ~finally:(fun () -> S.close t) @@ fun () ->
+  let g = t.g in
+  waits_on g;
+  let nop, ib = compute_words g [| pm4_nop |] in
+  let fill n =
+    E.words ~queue:"COMPUTE:0"
+      (Array.init n (fun i -> nop.(i mod Array.length nop)))
+  in
+  let _, size = A.ring g "COMPUTE:0" in
+  equal room_answer ~msg:"words past the ring" `Grow (E.room g [| fill size |]);
+  equal grown ~msg:"the first growth" Grown (A.grow g);
+  equal room_answer ~msg:"once grown, the device idle" `Fits
+    (E.room g [| fill size |]);
+  let _, installed = A.ring g "COMPUTE:0" in
+  at_least int ~msg:"the installed ring's size" ~than:(2 * size) installed;
+  let flag = Option.get (A.alloc g Pinned 8) in
+  H.set64 (host flag) 0;
+  let v = A.signaled g + 1 in
+  equal answer ~msg:"the hold" `Ok
+    (E.submit g ~v ~waits:[| (address flag, 1) |] [||]);
+  let past = fill installed in
+  equal room_answer ~msg:"words past the installed ring" `Grow
+    (E.room g [| past |]);
+  equal grown ~msg:"the growth beside the held value" Grown (A.grow g);
+  H.set64 (host flag) 1;
+  S.reached g v;
+  equal room_answer ~msg:"the value reached" `Fits (E.room g [| past |]);
+  let out = Option.get (A.alloc g Pinned 64) in
+  H.write (host out) (String.make 64 '\000');
+  let write, ib' =
+    compute_words g (words (Pm4.write_data (Memory (address out)) 0x2a))
+  in
+  let r = device g in
+  go r [| past |];
+  go r [| E.words ~queue:"COMPUTE:0" write |];
+  equal string ~msg:"the word written after the growths" (le32s [ 0x2a ])
+    (H.read (host out) 4);
+  List.iter (A.free g) ((flag :: out :: Option.to_list ib) @ Option.to_list ib')
+
 let rings =
   group ~timeout:300. "rings"
     [
@@ -1875,6 +2202,10 @@ let rings =
       test
         "a second compute growth before an install replaces the first's queue"
         regrown_compute;
+      test
+        "a compute growth destroys the replaced queue beside one holding a \
+         value"
+        regrown_beside_held;
       test "the compute ring grows as a new queue" (grown_ring true);
       test "the copy ring grows as a new queue" (grown_ring false);
       prop ~count:24 "a submission of parts joined across the queues runs whole"
@@ -1898,15 +2229,18 @@ let timeline =
 (* Two devices of one GPU *)
 
 (* With no kernel driver, a process takes a GPU once: a second open is refused,
-   naming the GPU taken, and the first device goes on. *)
+   naming the GPU taken, and the first device goes on from its last value,
+   which is past 0 where an earlier device held its slot. *)
 let one_gpu_driverless t =
+  let before = Rig.submitted t.d in
   (match S.open_gpu ~word:(Rig_gpu_support.Host.word ()) with
   | Ok g' ->
       A.stop g' ~fault:None;
       fail "a second open of a GPU the process took"
   | Error why -> contains ~sub:"is open in this process" why);
   let p = S.submit t [||] in
-  equal int ~msg:"the first device's next value" 1 (Rig.Point.value p);
+  equal int ~msg:"the first device's next value" (before + 1)
+    (Rig.Point.value p);
   Rig.Point.wait p
 
 (* Through amdgpu, a process opens a GPU as often as it likes: the devices, [g]
@@ -2208,6 +2542,11 @@ let level () =
         (try Some (In_channel.with_open_text file In_channel.input_all)
          with Sys_error _ -> None)
 
+(* What a trace answers while another process holds the GPU's stable power
+   state ([Rig_amd_amdgpu]'s tracing), which the machine, not the device,
+   decides. *)
+let held = "another process holds the GPU's stable power state"
+
 let traces =
   group ~timeout:60. "traces"
     [
@@ -2229,13 +2568,23 @@ let traces =
               if not (S.driverless ()) then
                 equal (option string) ~msg:"the GPU's clocks"
                   (Some "profile_standard") (level ())
-          | Error why, _ | _, Error why -> fail why);
+          | Error why, _ | _, Error why ->
+              if String.starts_with ~prefix:held why then skip ~reason:why ()
+              else fail why);
     ]
 
 let () =
+  if Array.length Sys.argv = 2 && Sys.argv.(1) = dma_child then
+    exit
+      (match exports_bus () with
+      | () -> 0
+      | exception e ->
+          prerr_endline (Printexc.to_string e);
+          1);
   exit
     (Windtrap.run "rig_amd"
        [
+         dma;
          gpus;
          misuse;
          images;

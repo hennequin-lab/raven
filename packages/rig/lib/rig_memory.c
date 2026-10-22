@@ -70,8 +70,9 @@ value caml_rig_memory_free(value v_p) {
   return Val_unit;
 }
 
-static int memory_room(void *self, const struct rig_part *parts, int n,
-                       void *scratch, const uint8_t *args) {
+static int memory_room(void *self, int nwaits, const struct rig_part *parts,
+                       int n, void *scratch, const uint8_t *args) {
+  (void)nwaits;
   (void)scratch;
   (void)args;
   (void)self;
@@ -81,6 +82,25 @@ static int memory_room(void *self, const struct rig_part *parts, int n,
       return RIG_NEVER;
   }
   return RIG_FITS;
+}
+
+/* Runs the copy part [p] over host addresses: a fill sets its row, and a
+   box moves its rows, in one move where both sides' rows are contiguous. */
+static void memory_copy(const struct rig_part *p) {
+  size_t width = (size_t)p->copy.width, rows = (size_t)p->copy.rows;
+  if (width == 0 || rows == 0) return;
+  char *dst = (char *)(uintptr_t)p->copy.dst + p->copy.dst_offset;
+  if (p->copy.fill) {
+    memset(dst, p->copy.byte, width);
+    return;
+  }
+  const char *src = (const char *)(uintptr_t)p->copy.src + p->copy.src_offset;
+  if (p->copy.src_pitch == width && p->copy.dst_pitch == width) {
+    memmove(dst, src, width * rows);
+    return;
+  }
+  for (size_t i = 0; i < rows; i++)
+    memmove(dst + i * p->copy.dst_pitch, src + i * p->copy.src_pitch, width);
 }
 
 /* Runs the parts in order, the fills with no queue context, then makes [v]
@@ -103,10 +123,8 @@ static int memory_submit(void *self, uint64_t v, const struct rig_wait *waits,
         *failure = "a fill failed";
         return RIG_FAILED;
       }
-    } else if (p->copy.bytes != 0)
-      memmove((char *)(uintptr_t)p->copy.dst + p->copy.dst_offset,
-              (const char *)(uintptr_t)p->copy.src + p->copy.src_offset,
-              (size_t)p->copy.bytes);
+    } else
+      memory_copy(p);
   }
   atomic_store_explicit(m->word, v, memory_order_release);
   return RIG_COMMITTED;
@@ -182,10 +200,10 @@ value caml_rig_set_bytes(value v_b, value v_j, value v_n, value v_c) {
    memory { dev; host; address; handle; alloc }, its allocation
    { owner; host; count; generation; why; entry; ... }, the allocation's
    entry { owner; backing; bytes; access; stamps; ... } and a device
-   { index; name; machine; ...; opened }, as rig's Def module lays them
+   { index; name; machine; opened; ... }, as rig's Def module lays them
    out. */
 
-enum { DEVICE_INDEX, DEVICE_NAME, DEVICE_MACHINE, DEVICE_OPENED = 16 };
+enum { DEVICE_INDEX, DEVICE_NAME, DEVICE_MACHINE, DEVICE_OPENED };
 enum { BUFFER_MEM, BUFFER_OFFSET, BUFFER_LENGTH, BUFFER_GEN };
 enum { MEMORY_DEV, MEMORY_HOST, MEMORY_ADDRESS, MEMORY_HANDLE, MEMORY_ALLOC };
 enum { ALLOC_OWNER, ALLOC_HOST, ALLOC_COUNT, ALLOC_GEN, ALLOC_WHY,
@@ -333,9 +351,13 @@ int rig_buffers_overlap(value a, intnat a_first, intnat a_bytes, value b,
   return rig_sides_overlap(&x, &y);
 }
 
+/* rig_buffers_overlap of the two whole buffers, whose ranges need no
+   check. */
 value caml_rig_buffer_overlaps(value b, value other) {
-  intnat n = (intnat)rig_buffer_bytes(b), m = (intnat)rig_buffer_bytes(other);
-  return Val_bool(rig_buffers_overlap(b, 0, n, other, 0, m));
+  struct rig_side x, y;
+  side_span(b, &x);
+  side_span(other, &y);
+  return Val_bool(rig_sides_overlap(&x, &y));
 }
 
 intnat caml_rig_cached_host(value b) { return cached_host(b); }
@@ -617,13 +639,12 @@ static int hold_one(value b) {
    [v_taken]: -1, or the index of the buffer refused, holding nothing. */
 value caml_rig_claim_holds(value v_bs, value v_taken) {
   unsigned char *taken = Bytes_val(v_taken);
-  intnat i = 0;
-  for (value l = v_bs; l != Val_emptylist; l = Field(l, 1), i++) {
-    if (!hold_one(Field(l, 0))) {
-      intnat n = 0;
-      for (value k = v_bs; n < i; k = Field(k, 1), n++) {
-        unhold_word(claim_word(Field(k, 0)));
-        taken[n] = 0;
+  intnat n = (intnat)Wosize_val(v_bs);
+  for (intnat i = 0; i < n; i++) {
+    if (!hold_one(Field(v_bs, i))) {
+      for (intnat k = 0; k < i; k++) {
+        unhold_word(claim_word(Field(v_bs, k)));
+        taken[k] = 0;
       }
       return Val_long(i);
     }

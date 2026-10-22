@@ -129,7 +129,8 @@ val gpu : int -> t Rig_edge.opener
 (** {1:driver The driver}
 
     rig calls these functions. On CUDA, {!alloc}, {!free}, {!locate},
-    {!map_host}, {!peer} and {!map_peer} behave as in {!section-memory};
+    {!map_host}, {!peer}, {!map_peer} and {!val-dma} behave as in
+    {!section-memory};
     {!val-image}, {!entry} and {!unload} as in {!section-code}; {!sleep} and
     {!stop} as in {!section-failure}; and the C functions as in
     {!section-work}. *)
@@ -159,6 +160,7 @@ val capability : t -> Rig_cuda_abi.t
       | [alignment]      | [256], as CUDA aligns every allocation           |
       | [capability]     | {!Rig_cuda_abi.t} ({!val-capability})            |
       | [word]           | The word [make] was given, registered            |
+      | [bus]            | [cuDeviceGetPCIBusId], in lowercase              |
     }
 
     [arch] is ["sm_89"] for compute capability 8.9. ["COMPUTE:0"] runs
@@ -196,19 +198,18 @@ val capability : t -> Rig_cuda_abi.t
     so the work's writes are visible once the word shows the value. A
     commit ({!Rig_edge.section-calls}) writes nothing if a commit already
     wrote that value or a later one. [rig_cuda_submit] also commits, and
-    returns [RIG_COMMITTED], in two cases:
-    {ul
-    {- a value 64 values past the last commit, so the device commits each
-       value at most 64 values late;}
-    {- a value that holds a copy, as it is enqueued, so that a wait for the
-       copy waits for no work enqueued after it.}}
+    returns [RIG_COMMITTED], for a value 64 values past the last commit, so
+    the device commits each value at most 64 values late.
 
     A fill [f] is called as [f stream arg v], with the device's context
-    current on the calling thread ({!Rig_cuda_abi}). A copy moves
-    [copy.bytes] bytes between the handles of two regions of the device, at
-    their offsets. A part must not write a timeline word, the device's or
-    another's. Only the devices' streams write their words, and a word that
-    work wrote could move backwards or show work that has not completed.
+    current on the calling thread ({!Rig_cuda_abi}). A copy part moves its
+    rows between the handles of two regions of the device, at their
+    offsets, in one 2D copy, or a copy per row where a pitch exceeds the
+    GPU's [CU_DEVICE_ATTRIBUTE_MAX_PITCH] or CUDA refuses the pitches, and
+    a copy part that fills sets its bytes with one memset. A part must not
+    write a timeline word, the device's or another's. Only the devices'
+    streams write their words, and a word that work wrote could move
+    backwards or show work that has not completed.
 
     A wait holds the work back until the aligned 64-bit word at [at] holds
     at least [value], compared circularly, in the sense that [x] is at least
@@ -315,7 +316,28 @@ val capability : t -> Rig_cuda_abi.t
     shared mapping of a file. A CUDA device therefore cannot borrow a region
     that an io device holds for writing through a shared mapping of a file
     ({!Rig_edge.Io.pages}), and copies to and from that region go through
-    staging memory. *)
+    staging memory.
+
+    {!val-dma}[ g r ~fn] exports the whole allocation [r] lies in as a
+    dma-buf ([cuMemGetHandleForAddressRange], with no flags), at [r]'s
+    distance from the allocation's start. CUDA exports [Device] memory only
+    where its kernel driver can, as [CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED]
+    states: on Linux, with NVIDIA's open kernel modules. It exports
+    [Pinned] memory only where [CU_DEVICE_ATTRIBUTE_HOST_ALLOC_DMA_BUF_SUPPORTED]
+    holds, an attribute from CUDA 13 on. The kernel maps the memory for
+    [fn] where [fn] registers the dma-buf, and refuses there a topology it
+    does not support. With no flags it maps a coherent GPU's memory as the
+    host's pages, over the GPU's link to the host, so a NIC behind the
+    GPU's own PCIe switch reaches it through the host's memory system, at
+    that link's bandwidth, where a BAR1 mapping would cross only the
+    switch. [fn] reads what the device's work wrote once that work's value
+    is reached, since the word's write ([cuStreamWriteValue64_v2]) fences
+    the stream's writes for every reader first. It is [Error], naming the
+    cause: for an [fn] that is no bus address or no function under
+    [/sys/bus/pci/devices]; where CUDA exports no dma-buf, naming the
+    attribute that decides it; and for an allocation whose start or size is
+    off the host's page, as CUDA's export requires and its allocations,
+    aligned to 256 bytes, need not be. *)
 
 (** {1:code Code}
 

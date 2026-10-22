@@ -79,7 +79,9 @@ val take : Machine.t -> string -> (t, string) result
     the memory files that dead processes left and no function reaches.
 
     [Error why] if [bus] is not a function of [m], if [m] has failed, if a
-    process, this one included, holds it, or if neither way is open:
+    process, this one included, holds it, if this process gave the memory
+    its BAR reaches to another function ({!Memory.bus}), until the process
+    exits, or if neither way is open:
     - it is bound to a driver other than [vfio-pci] ({!Driver.detach});
     - the IOMMU translates its addresses and it is not bound to [vfio-pci];
     - not behind an IOMMU, it is disabled, or it shares its device with
@@ -166,7 +168,8 @@ val set_bus_master : t -> bool -> unit
     function when it returns. A write the system refuses is dropped.
 
     Each access raises [Invalid_argument] if its bytes are not in the
-    configuration space or the function was released, and nothing else. *)
+    configuration space or the function was released. An error the system gives
+    only for a bug in this library raises [Failure], naming it. *)
 
 val config8 : t -> int -> int
 (** [config8 f off] is the byte at [off] of [f]'s configuration space. *)
@@ -390,9 +393,26 @@ val unpin : t -> int -> int -> unit
    take keeps until its release. *)
 val take_locked : Machine.t -> 's Sysfs.lock -> (t, string) result
 
+(* [set_own_length n] makes each range of this process's own addresses that
+   {!alloc_dma} reserves from then on, for memory of a function taken
+   physically without [va], [n] bytes, or as many as a request needs, and is
+   the length it replaces. A test shrinks it to pass a range with little
+   memory. *)
+val set_own_length : int -> int
+
 (* [inherited f] is the [inherited] of [f]'s take ({!Machine.fn}) until
    {!forget} returns [Ok ()], and [false] after. *)
 val inherited : t -> bool
+
+(* [keep f] keeps [f] taken until the process exits, since another function
+   may write the memory its BAR reaches ({!Memory.bus}): from then on
+   {!release} turns [f]'s bus mastering off and gives back nothing else, and
+   {!take} of [f]'s bus on its machine, in this process or a child of fork,
+   is [Error]. The process's exit gives [f] back as it gives back every
+   function it holds. Keeping it again does nothing.
+
+   Raises [Invalid_argument] if [f] was released. *)
+val keep : t -> unit
 
 (* [forget f] is the [forget] of [f]'s take ({!Machine.fn}). The memory this
    process allocated stays listed for [f], so that the process's own death

@@ -73,6 +73,7 @@ val capability : t -> Rig_remote_abi.t
       | [host_addresses] | [false]                                           |
       | [capability]     | {!capability} ({!Rig_remote_abi.declare})         |
       | [word]           | The word [make] was given                         |
+      | [bus]            | [None]                                            |
     }
 
     Each queue runs [Copy], and on the machine's host [Words] too. The
@@ -112,8 +113,10 @@ val capability : t -> Rig_remote_abi.t
     follows is done here: the timeline word of each wait's proxy reaches the
     wait's value, and [d]'s own word the last of [d]'s values with a copy
     into this process's memory. It then sends the copies' bytes from that
-    memory in place, so the bytes they copy are final, and holds the
-    submitting thread while they cross the link.
+    memory, so the bytes they copy are final, and holds the submitting
+    thread while they cross the link: in place where a copy's rows lie end
+    to end, and otherwise packed into memory of its own, which it allocates
+    for the call.
 
     [submit] returns [RIG_COMMITTED] once its message is sent. It returns
     [RIG_FAILED] with the job's root cause if the job has failed, with
@@ -143,7 +146,8 @@ val capability : t -> Rig_remote_abi.t
     [None] for proxies of two links. A word maps as itself. For memory, it
     asks the agent to map [r]'s object on [d]'s device as a new object, and is
     [None] if the agent cannot or refuses; it raises {!Fault} if it asks and
-    the job has failed. {!map_host} is [None]. *)
+    the job has failed. {!map_host} is [None]. {!val-dma} is [Error], since
+    the memory is another machine's, which its agent describes there. *)
 
 (** {1:images Code}
 

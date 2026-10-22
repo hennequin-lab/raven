@@ -47,6 +47,10 @@ val flocks : bool
     maps its BARs, as every system but Windows does. System memory for a
     function needs Linux ({!on_linux}). *)
 
+val ofd_locks : bool
+(** [ofd_locks] is [true] iff the system has open file description locks,
+    which tell a memory file's process alive, as Linux and macOS do. *)
+
 val patience : float
 (** [patience] is 10 s, how long a test waits for what must happen: the
     [~timeout] of each suite's top groups, and {!poll}'s bound. It is
@@ -284,10 +288,15 @@ module Tree : sig
       a check repeated after every call costs two system calls. *)
 
   val hold : string -> Unix.file_descr
-  (** [hold path] takes flock's exclusive lock on the file or directory at
-      [path], as another process would, and is the descriptor whose close
-      gives it back. Raises [Unix.Unix_error] if [path] cannot be opened or
-      another open file holds a lock on it. *)
+  (** [hold file] takes a read lock of a new open file description over
+      [file], as a memory file's live process holds one, and is the
+      descriptor whose close gives it back. Raises [Unix.Unix_error] if
+      [file] cannot be opened or a write lock holds it. *)
+
+  val held : string -> bool
+  (** [held file] is [true] iff an open file description holds a lock on
+      [file], as its live process's read lock, tested without placing one.
+      Raises [Unix.Unix_error] if [file] cannot be opened. *)
 
   val add : string -> string -> string -> unit
   (** [add root file s] writes [s] to [file], a path from the tree [root],
@@ -301,4 +310,65 @@ module Tree : sig
   val link : string -> string -> string -> unit
   (** [link root file target] makes [file], a path from the tree [root], a link
       to [target], making its directories. *)
+
+  val driver : string -> string -> string option
+  (** [driver root bus] is the driver the tree [root] binds to the function at
+      [bus]. *)
+
+  (** {2:kernels Kernels}
+
+      A tree's kernel acts on what a machine writes to the tree's
+      [sys/bus/pci] as Linux does inside the write, and records each bind and
+      unbind of a function. *)
+
+  (** The type for a change to a function's driver. *)
+  type change = Bind of string | Unbind of string
+
+  type event = {
+    fn : string;  (** The function whose driver changed. *)
+    change : change;
+    others : (string * string option) list;
+        (** Each other function of its device, with its driver while the
+            driver of [fn] runs: after a bind, before an unbind. *)
+  }
+  (** The type for a bind or an unbind. *)
+
+  type kernel
+  (** The type for a tree's kernel. *)
+
+  val kernel :
+    ?refuse:(int -> bool) ->
+    ?unloaded:string list ->
+    drivers:(string * string) list ->
+    string ->
+    kernel
+  (** [kernel ~drivers root] is the kernel of the tree [root], whose functions
+      at [bus] have their own driver [d] for each [(bus, d)] of [drivers],
+      each loaded but those [unloaded] names (defaults to [[]]). It acts on
+      writes as Linux does:
+      - [drivers/D/unbind] given a function bound to [D] unbinds it, and
+        refuses another with [ENODEV];
+      - [drivers_probe] given an unbound function binds it to the driver its
+        [driver_override] names, or to its own with none named, where that
+        driver is loaded: the tree has its directory;
+      - a function's [remove] unbinds and removes it, and [rescan] brings
+        back each removed function with no override and probes it.
+
+      [refuse i] is [true] for each write, counted from [0], that the kernel
+      refuses with [EIO], acting on none of it (defaults to none). A write
+      the kernel refuses leaves its file as it was. *)
+
+  val load : kernel -> string -> unit
+  (** [load k d] loads the driver [d], as a module's load does, and probes
+      each unbound function whose [driver_override] names [d], or names none
+      while [d] is its own. *)
+
+  val machine : kernel -> Rig_pci.Machine.t
+  (** [machine k] is the machine of [k]'s tree, whose writes [k] acts on. *)
+
+  val events : kernel -> event list
+  (** [events k] is the binds and unbinds [k] made, oldest first. *)
+
+  val writes : kernel -> int
+  (** [writes k] is the number of writes [k] acted on or refused. *)
 end

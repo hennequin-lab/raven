@@ -323,7 +323,9 @@ val of_bigarray :
     shape and the dtype that stores its kind. Later writes to [b] do not reach
     it.
 
-    The copy is one pass over [b]. To read [b]'s bytes in place instead,
+    The copy is one pass over [b], into memory the value owns, so its
+    donation may write in place ({!donate}). To read [b]'s bytes in place
+    instead,
     [Repr.of_array Host.v (Nx_array.of_bigarray dt b)] is the value over them
     ({!Nx_array.of_bigarray}, {!Repr.of_array}): a write to [b] from then on
     leaves what that value reads unspecified.
@@ -3829,10 +3831,24 @@ module Repr : sig
   val of_array : 'd devices -> ('v, 's) Nx_array.t -> ('v, 's, 'd) t
   (** [of_array s a] is the value whose bytes are [a]'s. The value reads [a]'s
       memory from then on: a write to it through any handle leaves what values
-      over it read unspecified.
+      over it read unspecified. The memory stays its caller's: no donation of
+      the value writes it ({!donate}).
 
       Raises [Invalid_argument] naming [Nx.Repr.of_array] unless [a] lies on a
       device of [s]. *)
+
+  val unsafe_of_array : 'd devices -> ('v, 's) Nx_array.t -> ('v, 's, 'd) t
+  (** [unsafe_of_array s a] is {!of_array}[ s a] for an [a] its caller gives
+      up: the value owns [a]'s memory, as it owns memory nx allocated for it,
+      so a donation of the value may write its result there ({!donate}).
+
+      {b Warning.} After the call, the caller must not read, write or keep
+      [a], an array over its memory or a bigarray over it, and no other value
+      must read that memory: a donation of the value would change what they
+      read.
+
+      Raises [Invalid_argument] naming [Nx.Repr.unsafe_of_array] unless [a]
+      lies on a device of [s]. *)
 
   val array : ('v, 's, 'd) t -> ('v, 's) Nx_array.t option
   (** [array x] is [Some a] iff [x] has bytes on one device, [a] its array, and
@@ -4393,7 +4409,10 @@ module Prim : sig
           go 0 init
       ]}
       A scatter whose targets may repeat loops once per position along its
-      axis.
+      axis. A matrix routine loops once per step of its factorisation or
+      solve, [Eigh] for as many trips as its dtype's precision and its size
+      bound, and [Svd] for 30 sweeps, a matrix not converged by then NaN;
+      [Eig] has no expansion.
 
       Raises [Invalid_argument] naming [by] and [i] if [i] returned. *)
 end

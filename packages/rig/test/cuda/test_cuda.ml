@@ -229,7 +229,6 @@ let facts () =
   equal bool ~msg:"completion is the store" true (f.completion = Store);
   equal (list bool) ~msg:"waits on stores, hosts" [ true; true ]
     [ f.waits.stores; f.waits.hosts ];
-  equal int ~msg:"most waits" max_int f.waits.most;
   equal bool ~msg:"submit may block" true f.may_block;
   equal (option int) ~msg:"the hang bound, where no display's watchdog bounds"
     (if S.attribute watchdog = 0 then Some 30_000 else None)
@@ -299,11 +298,70 @@ let written_on_return () =
     (H.read (H.at dst) n);
   C.free g flag
 
+(* Another function's DMA. The GPU's own function stands for the other one,
+   as every machine has it. CUDA exports a dma-buf of an allocation on the
+   host's page, where its kernel driver can: an export is [Ok] iff the
+   buffer spans an allocation that starts on the page and is a whole number
+   of pages, and then lies at offset 0. A buffer that spans no allocation,
+   as one rig rounded up, says nothing of it and is skipped. *)
+let dma_sizes = [ 1; 4095; 4096; 4097; 8192; 1 lsl 22; (1 lsl 22) + 1 ]
+
+let gpu_fn d =
+  let fn = require_some ~msg:"the device's bus" (Rig.bus d) in
+  equal ~msg:"GPU 0's function" (option string)
+    (List.nth_opt (require_ok (C.buses ())) 0)
+    (Some fn);
+  fn
+
+let export_law d ~fn memory n =
+  let module Dmabuf = Rig_gpu_support.Dmabuf in
+  let b = B.create ~memory d n in
+  let on_pages = B.aligned b ~at:0 H.page && n mod H.page = 0 in
+  match B.dma b ~fn with
+  | Error why when Rig_gpu_support.has ~sub:"_DMA_BUF_SUPPORTED is false" why ->
+      skip ~reason:why ()
+  | _ when not (B.spans b) -> ()
+  | Error why ->
+      equal ~msg:(strf "%d bytes refused: %s" n why) bool false on_pages;
+      contains ~msg:"its cause" ~sub:"off the host's page" why
+  | Ok (Bus _) -> fail "CUDA gives a dma-buf"
+  | Ok (Dmabuf { fd; offset }) -> (
+      Fun.protect ~finally:(fun () -> Dmabuf.close fd) @@ fun () ->
+      equal ~msg:(strf "%d bytes exported" n) bool true on_pages;
+      equal ~msg:"close-on-exec" bool true (Dmabuf.cloexec fd);
+      equal ~msg:"its offset" int 0 offset;
+      match Dmabuf.size fd with
+      | Some bytes -> at_least ~msg:"its bytes" int ~than:n bytes
+      | None -> fail "the descriptor is no dma-buf")
+
+let exports () =
+  S.with_ @@ fun { d; _ } ->
+  let fn = gpu_fn d in
+  List.iter (export_law d ~fn Device) dma_sizes;
+  List.iter
+    (fun fn ->
+      match B.dma (B.create d 64) ~fn with
+      | Ok _ -> failf "%s reaches the memory" fn
+      | Error why -> contains ~msg:fn ~sub:fn why)
+    [ "41:00.0"; "ffff:ff:1f.7" ]
+
+(* Page-locked host memory exports only where CUDA says it can, which it
+   says apart from GPU memory: a case of its own, so a GPU that refuses it
+   still reports the export of its own memory. *)
+let exports_pinned () =
+  S.with_ @@ fun { d; _ } -> export_law d ~fn:(gpu_fn d) Pinned (1 lsl 22)
+
 let memory =
   group ~timeout:120. "memory"
     [
       test "an allocation past the GPU's memory is None" past_memory;
       test "write_gpu's bytes are on the GPU when it returns" written_on_return;
+      test
+        "dma exports an allocation on the host's page as a dma-buf, and \
+         refuses another"
+        exports;
+      test "dma exports page-locked host memory where CUDA says it can"
+        exports_pinned;
     ]
 
 (* Work *)
@@ -311,13 +369,14 @@ let memory =
 let fills_in_a_fresh_domain () =
   S.with_ @@ fun t ->
   let f = S.context () in
+  let before = Rig.submitted t.d in
   let r, current =
     Domain.join
       (Domain.spawn (fun () ->
            let v = S.submit_work t [ S.part t.d f ] in
            (v, S.current ())))
   in
-  equal int ~msg:"the value" 1 (Rig.Point.value r);
+  equal int ~msg:"the value" (before + 1) (Rig.Point.value r);
   equal nativeint ~msg:"the domain's thread has no context after" 0n current;
   Rig.Point.wait r;
   not_equal nativeint ~msg:"the fill saw a context" 0n (S.seen f)
@@ -448,6 +507,8 @@ let largest_shared = 97
    threads along x and 1024 threads in a group. *)
 let refused_launches () =
   S.with_ @@ fun { d; _ } ->
+  (* A device's values go on past those of its slot's earlier devices. *)
+  let opened = Rig.submitted d in
   let out = B.create ~memory:Pinned d 4096 in
   let refuses msg ?kernel ?params ?(groups = (1, 1, 1)) ?(threads = (1, 1, 1))
       ?(shared = 0) () =
@@ -468,7 +529,7 @@ let refused_launches () =
   refuses "a byte of shared memory past the largest" ~kernel:"rotate" ~params:12
     ~shared:(S.attribute largest_shared + 1)
     ();
-  equal int ~msg:"values assigned" 0 (Rig.submitted d);
+  equal int ~msg:"values assigned" opened (Rig.submitted d);
   equal (option string) ~msg:"the device's loss" None (Rig.lost d);
   let n = 65535 * 1024 in
   let run =
@@ -647,9 +708,10 @@ let stop_idle () =
   let p = H.pages H.page in
   let r = require_some (C.map_host g p 64) in
   equal bool ~msg:"locked" true (S.locked p);
-  Rig.Point.wait (S.submit t [||]);
+  let last = S.submit t [||] in
+  Rig.Point.wait last;
   S.close t;
-  equal int ~msg:"the word" 1 (Rig.signaled d);
+  equal int ~msg:"the word" (Rig.Point.value last) (Rig.signaled d);
   C.free g r;
   equal bool ~msg:"locked after free" false (S.locked p);
   H.free_pages p H.page

@@ -13,6 +13,7 @@ let host = Dev.host
 let name (d : t) = d.name
 let host_of = Dev.host_of
 let arch d = d.arch
+let bus d = d.bus
 let computes d =
   match d.kind with Host | Driver _ -> true | Io _ -> false
 let runs_on_host d = Dev.is_host d || d.memory_device
@@ -87,6 +88,19 @@ module Buffer = struct
 
   let read = Claim.read_bytes
   let write = Claim.write_bytes
+
+  type box = Def.box = {
+    src_offset : int;
+    dst_offset : int;
+    width : int;
+    rows : int;
+    src_pitch : int;
+    dst_pitch : int;
+  }
+
+  let row = Copy.row
+  let submit_copy = Copy.submit_copy
+  let submit_fill = Copy.submit_fill
   let copy = Copy.copy
   let blit_from_string = Copy.blit_from_string
   let blit_to_bytes = Copy.blit_to_bytes

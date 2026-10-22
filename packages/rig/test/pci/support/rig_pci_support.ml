@@ -38,6 +38,7 @@ let largest_gap lo hi live =
 let fits ~gap n a = n <= gap / 2 && a <= (gap / 2) - n
 let on_linux = Sys.file_exists "/sys/bus/pci/devices"
 let flocks = not Sys.win32
+let ofd_locks = not Sys.win32
 
 external now_ns : unit -> int = "rig_pci_test_now_ns"
 
@@ -295,7 +296,8 @@ external device_number : string -> string = "rig_pci_test_device_number"
 external stored : string -> int = "rig_pci_test_stored"
 external flocked : string -> bool = "rig_pci_test_flocked"
 external flocked_fd : Unix.file_descr -> bool = "rig_pci_test_flocked_fd"
-external flock_hold : string -> Unix.file_descr = "rig_pci_test_flock"
+external ofd_hold : string -> Unix.file_descr = "rig_pci_test_ofd_hold"
+external ofd_held : string -> bool = "rig_pci_test_ofd_held"
 
 module Tree = struct
   type bar = Mem32 of int * int | Mem64 of int * int | Io of int * int
@@ -565,7 +567,8 @@ module Tree = struct
   let stored = stored
   let flocked = flocked
   let flocked_fd = flocked_fd
-  let hold = flock_hold
+  let hold = ofd_hold
+  let held = ofd_held
   let add root file s = write (root / file) s
 
   (* An entry of a page map: bit 63 says the page is present, bits 0-54 hold its
@@ -587,4 +590,186 @@ module Tree = struct
   let link root file target =
     mkdir_p (Filename.dirname (root / file));
     Unix.symlink target (root / file)
+
+  (* Kernels *)
+
+  type change = Bind of string | Unbind of string
+
+  type event = {
+    fn : string;
+    change : change;
+    others : (string * string option) list;
+  }
+
+  type kernel = {
+    root : string;
+    drivers : (string * string) list;
+    refuse : int -> bool;
+    mutable writes : int;
+    mutable events : event list; (* newest first *)
+    mutable removed : (string * string) list; (* each with its directory *)
+    contents : (string, string) Hashtbl.t;
+        (* each attribute's, by its path through no link, which a refused
+           write restores: the write's open truncated it *)
+  }
+
+  let pci k = k.root / "sys/bus/pci"
+  let fn_dir k bus = pci k / "devices" / bus
+
+  let driver root bus =
+    match Unix.readlink (root / "sys/bus/pci/devices" / bus / "driver") with
+    | target -> Some (Filename.basename target)
+    | exception Unix.Unix_error (ENOENT, _, _) -> None
+
+  let driver_of k bus = driver k.root bus
+
+  (* The other functions of [bus]'s device, with their drivers. *)
+  let others k bus =
+    let prefix = String.sub bus 0 (String.length bus - 1) in
+    List.init 8 (fun fn -> prefix ^ string_of_int fn)
+    |> List.filter (fun f -> f <> bus && Sys.file_exists (fn_dir k f))
+    |> List.map (fun f -> (f, driver_of k f))
+
+  let record k fn change =
+    k.events <- { fn; change; others = others k fn } :: k.events
+
+  (* A driver's remove runs while it is bound, so an unbind is recorded
+     before the link goes. *)
+  let unbind k bus =
+    Option.iter
+      (fun d ->
+        record k bus (Unbind d);
+        Unix.unlink (fn_dir k bus / "driver"))
+      (driver_of k bus)
+
+  (* The driver a probe may bind to [bus]: the one its [driver_override]
+     names, or its own without one. *)
+  let named k bus =
+    let override = fn_dir k bus / "driver_override" in
+    match In_channel.with_open_bin override In_channel.input_all with
+    | s when List.mem (String.trim s) [ ""; "(null)" ] ->
+        List.assoc_opt bus k.drivers
+    | s -> Some (String.trim s)
+
+  (* A probe binds an unbound function to its named driver if that driver is
+     loaded. A driver's probe runs while it is bound, so a bind is recorded
+     after the link. *)
+  let probe k bus =
+    if driver_of k bus = None then
+      match named k bus with
+      | Some d when Sys.file_exists (pci k / "drivers" / d) ->
+          relative
+            (Unix.realpath (fn_dir k bus) / "driver")
+            (Unix.realpath (pci k / "drivers" / d));
+          record k bus (Bind d)
+      | _ -> ()
+
+  (* Linux unbinds a function it removes. A rescan brings it back as new,
+     with no override. *)
+  let remove k bus =
+    unbind k bus;
+    let dir = Unix.realpath (fn_dir k bus) in
+    let away = k.root / "removed" / bus in
+    mkdir_p (Filename.dirname away);
+    Unix.rename dir away;
+    Unix.unlink (fn_dir k bus);
+    k.removed <- (bus, dir) :: k.removed
+
+  let rescan k =
+    let back = List.rev k.removed in
+    k.removed <- [];
+    List.iter
+      (fun (bus, dir) ->
+        Unix.rename (k.root / "removed" / bus) dir;
+        relative (fn_dir k bus) dir;
+        write (dir / "driver_override") "(null)\n";
+        Hashtbl.replace k.contents (dir / "driver_override") "(null)\n")
+      back;
+    List.iter (fun (bus, _) -> probe k bus) back
+
+  let act k file s =
+    let n = k.writes in
+    k.writes <- n + 1;
+    if k.refuse n then raise (Unix.Unix_error (EIO, "write", file));
+    let named = String.trim s in
+    match Filename.basename file with
+    | "unbind" ->
+        let d = Filename.basename (Filename.dirname (Unix.realpath file)) in
+        if driver_of k named <> Some d then
+          raise (Unix.Unix_error (ENODEV, "write", file));
+        unbind k named
+    | "drivers_probe" -> probe k named
+    | "remove" -> remove k (Filename.basename (Filename.dirname file))
+    | "rescan" -> rescan k
+    | _ -> ()
+
+  (* Linux leaves an attribute as it was when it refuses a write. *)
+  let kernel_write k file s =
+    let at = Unix.realpath file in
+    let old = Option.value (Hashtbl.find_opt k.contents at) ~default:"" in
+    match act k file s with
+    | () -> Hashtbl.replace k.contents at s
+    | exception (Unix.Unix_error _ as e) ->
+        write at old;
+        raise e
+
+  let attributes =
+    [
+      "bind";
+      "unbind";
+      "drivers_probe";
+      "rescan";
+      "remove";
+      "enable";
+      "reset";
+      "driver_override";
+    ]
+
+  (* The attributes under [dir], read through no link. *)
+  let rec snapshot contents dir =
+    Array.iter
+      (fun name ->
+        let f = dir / name in
+        match (Unix.lstat f).st_kind with
+        | S_DIR -> snapshot contents f
+        | S_REG when List.mem name attributes ->
+            Hashtbl.replace contents f
+              (In_channel.with_open_bin f In_channel.input_all)
+        | _ -> ())
+      (Sys.readdir dir)
+
+  let make_driver k d =
+    write (pci k / "drivers" / d / "bind") "";
+    write (pci k / "drivers" / d / "unbind") ""
+
+  (* The root is read through no link, so that the links the kernel makes
+     between a function and its driver are relative within the tree. *)
+  let kernel ?(refuse = Fun.const false) ?(unloaded = []) ~drivers root =
+    let k =
+      {
+        root = Unix.realpath root;
+        drivers;
+        refuse;
+        writes = 0;
+        events = [];
+        removed = [];
+        contents = Hashtbl.create 64;
+      }
+    in
+    List.iter
+      (fun (_, d) -> if not (List.mem d unloaded) then make_driver k d)
+      drivers;
+    snapshot k.contents (k.root / "sys");
+    k
+
+  (* A module's load probes each unbound function the driver may bind. *)
+  let load k d =
+    make_driver k d;
+    Array.iter
+      (fun bus -> if named k bus = Some d then probe k bus)
+      (Sys.readdir (pci k / "devices"))
+
+  let machine k = Rig_pci.Machine.at ~kernel:(kernel_write k) k.root
+  let events k = List.rev k.events
+  let writes k = k.writes
 end

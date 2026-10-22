@@ -534,15 +534,25 @@ let test_check_one () =
   at Count.on;
   at (Count2.split ~axis:0);
   at (Count2.split ~axis:1);
+  let donated (type d) (p : d Nx.Placement.t) =
+    let on dt v =
+      Nx.place p (Nx.Repr.of_array Nx.Host.v (A.of_array dt shape [| v |]))
+    in
+    let x = on D.Float32 5. in
+    (* Computed, so the memory is the flag's alone and a donation may write
+       it. *)
+    let ok = Nx.logical_not (on D.Bool true) in
+    check ok x;
+    ignore (Nx.logical_not (Nx.donate ok));
+    raises failed (fun () -> Nx.sync x)
+  in
+  donated Count.on;
+  donated (Count2.split ~axis:0);
+  donated (Count2.split ~axis:1);
   let on_count dt v =
     Nx.place Count.on (Nx.Repr.of_array Nx.Host.v (A.of_array dt shape [| v |]))
   in
   let x = on_count D.Float32 5. in
-  (* Computed, so the memory is the flag's alone and a donation may write it. *)
-  let ok = Nx.logical_not (on_count D.Bool true) in
-  check ok x;
-  ignore (Nx.logical_not (Nx.donate ok));
-  raises failed (fun () -> Nx.sync x);
   let formula () = Nx.equal_s (Nx.zeros D.Float32 shape) 1. in
   C.reset ();
   ignore (Nx.place Count.on (formula ()));
@@ -628,6 +638,16 @@ let test_sub_byte_tail () =
       int 0x02 (A.get bytes [| n |])
   done
 
+(* The minor words one call of [f] allocates, over a thousand after one. *)
+let words f =
+  ignore (f ());
+  let n = 1000 in
+  let before = Gc.minor_words () in
+  for _ = 1 to n do
+    ignore (Sys.opaque_identity (f ()))
+  done;
+  (Gc.minor_words () -. before) /. Float.of_int n
+
 let allocation =
   group "allocation"
     [
@@ -635,14 +655,15 @@ let allocation =
         test_sub_byte_tail;
       test "an add of one-element host values allocates its budget" (fun () ->
           let a = on_host Plain D.Float32 [| 1 |] [| 1. |] in
-          ignore (Nx.add a a);
-          let n = 1000 in
-          let before = Gc.minor_words () in
-          for _ = 1 to n do
-            ignore (Sys.opaque_identity (Nx.add a a))
-          done;
-          let per = (Gc.minor_words () -. before) /. Float.of_int n in
-          at_most (float 0.5) ~than:51. per);
+          at_most (float 0.5) ~than:42. (words (fun () -> Nx.add a a)));
+      test "a copy of a one-element host value allocates its budget"
+        (fun () ->
+          let a = on_host Plain D.Float32 [| 1 |] [| 1. |] in
+          at_most (float 0.5) ~than:124. (words (fun () -> Nx.copy a)));
+      test "a matmul of 4x4 float32 host values allocates its budget"
+        (fun () ->
+          let a = on_host Plain D.Float32 [| 4; 4 |] (Array.make 16 1.) in
+          at_most (float 0.5) ~than:167. (words (fun () -> Nx.matmul a a)));
     ]
 
 (* Placements *)
@@ -847,6 +868,7 @@ let law_placed (Case (k, s, data, w, op)) =
         (not (List.mem (Array.length s - 1) cut))
   | Moved _ -> cover "a movement of a cut value" true
   | Beside a ->
+      cover "a constant scanned along a cut axis" (List.mem a cut);
       cover "a constant computed whole along an axis, beside another cut"
         (List.mem a cut && List.length cut > 1)
   | Combine -> ());

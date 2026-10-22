@@ -10,6 +10,49 @@ val opened : 'a Rig_edge.opener -> ('a, string) result
 (** [opened o] is [o.make] given a {!Host.word}: the device opened outside
     rig, for a test that calls its driver itself. *)
 
+(** {1:dmabufs Dma-bufs} *)
+
+(** The dma-bufs a driver exports ({!Rig.Buffer.dma}), by descriptor. *)
+module Dmabuf : sig
+  val size : int -> int option
+  (** [size fd] is the bytes of the dma-buf open as [fd], from Linux's
+      [/proc/self/fdinfo/FD], or [None] if no exporter is named there
+      ([exp_name]), as for a descriptor that is no dma-buf. *)
+
+  val read : int -> at:int -> int -> string option
+  (** [read fd ~at n] is the [n] bytes from byte [at] of the dma-buf [fd],
+      read through a mapping of it inside [DMA_BUF_IOCTL_SYNC]'s start and
+      end, or [None] if its exporter maps none, or off Linux. *)
+
+  val cloexec : int -> bool
+  (** [cloexec fd] is [true] iff [fd] closes on [exec]. *)
+
+  val close : int -> unit
+  (** [close fd] closes [fd]. *)
+end
+
+val bar_bytes : string -> bar:int -> (int * int) list -> int -> string
+(** [bar_bytes bus ~bar runs n] is the first [n] bytes at the bus ranges
+    [runs], as (address, bytes), of BAR [bar] of the function at [bus],
+    read through mappings of its [resourceN] file under [/sys/bus/pci],
+    which root may read. Each range lies in the BAR, at its bus address.
+
+    Raises [Unix.Unix_error] if the file cannot be mapped. *)
+
+val has : sub:string -> string -> bool
+(** [has ~sub s] is [true] iff [sub] occurs in [s]. *)
+
+val child : string -> unit
+(** [child flag] runs this executable again with the one argument [flag]. A
+    suite runs a test in a child where the test leaves its process changed
+    for good, as an export of a GPU's memory over PCI does. The test fails
+    unless the child exits with [0], and skips for the reason the child
+    gives if the child ends with {!skipped}. *)
+
+val skipped : string -> 'a
+(** [skipped why] ends this process, a child {!child} runs, as a skip of the
+    test for [why]. *)
+
 (** {1:host Host memory} *)
 
 (** Host memory the suites own, by address. *)
@@ -222,6 +265,97 @@ module Watch (D : Rig_edge.Driver) : sig
   val late_reads : t -> int
   (** [late_reads h] is the number of {!Rig_edge.Driver.signaled} calls on
       [h] after a free of its word. *)
+end
+
+(** {1:edge A driver's copies} *)
+
+(** The type for a copy part's fields, as [rig_edge.h] lays them out: each
+    side's handle, or host address for a side [local] names, and offset. *)
+type raw = {
+  dst : nativeint;
+  dst_offset : int;
+  src : nativeint;
+  src_offset : int;
+  width : int;
+  rows : int;
+  src_pitch : int;
+  dst_pitch : int;
+  local : [ `None | `Src | `Dst ];  (** [copy.local]. *)
+  device_memory : bool;  (** [copy.device_memory]. *)
+  fill : char option;
+      (** [Some c] for a fill of [c]: [copy.fill] and [copy.byte]. *)
+}
+
+(** The type for what a hand-over of a part answers. *)
+type answer =
+  | Handed  (** Submitted and committed. *)
+  | Room of int
+      (** The room check's answer, other than [RIG_FITS]: [1] for
+          [RIG_LATER], [2] for [RIG_NEVER], [3] for [RIG_GROW]. *)
+  | Failed  (** The submit or the commit failed. *)
+
+val hand : nativeint -> v:int -> queue:int -> raw -> answer
+(** [hand edge ~v ~queue p] hands the device whose C state is [edge] the
+    value [v], one copy part [p] on its queue [queue], through its room
+    check, submit and commit, as rig calls them. It waits for nothing. *)
+
+(** [Edge (D)] hands copy parts to a device of [D] opened by its driver
+    alone ({!hand}), for the laws of copy parts that rig's interface does
+    not make, such as boxes. *)
+module Edge (D : Rig_edge.Driver) : sig
+  type t
+  (** The type for a device and the memory allocated for its parts. *)
+
+  (** The type for memory of the device. *)
+  type region = {
+    r : D.region;
+    memory : Rig_edge.memory;  (** Its kind. *)
+    bytes : int;  (** Its bytes. *)
+  }
+
+  (** The type for a side of a part: the device's memory, or this process's
+      memory at a host address, which only a device of another machine
+      takes. *)
+  type side = Region of region | Host of int
+
+  (** The type for copy parts. A part with a [fill] sets its row to the byte
+      and has no [src]. *)
+  type part = {
+    dst : side;
+    dst_offset : int;
+    src : side option;
+    src_offset : int;
+    width : int;
+    rows : int;
+    src_pitch : int;
+    dst_pitch : int;
+    fill : char option;
+  }
+
+  val make : D.t -> t
+  (** [make g] hands work to [g], which its driver opened alone, from the
+      value after the one its word holds. *)
+
+  val alloc : t -> Rig_edge.memory -> int -> region
+  (** [alloc t m n] is [n] bytes of [t]'s memory [m], until {!release}. It
+      fails the test if the device has none. *)
+
+  val release : t -> unit
+  (** [release t] frees the memory {!alloc} made. *)
+
+  val run : t -> part -> unit
+  (** [run t p] hands [p] to the device's copy engine as the next value, its
+      [copy.device_memory] set where both sides are [Device] memory and its
+      [copy.local] where a side is [Host], and waits until the word shows
+      that value. It fails the test if the device never runs [p] or fails
+      it, or the value is not reached within 10 s. *)
+
+  val read : t -> region -> at:int -> int -> string
+  (** [read t r ~at n] is the [n] bytes of [r] from [at], copied by a part
+      into [Pinned] memory where the host does not address [r]. *)
+
+  val write : t -> region -> at:int -> string -> unit
+  (** [write t r ~at s] writes [s] into [r] from [at], as {!read}. *)
 end
 
 (** {1:conformance Conformance}

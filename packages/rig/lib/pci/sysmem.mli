@@ -8,7 +8,8 @@
     {!Function} checks every argument first. Sizes are positive, addresses are
     on a page, and contiguous memory is at most 2 MiB, a huge page that starts
     on 2 MiB. What the system refuses raises {!Fail.Failed}, and off Linux
-    every value but {!page} raises it. Any domain may use this module. *)
+    every value but {!page} and {!set_own_length} raises it. Any domain may
+    use this module. *)
 
 val page : int
 (** [page] is the system's page size in bytes. *)
@@ -35,7 +36,12 @@ val unmap : Window.t -> unit
     The memory of functions taken physically, which outlives the process as
     {{!Function.dma}system memory} states. It lies in huge pages of a file of
     the process under the machine's root, in [dev/hugepages], laid out as
-    [sysmem.ml] comments. *)
+    [sysmem.ml] comments. The process holds a read lock of an open file
+    description on its file while it lives (fcntl(2)), so a file whose lock
+    is free is a dead process's. {!collect_dead}, {!left} and {!forget} tell
+    a dead process's file by testing for that lock, and place none. A system
+    without such locks, Windows, tells no file dead: they delete nothing and
+    {!left} is [false]. Only Linux takes a function physically. *)
 
 type store
 (** The type for the memory of one function taken physically. *)
@@ -77,6 +83,12 @@ val close : store -> unit
     left goes at {!collect_dead} once it lists no function, or at {!forget} of
     each function it lists. Called once per store. *)
 
+val set_own_length : int -> int
+(** [set_own_length n] makes each range of the process's own addresses that
+    {!alloc} reserves from then on, for memory without an address, [n] bytes,
+    or as many as a request needs. It is the length it replaces. The first
+    is 1 GiB. *)
+
 val reach : root:string -> bus:string -> int -> int -> (int * int) list option
 (** [reach ~root ~bus a n] is the physical runs of the [n] bytes at [a], if
     {!alloc} gave every 2 MiB block that holds them under [root]. It records
@@ -111,8 +123,9 @@ val forget : root:string -> bus:string -> unit
 (** [forget ~root ~bus] records that the GPU of the function at [bus] was
     reset, so that it reaches none of the memory that dead processes left. The
     function leaves the list of every file under [root] that a dead process
-    left, which the file's shared flock tells, since its process held that
-    lock while it lived. Each such file that no function reaches then goes. The
+    left. Each such file that no function reaches then goes, also when
+    another process's [forget] of another function of the file runs at the
+    same time. The
     process's own files keep listing the function, since its driver may reach
     their memory again, until its release ({!close}). Called with the function
     taken. *)

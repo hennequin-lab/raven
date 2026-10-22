@@ -274,7 +274,7 @@ let around o =
    interpretation; one [i] adopts is around by construction ({!interpret}). An
    operation the rule receives consumes its handles, a movement too: the rule's
    results hold none to pass on. The rule reads it as it was called
-   ({!Exec.consume}). *)
+   ({!Donate.consume}). *)
 let deliver i ~by op =
   let checked = ref ([] : interpretation list) in
   Prim.iteri
@@ -286,7 +286,7 @@ let deliver i ~by op =
           checked := List.cons owner !checked
       | Traced _ | Array _ | Shards _ | Donated _ | Deferred _ -> ())
     op;
-  let op = Exec.consume ~by op in
+  let op = Donate.consume ~by op in
   let op =
     if Prim.exists (fun x -> changes i x) op then
       Prim.map (fun x -> received i x) op
@@ -447,11 +447,11 @@ let apply3 ~by k c x y =
       if quiet () then Exec.apply3 ~by k c x y
       else eval3 ~by k c x y
 
-let contract ~by ~shape ~rows ~columns ~batch ~contracting ~acc dt a b init =
-  let order = Prim.contract_order_of ~rows ~columns a b in
+let contract ~by ~batch ~contracting ~acc dt a b init =
+  let order = Prim.contract_order ~batch ~contracting a b in
   let fast =
     if quiet () then
-      Exec.contract ~by ~order ~shape ~batch ~contracting ~acc dt a b init
+      Exec.contract ~by ~order ~batch ~contracting ~acc dt a b init
     else None
   in
   match fast with

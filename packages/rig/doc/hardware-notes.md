@@ -37,6 +37,16 @@ A driver that keeps its segments in a ring closes the open segment into its
 entry whenever its write position returns to the ring's start, also when the
 last command ended exactly at the ring's end, and opens a new segment there.
 
+### A channel's ring holds up to 2^31 entries
+
+A channel's DMA engine holds the log2 of its GPFIFO's entries in a 5-bit
+field (`LIMIT2`, set from the allocation's `gpFifoEntries`), so a ring holds
+at most 2^31 entries. On the RTX 5000 Ada the RM made channels whose rings
+held 2^20, 2^24 and 2^31 entries, on the copy engine and, at 2^31, on the
+compute engine too, and 300,000 entries and a release then ran on each. A
+ring of 2^31 entries takes 16 GiB of host memory, which the RM made the
+channel over in about 3 s. Run in forked children on fudge, driver 615.
+
 ### CUDA's compiled code reads the launch sizes from constant bank 0
 
 Code that NVCC compiles reads `blockDim` and `gridDim` from the start of
@@ -91,18 +101,52 @@ is stopped").
 
 ### A map into an empty region pays for its page tables
 
-On the RTX 5000 Ada, `NV_ESC_RM_MAP_MEMORY_DMA` of a 64 KiB allocation takes
-21.4 µs when nothing else is mapped in its region of the GPU's address space,
-and 8.6 µs with the same parameters when one other allocation lives there.
-Measured per ioctl with an `LD_PRELOAD` counter. We read the difference as the
-RM building the region's page tables at its first map and freeing them at its
-last unmap. A 64 KiB allocation and free took 73.5 µs alone and 46.0 µs beside
-one live 4 KiB allocation.
+On the RTX 5000 Ada, the RM's own map, `NV_ESC_RM_MAP_MEMORY_DMA`, of a
+64 KiB allocation takes 21.4 µs when nothing else is mapped in its region of
+the GPU's address space, and 8.6 µs with the same parameters when one other
+allocation lives there. Measured per ioctl with an `LD_PRELOAD` counter. We
+read the difference as the RM building the region's page tables at its first
+map and freeing them at its last unmap. A 64 KiB allocation and free through
+that map took 73.5 µs alone and 46.0 µs beside one live 4 KiB allocation. No
+path makes that map now (the next note).
 
-A driver that allocates and frees small buffers in an otherwise empty region
-pays this every time. Long-lived memory of the driver in the same region
-keeps the tables; allocation benches hold one live allocation of the kind, as
-a running program does.
+The unified memory driver's map pays less for an empty region. Through it
+alone, a 64 KiB allocation and free of Device memory takes 50.3 µs alone and
+42.1 µs beside one live 4 KiB allocation, and of Pinned or Mapped memory
+46.8 µs and 56.8 µs either way. Measured on fudge, medians of 7 runs of 200,
+in two runs.
+
+A driver that allocates and frees small Device buffers in an otherwise empty
+region pays this every time. Long-lived memory of the driver in the same
+region keeps the tables; allocation benches hold one live allocation of the
+kind, as a running program does.
+
+### The RM's own mappings stop at about 39 GiB a GPU
+
+`NV_ESC_RM_MAP_MEMORY_DMA` maps a memory object into a device's virtual memory
+object (`NV01_MEMORY_VIRTUAL`), in the RM's own page tables. An object made
+with no address space named (`hVASpace` 0) lies in the device's default
+address space, which the RM makes for a device whose client shares it with
+itself (`vaspaceGetByHandleOrDeviceDefault`, `deviceInitClientShare`; read in
+source, open-gpu-kernel-modules 570 and 615). A channel runs in the address
+space its context share names, and rig's name the externally owned
+`FERMI_VASPACE_A` that the unified memory driver registers and fills, so its
+work never reads the default one's mappings. On the RTX 5000 Ada (32 GiB) in a
+machine of 62 GiB, with every map in 4 KiB pages, the RM refuses it with
+`NV_ERR_NO_MEMORY` once about 39.04 GiB is mapped this way for the GPU,
+counting GPU memory and host memory alike, and every process's: 39 maps of 1
+GiB of one shared memory file, 156 of 256 MiB or 2,498 of 16 MiB; 15 GiB of
+host memory beside 24 GiB of GPU memory; 9 GiB in a second process while the
+first held 30 GiB. A map succeeds again once others are freed. The unified
+memory driver's `UVM_MAP_EXTERNAL_ALLOCATION` maps the same objects into the
+channels' address space, from the memory's own description, and with no RM map
+it mapped 160 maps of 1 GiB of one file, and 70 beside 24 GiB of GPU memory.
+CUDA page-locked 61 maps of 1 GiB of one file, beside 24 GiB of its own GPU
+memory or not, then answered `CUDA_ERROR_OUT_OF_MEMORY`. Measured from forked
+children on fudge, driver 615.
+
+The NVIDIA kernel path maps its memory through the unified memory driver
+alone, so no RM map bounds it.
 
 ### Rings in host memory cost less host time than rings in BAR1
 
@@ -202,6 +246,15 @@ alone, medians of three runs.
 The CUDA driver orders work within a device by events, and waits on other
 devices' words in batches of at most 255.
 
+### A copy beside a kernel runs at its own speed
+
+On the RTX 5000 Ada, an upload of 256 MiB from page-locked host memory on a
+second stream took 10.69 ms beside a 10 ms launch of 600 groups of 256
+threads, enough to fill every multiprocessor: as long as it took alone. The
+two one after the other took 20.69 ms. Measured through rig.cuda's two
+streams on fudge, medians of 9. A driver that runs its copies on a stream
+of their own beside its kernels halves such a pair's time.
+
 ## AMD under KFD
 
 ### KFD refuses a queue whose context save area is short of its rule
@@ -245,8 +298,9 @@ host-visible GPU memory (below).
 
 ### Without resizable BAR no GPU memory is host-visible
 
-With resizable BAR off, the R9700's BAR0 is 256 MiB and KFD's topology lists
-no memory bank of the public heap type (`heap_type` 1), only private ones.
+With resizable BAR off, the R9700's BAR0 is 256 MiB (512 MiB at most once
+resized, below) and KFD's topology lists no memory bank of the public heap
+type (`heap_type` 1), only private ones.
 Memory the host writes in GPU memory through the BAR does not exist on that
 machine, and a driver falls back to host memory: reading 1 MiB took 0.041 ms
 from both, where reading it across the bus would take milliseconds. A driver
@@ -365,7 +419,7 @@ enumerations that aqlprofile ships (`vega10_enum.h`, `soc21_enum.h`,
 For gfx942 and gfx950, 60 of the 91 SQ event names the two share have
 different numbers; for GFX12, `GL2C_HIT` is 39 in the enumeration and 41 in
 the YAML. The AMD ABI library's counter table comes from `counter_defs.yaml`,
-the one AMD's profiler counts with (`lib/amd/abi/gen/gen.py`). The files were
+the one AMD's profiler counts with (`lib/amd/gen/gen.py`). The files were
 compared; no gfx942 or gfx950 GPU ran the counters here.
 
 ### CDNA drops completion interrupts whose context id is 0
@@ -405,8 +459,8 @@ than spinning (`wake/driver` against `release/driver` in bench/amd).
 KFD keeps one GPU address space per GPU per process, bound to one render node
 file by `AMDKFD_IOC_ACQUIRE_VM`; the process cannot hold a second one on the
 same GPU through another file. A memory fault in that address space reaches
-every user of the GPU in the process. The AMD bench runs its C floors, which
-make their own queues, in worker processes for this reason.
+every user of the GPU in the process. The AMD bench opens each case's device
+in a worker process of its own for this reason.
 
 ### The stable power state has one holder
 
@@ -431,6 +485,62 @@ whose low half is above the target's. The AMD driver waits in its queue on
 another device's word only from a firmware version seen to do this, per GC
 version (`wait64_from` in `lib/amd/rig_amd.ml`); elsewhere the wait is the
 host's.
+
+### A KFD process can outlive its process and pin amdgpu
+
+On the R9700, KFD kept a process for 44 hours after it exited: a directory
+under `/sys/class/kfd/kfd/proc/` with 320 KiB of GPU memory and no queues,
+and a client of the GPU's DRM device in debugfs's `clients` list, named
+`<unknown>`, whose process did not exist. No live process held a KFD, DRM
+or dma-buf file. While it stayed, `Rig_amd_pci.detach` refused the GPU (the
+kernel holds a file of its DRM device for that process) and
+`modprobe -r amdgpu` answered that the module is in use. Only a reboot
+cleared it. What left it is not known.
+
+## AMD over PCI
+
+### On the R9700's host BAR0 grows to 512 MiB at most
+
+The R9700's BAR0 offers every size from 256 MiB to 32 GiB
+(`resource0_resize` reads `0xff00`), and the host's firmware assigns it
+256 MiB below 4 GiB. Asked for the largest size its bridges hold, as
+`Rig_amd_pci.detach` asks, Linux refused each size from 32 GiB down to
+1 GiB, with "can't assign; no space" for every bridge up to the root port,
+and assigned 512 MiB at `0xc0000000`, the bridges' prefetchable window
+becoming `0xb0000000`–`0xdfffffff`. The host gives the GPU no 64-bit window
+above 4 GiB, likely because its firmware's Above 4G decoding is off; that
+setting was not read. amdgpu, bound after the resize, reports
+`BAR=512M` against 32,624 MiB of memory. A driver-less boot of this GPU
+therefore reads the discovery table a word at a time through `MM_INDEX`,
+`MM_INDEX_HI` and `MM_DATA`, and places its page tables in their own pool
+(`Page_table.Pool`).
+
+### The R9700's blocks
+
+The R9700's discovery table, read through the index window after a detach,
+lists GC 12.0.1, SDMA0 and SDMA1 7.0.1, MP0 and MP1 14.0.3, MMHUB 4.1.0,
+OSSSYS 7.0.0, NBIF 6.3.1, HDP 7.0.0, ATHUB 4.1.0, DF 4.15.1, UMC 8.14.0,
+PCIE 6.1.0, LSDMA 7.0.1, DMU 4.1.0, SMUIO, THM, FUSE and CLKA 14.0.2, with
+no instance fused off. Its GC has 4 shader engines of 2 arrays of 8
+compute units, 64 in all, 16 waves per SIMD and 64 KiB of LDS. Its
+register BAR (BAR 5) holds 131,072 words, so the registers a boot's plan
+reads (`SCRATCH_REG6`, `SCRATCH_REG7`, the GC hub's fault status) lie
+inside it, with no access through the RSMU window. The boot report finds
+the eight images `rig_amd_pci.mli` names for it, and each is laid out as
+its format says.
+
+### amdgpu leaves the security processor's OS running
+
+Right after amdgpu unbinds from the R9700, the security processor's OS
+runs (its `C2PMSG_81` is not zero), its bootloader is not ready, and
+`SCRATCH_REG6`, `SCRATCH_REG7` and the GC hub's fault status read 0: no
+mark of this library, so a driver-less open plans a reset first (`Booted`
+in `lib/amd/pci/boot.mli`). `Rig_amd_pci.reset` resets it whole in 1.1 s
+with bus mastering off throughout, and its configuration reads back as
+saved. amdgpu's probe resets the GPU itself (mode 1) when it finds the OS
+running, as it does at every rebind and module load after its own session;
+after `Rig_amd_pci.reset` and `Rig_amd_pci.attach` its probe initialized
+the GPU with no reset of its own, which shows that no firmware ran.
 
 ## Apple GPUs under Metal
 
@@ -694,12 +804,6 @@ for each allocation wherever it has room. Unified memory maps a range for a
 GPU only in the lower half of the CPU's addresses (`uvm_gpu_can_address`),
 which bounds where the kernel places a mapping without a hint.
 
-On the kernel path of an RTX 5000 Ada with 62 GiB of RAM, the RM refuses
-`NV_ESC_RM_MAP_MEMORY_DMA` with `NV_ERR_NO_MEMORY` once about 39 GiB of host
-memory is mapped for the GPU in 4 KiB pages, however it is split: after 39
-maps of 1 GiB, or 156 of 256 MiB, of one shared memory file. Run on fudge,
-driver 615.
-
 ### x86_64 AddressSanitizer owns 2.25 GiB to 2 TiB
 
 On x86_64 Linux, ASan's shadow gap covers `0x00008fff7000` to
@@ -812,9 +916,12 @@ detaches an AMD GPU reloads the module before KFD's users come back.
 ## Round trips on these machines
 
 Medians of loops in C (Objective-C on the M1 Max) over each vendor's
-interface: the floors the drivers' benches compare against (`release/floor`,
-`launch/floor-1`, `launch/floor-64` and the copy floors in each driver's
-bench).
+interface: what each operation costs with no runtime above it. The
+`vendor` scenario of [bench/compare](../bench/compare/README.md) runs the
+releases and copies through CUDA, HIP and Metal. The RM and KFD columns
+came from loops over the kernel drivers' own interfaces, which no program
+in the tree runs; compare's CUDA and HIP cases stand in for them on those
+GPUs.
 
 | | RTX 5000 Ada, RM | RTX 5000 Ada, CUDA | R9700, KFD | M1 Max, Metal |
 |---|---|---|---|---|
@@ -841,7 +948,8 @@ has one memory, so its copies are the host's.
 - On the R9700 rows that wait on a copy-queue fence are bimodal between
   processes (see the TRAP note above): a round trip that switches queues takes
   14.5 or 18.8-19.8 µs, a 16-byte copy 3.9 to 6.1 µs. One session ran every
-  latency row, floors included, 1.6 times slower; its cause was not found.
+  latency row, the vendor loops included, 1.6 times slower; its cause was not
+  found.
 - The R9700's own link reads 32 GT/s to its PCIe switch, but the root port
   above runs PCIe 3.0 x16, and host copies stop at its 15.75 GB/s. A link
   budget reads every hop up to the root port.

@@ -34,7 +34,7 @@ enum {
   T_ACQUIRE,      /* (address, value): wait until the word is at least value */
   T_RELEASE,      /* (address, value): wait for idle, then write value */
   T_COPY_RELEASE, /* (address, value): after the copies, write value */
-  T_COPY,         /* (dst, src, bytes): one copy of at most COPY_MAX bytes */
+  T_COPY,         /* (dst, src, bytes): one line of at most COPY_MAX bytes */
   T_LOCAL,        /* (address, per_tpc): the compute channel's local memory */
   T_SETUP,        /* (): a channel's engine binding, and compute's windows */
   T_SETUP_COPY,   /* (): the copy channel's engine binding */
@@ -43,14 +43,22 @@ enum {
   T_SCHEDULE,     /* (address): schedule the launch descriptor there */
   T_STAMP,        /* (address, value): T_RELEASE, and the timer at +8 */
   T_COPY_STAMP,   /* (address, value): T_COPY_RELEASE, and the timer at +8 */
+  T_FILL,         /* (dst, word, count): count 4-byte components of word */
+  T_FILL_BYTES,   /* (dst, byte, count): count bytes of byte */
+  T_BOX,          /* (dst, src, width, rows, dst_pitch, src_pitch) */
   TEMPLATES
 };
 
 /* A channel template's bytes, and its values: two addresses or an address
-   and a value, then a size. */
+   and a value, then a size, then a box's rows and pitches. */
 #define TEMPLATE_WORDS 16
-#define TEMPLATE_VALUES 3
+#define TEMPLATE_VALUES 6
+
+/* The most bytes of a copy's row or a fill's launch (Rig_nv_abi.Method's
+   max_copy), and the most rows and pitch bytes of a copy's launch:
+   LINE_COUNT, PITCH_IN and PITCH_OUT are 32 bits (clc7b5.h). */
 #define COPY_MAX (UINT64_C(1) << 31)
+#define LINES_MAX UINT64_C(0xFFFFFFFF)
 
 /* The most bytes of a segment: an entry's length holds 2^21 - 1 words
    (clc56f.h, GP_ENTRY1_LENGTH 30:10). */
@@ -114,6 +122,8 @@ enum {
   V_BANK0,  /* the address of its constant bank 0 */
   V_NEXT,   /* the address of the descriptor it chains */
   V_SHARED, /* its dynamic shared memory, in bytes, a multiple of 128 */
+  V_WORD,   /* the address its release writes */
+  V_VALUE,  /* the value its release writes */
   VALUES
 };
 
@@ -125,6 +135,9 @@ struct launch {
   /* [qmd[s][c]]: without (s = 0) or with dynamic shared memory, chaining
      no descriptor (c = 0) or the one at V_NEXT */
   struct template qmd[2][2];
+  /* [released[s]]: qmd[s][0], which also writes V_VALUE at V_WORD as its
+     launch completes */
+  struct template released[2];
   struct template bank0;
   /* where the kernel's parameters start in bank 0, how many it reads, and
      the bank's bytes the descriptor names, which hold them */
@@ -339,8 +352,9 @@ struct device {
   _Atomic uint64_t local;
   /* whether the compute caches are owed an invalidation */
   _Atomic int invalidate;
-  /* The driver's byte-copy kernel; owned until confirmed channel stop. */
-  struct launch *copy_launch;
+  /* The driver's byte-copy and fill kernels; owned until confirmed channel
+     stop. */
+  struct launch *copy_launch, *fill_launch;
   /* The rings a growth made, which the next room that needs them installs,
      and the rings installed, NULL for those the device opened with: each
      channel's segment ring, then COMPUTE's launch ring. A room retires the

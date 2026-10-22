@@ -549,7 +549,8 @@ let test_copy_across () =
        (Testable.structural ~pp:(fun ppf s ->
             Format.pp_print_string ppf
               (match s with `None -> "none" | `Src -> "src" | `Dst -> "dst"))))
-    [ `Src; `Dst; `None ] (P.copy_sides p)
+    [ `Src; `Dst; `None ]
+    (List.map (fun (c : P.copy) -> c.local) (P.copies p))
 
 (* An empty buffer of a driver's device names no memory: its address and its
    handle are 0. *)
@@ -990,9 +991,9 @@ let test_mapless_pair () =
   equal ~msg:"bytes that differ" int 0 wrong;
   equal ~msg:"host maps" (list int) [] (P.host_maps pd @ P.host_maps pe)
 
-(* Copies between two such devices both ways run concurrently, each through a
-   slot of each device's staging memory. Two copies each way, with both
-   devices' sleeps held: all four wait at the gates at once, none for a slot.
+(* Copies between two such devices both ways run concurrently, each through
+   halves of each device's staging memory. Two copies each way, with both
+   devices' sleeps held: all four wait at the gates at once, none for a half.
    Every copy lands once the gates open. *)
 let test_mapless_pair_slots () =
   let open_ name =
@@ -1020,12 +1021,15 @@ let test_mapless_pair_slots () =
     (List.init 4 (fun k -> String.make 64 (Char.chr (Char.code 'a' + k))))
     (List.map (fun (_, dst) -> contents dst) copies)
 
-(* Three copies at once from the host to [d], a device that maps no host
-   memory, held at [p]'s gate until all three wait there: each makes a half
-   of 32 MiB of [d]'s [Pinned] memory. The copies' destinations. *)
-let staging_burst d p =
-  let srcs = List.map (fun c -> filled 64 c) [ 'a'; 'b'; 'c' ] in
-  let dsts = List.map (fun _ -> B.create d 64) srcs in
+(* Three copies at once from [d], whose memory the host does not address, to
+   the host, held at [p]'s gate until all three wait there for [d]'s legs into
+   staging memory: each makes a half of 32 MiB, since a device writes only a
+   half whose work is done. [burst_from p srcs] copies from [srcs], made by
+   [sources], and is the copies' destinations. *)
+let sources d = List.map (on d) [ 'a'; 'b'; 'c' ]
+
+let burst_from p srcs =
+  let dsts = List.map (fun _ -> B.create Rig.host 64) srcs in
   P.gate p;
   let copier src dst = Thread.create (fun () -> B.copy ~src ~dst) () in
   let copiers = List.map2 copier srcs dsts in
@@ -1034,10 +1038,12 @@ let staging_burst d p =
   List.iter Thread.join copiers;
   dsts
 
+let staging_burst d p = burst_from p (sources d)
+
 let burst_landed dsts =
   equal ~msg:"the copies' bytes" (list string)
     (List.map (String.make 64) [ 'a'; 'b'; 'c' ])
-    (List.map contents dsts)
+    (List.map bytes dsts)
 
 (* Staging memory keeps what concurrent copies made for later copies, through
    collections, and returns it at [Rig.free_cache]. *)
@@ -1071,28 +1077,18 @@ let test_staging_pressure () =
   burst_landed dsts
 
 (* Staging memory keeps the halves that later copies use, and returns those
-   that as many later copies as it has slots did not use, without waiting
-   for a collection. Copies from the
-   host to [d], whose memory the host does not address, stage through the
-   host's halves, each mapped on [d] at its first use. After a burst of
-   three, three copies in turn use one slot alone, the two halves they passed
-   by go back with their mappings at the next drain, and a second burst maps
-   two new halves. *)
+   that as many later takes as it has halves did not take, without waiting
+   for a collection. Copies between the host and [d], whose memory the host
+   does not address, stage through the host's halves, each mapped on [d] at
+   its first use. After a burst of three, three copies in turn put their
+   bytes one after the other in one half, the two halves they passed by go
+   back with their mappings at the next drain, and a second burst maps two
+   new halves. *)
 let test_staging_window () =
   let d, p = P.open_ ~host_visible:false "buffer:staging-window" in
   let maps () = List.length (P.host_maps p) in
-  let burst () =
-    let srcs = List.map (fun c -> filled 64 c) [ 'a'; 'b'; 'c' ] in
-    let dsts = List.map (fun _ -> B.create d 64) srcs in
-    P.gate p;
-    let copier src dst = Thread.create (fun () -> B.copy ~src ~dst) () in
-    let copiers = List.map2 copier srcs dsts in
-    Support.await "three copies waiting" (fun () -> P.sleepers p = 3);
-    P.open_gate p;
-    List.iter Thread.join copiers;
-    dsts
-  in
-  let first = burst () in
+  let srcs = sources d and later = sources d in
+  let first = burst_from p srcs in
   let after_burst = maps () in
   List.iter
     (fun c -> B.copy ~src:(filled 64 c) ~dst:(B.create d 64))
@@ -1101,12 +1097,35 @@ let test_staging_window () =
   ignore (B.create Rig.host 0);
   equal ~msg:"halves mapped once the copies in turn return" int 1
     (List.length (List.filter (( = ) (32 lsl 20)) (P.outstanding p)));
-  let second = burst () in
+  let second = burst_from p later in
   equal ~msg:"maps of the second burst" int (after_burst + 2) (maps ());
   burst_landed first;
   burst_landed second
 
-(* Copies through one staging memory run concurrently, each through a slot of
+(* Copies from host memory that the host writes into staging memory put their
+   pieces one after the other in one half, and wait for no work there: a copy
+   gives its half back once the host wrote its piece, and while it waits for
+   the device's leg, a second copy writes after it in the same half, which the
+   device maps once. *)
+let test_staging_packed () =
+  let d, p = P.open_ ~host_visible:false "buffer:staging-packed" in
+  let dsts = [ B.create d 64; B.create d 64 ] in
+  P.gate p;
+  let copier c dst = Thread.create (fun () -> B.copy ~src:(filled 64 c) ~dst) () in
+  let first = copier 'a' (List.nth dsts 0) in
+  Support.await "the first copy waiting" (fun () -> P.sleepers p = 1);
+  let second = copier 'b' (List.nth dsts 1) in
+  Support.await "both copies waiting" (fun () -> P.sleepers p = 2);
+  P.open_gate p;
+  Thread.join first;
+  Thread.join second;
+  equal ~msg:"halves mapped" int 1
+    (List.length (List.filter (( = ) (32 lsl 20)) (P.host_maps p)));
+  equal ~msg:"the copies' bytes" (list string)
+    [ String.make 64 'a'; String.make 64 'b' ]
+    (List.map contents dsts)
+
+(* Copies through one staging memory run concurrently, each through halves of
    its own: three copies wait on a device at once, and every copy lands once
    the device runs. *)
 let test_staging_turns () =
@@ -1176,12 +1195,13 @@ let breaks f =
     ~finally:(fun () -> Sys.catch_break false)
     (fun () -> match f () with _ -> false | exception Sys.Break -> true)
 
-(* A copy through the staging memory gives its slot back on every exit. A copy
-   of two pieces from an io device to a device that maps no host memory queues
-   the first piece's leg out of its slot, then its second read fails; the wait
-   for that leg is interrupted. Two such copies, then a third that lands, all
-   go through the halves the first made. Each broken copy released its claim
-   on its destination. *)
+(* A copy through the staging memory gives its halves back on every exit. A
+   copy of three pieces from an io device to a device that maps no host
+   memory queues the legs out of both its halves, then waits for the first
+   half's leg before it reads the third piece into it, and that wait is
+   interrupted. Two such copies, then a third that lands, all go through the
+   halves the first made. Each broken copy released its claim on its
+   destination. *)
 let test_staging_gives_back () =
   let d, p = staging_device "buffer:staging-gives-back" in
   let halves () =
@@ -1190,7 +1210,7 @@ let test_staging_gives_back () =
          (fun (k, n, _) -> k = B.Pinned && n = 32 lsl 20)
          (P.allocs p))
   in
-  let n = (32 * 1024 * 1024) + 8 in
+  let n = (2 * 32 * 1024 * 1024) + 8 in
   let copy reads dst = B.copy ~src:(B.create (cut reads) n) ~dst in
   for i = 1 to 2 do
     P.interrupt p;
@@ -1198,7 +1218,7 @@ let test_staging_gives_back () =
     equal
       ~msg:(Printf.sprintf "copy %d broke" i)
       bool true
-      (breaks (fun () -> copy 1 dst));
+      (breaks (fun () -> copy 2 dst));
     is_some
       ~msg:(Printf.sprintf "copy %d's destination donated after it" i)
       (Support.donated dst)
@@ -1206,7 +1226,7 @@ let test_staging_gives_back () =
   let copied = Atomic.make false in
   let third =
     Domain.spawn (fun () ->
-        copy 2 (B.create d n);
+        copy 3 (B.create d n);
         Atomic.set copied true)
   in
   Support.await "the third copy" (fun () -> Atomic.get copied);
@@ -1240,7 +1260,7 @@ module Hooked = struct
 end
 
 (* A staged copy from a callback inside a copy inside a copy, on the thread
-   that holds two slots of the staging memory, makes a third and lands, and
+   that holds two halves of the staging memory, makes a third and lands, and
    so do both outer copies. *)
 let test_staging_held () =
   let d, _ = P.open_ ~host_visible:false "buffer:staging-held" in
@@ -1595,6 +1615,40 @@ let test_blits_staged_large () =
   B.blit_to_bytes b 0 got 0 n;
   equal ~msg:"bytes the fill missed" int 0 (differ (String.make n 'q') got)
 
+(* A fill of memory the host does not address is one fill of its byte on the
+   device's copy engine, which reads no memory, and stages nothing: Polled
+   runs one copy part, a fill of one row of the view's bytes. An empty fill
+   runs none. *)
+let test_fill_on_engine () =
+  let d, p = P.open_ ~host_visible:false "buffer:fill-engine" in
+  let b = B.create d 4099 in
+  B.fill (B.view b ~first:3 ~length:4096) 'f';
+  B.fill (B.view b ~first:0 ~length:0) 'e';
+  let pp ppf (c : P.copy) =
+    Format.fprintf ppf "{ width = %d; rows = %d; dst_pitch = %d; fill = %s }"
+      c.width c.rows c.dst_pitch
+      (match c.fill with Some c -> Printf.sprintf "%C" c | None -> "None")
+  in
+  let copy = Testable.make ~pp ~equal:( = ) in
+  equal (list copy)
+    [
+      {
+        local = `None;
+        device_memory = true;
+        width = 4096;
+        rows = 1;
+        src_pitch = 0;
+        dst_pitch = 4096;
+        fill = Some 'f';
+      };
+    ]
+    (P.copies p);
+  let got = Bytes.create 4099 in
+  B.blit_to_bytes b 0 got 0 4099;
+  equal ~msg:"the view's bytes" string (String.make 4096 'f')
+    (Bytes.sub_string got 3 4096);
+  Rig.close d
+
 (* Host access *)
 
 (* The host reads and writes the memory of a device that it addresses as the
@@ -1822,6 +1876,108 @@ let test_bigarray_shares () =
   equal ~msg:"the bytes" char 's' view.{4095};
   ignore (Sys.opaque_identity m)
 
+(* Another function's DMA
+
+   Polled describes a region as one run of its own address and bytes. *)
+
+let fn = "0000:41:00.0"
+
+let pp_dma ppf = function
+  | Rig_edge.Bus runs ->
+      Format.fprintf ppf "Bus [%s]"
+        (String.concat "; "
+           (List.map (fun (a, n) -> Printf.sprintf "(0x%x, %d)" a n) runs))
+  | Dmabuf { fd; offset } ->
+      Format.fprintf ppf "Dmabuf { fd = %d; offset = %d }" fd offset
+
+let dma_answer = result (Testable.make ~pp:pp_dma ~equal:( = )) string
+
+(* A view's answer describes the allocation it lies in, and the memory leaves
+   the claims, so no donation writes what the function reads. *)
+let test_dma () =
+  let d, p = P.open_ "buffer:dma" in
+  let b = B.create d 4096 in
+  let v = B.view b ~first:16 ~length:32 in
+  equal ~msg:"the whole allocation" dma_answer
+    (Ok (Rig_edge.Bus [ (Support.at b, 4096) ]))
+    (B.dma v ~fn);
+  equal ~msg:"asked of the driver" int 1 (count "dma" p);
+  is_none ~msg:"never donated" (Support.donated b);
+  let other = B.create d 64 in
+  P.fail_at p 1 (`Refuse 1);
+  equal ~msg:"the driver's refusal" dma_answer (Error "Polled: dma refused")
+    (B.dma other ~fn)
+
+(* A borrow's answer is its memory's owner's: the owner's driver describes
+   its own region, and the borrower's is not asked. *)
+let test_dma_borrow () =
+  let owner, p = P.open_ "buffer:dma-owner" in
+  let borrower, q = P.open_ "buffer:dma-borrower" in
+  let b = B.create owner 4096 in
+  let borrowed = require_some (B.borrow borrower b) in
+  equal ~msg:"the owner's allocation" dma_answer
+    (Ok (Rig_edge.Bus [ (Support.at b, 4096) ]))
+    (B.dma borrowed ~fn);
+  equal ~msg:"asked of the owner" int 1 (count "dma" p);
+  equal ~msg:"not of the borrower" int 0 (count "dma" q)
+
+(* Collected memory a function reaches goes back to its driver, where memory
+   no function reaches returns to the cache and is reused. *)
+let test_dma_uncached () =
+  let d, p = P.open_ "buffer:dma-uncached" in
+  let n = 4096 in
+  let freed at = List.exists (fun (a, _) -> a = at) (P.frees p) in
+  let first = ref (Some (B.create d n)) in
+  let at = Support.at (Option.get !first) in
+  first := None;
+  collect d;
+  equal ~msg:"cached, not freed" bool false (freed at);
+  let second = ref (Some (B.create d n)) in
+  equal ~msg:"reused from the cache" int at (Support.at (Option.get !second));
+  ignore (B.dma (Option.get !second) ~fn : (Rig_edge.dma, string) result);
+  second := None;
+  collect d;
+  equal ~msg:"given back to the driver" bool true (freed at)
+
+let dma b () = ignore (B.dma b ~fn : (Rig_edge.dma, string) result)
+
+let dma_refusals =
+  let polled name = fst (P.open_ name) in
+  [
+    ("the host's memory", fun () -> B.create Rig.host 64);
+    ("a memory device's", fun () -> B.create (memory "buffer:dma-memory") 64);
+    ("an io device's", fun () -> B.create (Support.io "buffer:dma-io") 64);
+    ("an empty buffer", fun () -> B.create (polled "buffer:dma-empty") 0);
+    ( "a dead buffer",
+      fun () ->
+        let b = B.create (polled "buffer:dma-dead") 64 in
+        ignore (Support.donated b);
+        b );
+  ]
+
+let test_dma_refused (_, make) = raises_match Exn.invalid_arg (dma (make ()))
+
+let test_dma_exclusive () =
+  let d, _ = P.open_ "buffer:dma-exclusive" in
+  let held = B.create d 64 in
+  Rig.Claim.with_ ~read:[] ~donate:[ held ] (fun c ->
+      equal ~msg:"held exclusive" bool true (Rig.Claim.exclusive c held);
+      raises_match ~msg:"memory held exclusive" Exn.invalid_arg (dma held))
+
+let test_dma_lost () =
+  let d, p = P.open_ "buffer:dma-lost" in
+  let b = B.create d 64 in
+  P.fault p "gone";
+  raises_match lost (dma b)
+
+let test_bus () =
+  let d, _ = P.open_ ~bus:"0000:03:00.0" "buffer:bus" in
+  let none, _ = P.open_ "buffer:no-bus" in
+  equal ~msg:"its driver's fact" (option string) (Some "0000:03:00.0")
+    (Rig.bus d);
+  equal ~msg:"none stated" (option string) None (Rig.bus none);
+  equal ~msg:"the host" (option string) None (Rig.bus Rig.host)
+
 let tests =
   [
     group ~timeout "host buffers"
@@ -1920,6 +2076,8 @@ let tests =
           test_mapless_pair_slots;
         test "copies through one staging memory run concurrently"
           test_staging_turns;
+        test "small copies the host stages share a half and wait for no work"
+          test_staging_packed;
         test "staging memory keeps its halves until free_cache"
           test_staging_kept;
         test "staging memory's free halves return under pressure"
@@ -1928,7 +2086,7 @@ let tests =
           test_staging_window;
         test "a loss with the staging memory leaves other copies working"
           test_staging_after_loss;
-        test "a staged copy gives its slot back on every exit"
+        test "a staged copy gives its halves back on every exit"
           test_staging_gives_back;
         test "a staged copy inside two staged copies on one thread lands"
           test_staging_held;
@@ -1971,6 +2129,10 @@ let tests =
           (law_fill Unaddressed);
         test "blits and a fill through several staging pieces keep every byte"
           test_blits_staged_large;
+        test
+          "a fill of memory the host does not address is one fill on its \
+           copy engine"
+          test_fill_on_engine;
         test "a blit waits as a host access of its kind does" test_blit_waits;
       ];
     group ~timeout "host access"
@@ -2007,6 +2169,21 @@ let tests =
         test "reached raises Lost where a wait does" test_reached_lost;
         cases ~name:fst "a host access keeps its buffer through its wait"
           host_accesses test_wait_keeps;
+      ];
+    group ~timeout "another function's DMA"
+      [
+        test
+          "dma describes the whole allocation as its driver does and shares \
+           the memory"
+          test_dma;
+        test "a borrow's answer is its memory's owner's" test_dma_borrow;
+        test "memory dma described goes back to its driver, never the cache"
+          test_dma_uncached;
+        cases ~name:fst "dma refuses memory no driver gives" dma_refusals
+          test_dma_refused;
+        test "dma refuses memory held exclusive" test_dma_exclusive;
+        test "dma of a lost device's memory raises Lost" test_dma_lost;
+        test "bus is the driver's fact" test_bus;
       ];
   ]
 

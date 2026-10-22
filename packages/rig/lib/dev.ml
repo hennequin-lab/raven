@@ -144,9 +144,9 @@ end
 module Cache = Tbl.Make (Int)
 module Strings = Tbl.Make (String)
 
-let no_waits = { Rig_edge.stores = false; hosts = false; most = 0 }
+let no_waits = { Rig_edge.stores = false; hosts = false }
 
-let make_device ~index ~name ~machine ~kind ~c ~arch ~queues ~copy_engine
+let make_device ~index ~name ~machine ~kind ~c ~arch ~bus ~queues ~copy_engine
     ~completion ~waits ~hang_ms ~maps_host ~alignment ~host_addresses ~word
     ~word_region ~key ~memory_device ~fault ~capability ~budget ~opened =
   let live =
@@ -173,12 +173,12 @@ let make_device ~index ~name ~machine ~kind ~c ~arch ~queues ~copy_engine
       freeing = false;
       pending = ([], []);
       pairs = [||];
-      retired = [];
       words = 0;
       word_maps = [];
       mapped = Cache.create 4;
-      slots = [||];
-      claims = 0;
+      halves = [||];
+      takes = 0;
+      laps = 0;
     }
   in
   {
@@ -199,6 +199,7 @@ let make_device ~index ~name ~machine ~kind ~c ~arch ~queues ~copy_engine
     live;
     base = c_base c;
     opened;
+    bus;
   }
 
 (* The host's fault, which nothing raises. *)
@@ -214,9 +215,9 @@ let host =
   let queues = [| { Rig_edge.name = "COMPUTE:0"; runs = [ Launch ] } |] in
   let d =
     make_device ~index:0 ~name:"CPU" ~machine:Here ~kind:Host
-      ~c:(c_host_new "CPU") ~arch:(host_arch ()) ~queues ~copy_engine:None
-      ~completion:Rig_edge.Host ~waits:no_waits ~hang_ms:None ~maps_host:false
-      ~alignment:malloc_alignment ~host_addresses:false
+      ~c:(c_host_new "CPU") ~arch:(host_arch ()) ~bus:None ~queues
+      ~copy_engine:None ~completion:Rig_edge.Host ~waits:no_waits ~hang_ms:None
+      ~maps_host:false ~alignment:malloc_alignment ~host_addresses:false
       ~word:(Nativeint.to_int (c_slot_word 0))
       ~word_region:None ~key:(-1)
       ~memory_device:false
@@ -471,8 +472,8 @@ let stopped (d : device) =
   end
 
 (* Frees [d]'s slot once [d] has stopped and nothing of it remains to give
-   back: no token its drains have not routed, nothing in its cache, among its
-   retiring memory or its retired mappings, or waiting for a value.
+   back: no token its drains have not routed, nothing in its cache or among
+   its retiring memory, and no release waiting for a value.
    [caml_rig_free] checks the rest.
    Its record then answers as it stood, and a later device takes the slot,
    continuing its timeline. Whether this call freed it. *)
@@ -481,7 +482,6 @@ let free_slot d =
   d.index > 0 && stopped d
   && l.cached = 0
   && l.nretiring = 0
-  && l.retired == []
   && fst l.pending == []
   && c_free l.c d
 
@@ -714,7 +714,20 @@ let rec settle d v =
   if r = Answer.failed then run_own d;
   if r = Answer.busy then settle d v else r = Answer.ok
 
-let signaled = word
+(* A lost device's word of its driver's own moves only where rig reads it
+   through the driver: its stop raises it, or the work the stop left running
+   writes it. A read there is a driver call refused as lost, so it runs the
+   owed stop first, and reads the word once the stop returned. Inside a lock it
+   takes neither lock and answers the slot's word. A word in rig's array moves
+   by itself. *)
+let signaled d =
+  if d.live.word <> 0 || not (is_lost d) then word d
+  else if holds () <> 0 then slot_word d
+  else begin
+    run_own d;
+    if state d = ended_state then refresh d;
+    slot_word d
+  end
 
 (* The word of a live device, or [-1] once a read of a word of its driver's
    own found it lost, which its line then answers for. A word in rig's array
@@ -834,6 +847,16 @@ let is_done p =
   if not (owns d p) then c_done p
   else
     let w = live_word d in
+    if is_lost d then c_done p else w >= Point.value p
+
+(* [is_done] from the values rig has seen: the slot's word, which a device
+   behind a transport moves only when rig reads its word through the driver,
+   so it calls no driver. *)
+let seen_done p =
+  let d = of_index (Point.index p) in
+  if not (owns d p) then c_done p
+  else
+    let w = slot_word d in
     if is_lost d then c_done p else w >= Point.value p
 
 (* [wait_point]'s reads and commit without its wait: a done point answers
@@ -1092,7 +1115,7 @@ let driver_device (type a) (module D : Rig_edge.Driver with type t = a)
   let d =
     make_device ~index ~name ~machine
       ~kind:(Driver { m; h; rid })
-      ~c ~arch:f.arch ~queues ~copy_engine:f.copy_engine
+      ~c ~arch:f.arch ~bus:f.bus ~queues ~copy_engine:f.copy_engine
       ~completion:f.completion
       ~waits:f.waits ~hang_ms:f.hang_ms ~maps_host:f.maps_host
       ~alignment:f.alignment ~host_addresses:f.host_addresses ~word
@@ -1145,11 +1168,12 @@ let open_io (type a) (module I : Rig_edge.Io with type t = a) ~machine ~name
         let d =
           make_device ~index ~name:full ~machine
             ~kind:(Io { m = (module I); h })
-            ~c ~arch:"" ~queues:[||] ~copy_engine:None ~completion:Rig_edge.Host
-            ~waits:no_waits ~hang_ms:None ~maps_host:false ~alignment:1
-            ~host_addresses:false ~word:0 ~word_region:None ~key
-            ~memory_device:false ~fault:[%extension_constructor I.Fault]
-            ~capability:None ~budget ~opened
+            ~c ~arch:"" ~bus:None ~queues:[||] ~copy_engine:None
+            ~completion:Rig_edge.Host ~waits:no_waits ~hang_ms:None
+            ~maps_host:false ~alignment:1 ~host_addresses:false ~word:0
+            ~word_region:None ~key ~memory_device:false
+            ~fault:[%extension_constructor I.Fault] ~capability:None ~budget
+            ~opened
         in
         register d;
         d

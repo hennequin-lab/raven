@@ -12,6 +12,12 @@ let ( let* ) = Result.bind
 external file_map : Unix.file_descr -> int -> int -> int = "caml_rig_pci_map"
 external file_unmap : int -> int -> unit = "caml_rig_pci_unmap"
 
+external pread : Unix.file_descr -> bytes -> int -> int -> int
+  = "caml_rig_pci_pread"
+
+external pwrite : Unix.file_descr -> string -> int -> int -> int
+  = "caml_rig_pci_pwrite"
+
 let page = Sysmem.page
 let round_page n = (n + page - 1) / page * page
 let reserve = Sysmem.reserve
@@ -31,7 +37,6 @@ type taken = {
   bus : string;
   config : Unix.file_descr * int; (* where configuration space starts in it *)
   bars : (int * int) option array; (* read once: a held function keeps them *)
-  seek : Lock.t; (* a seek and its read or write, one at a time *)
   interrupts : Unix.file_descr option; (* the eventfd VFIO signals *)
   intx : int option; (* the INTx bit as found, if the take turned INTx off *)
   way : way;
@@ -39,23 +44,36 @@ type taken = {
   fds : Unix.file_descr list; (* every descriptor the take opened *)
 }
 
-(* Moves the [n] bytes of configuration space at [off] with [io]: the bytes
-   moved, none if the system refused. *)
-let config_io t io off b n =
+(* The [n] bytes of configuration space at [off] are moved at their offset in
+   the file, which a VFIO device's file requires: it has no position to seek
+   to. A move the system refuses moves nothing. Linux 6.12 refuses one with
+   EIO where VFIO cannot wake the function, EFAULT past a VFIO function's
+   configuration space, ENODEV once the function has left the bus, and EPERM
+   for a write the kernel's lockdown forbids. Behind VFIO a move also gives
+   the host bridge's answer, as pcibios_err_to_errno turns it into an errno:
+   ENOENT, ENOTTY, ENODEV, EFAULT, EIO, ENOSPC or ERANGE. Any other errno, such
+   as EBADF or ESPIPE, comes from a mistake of this library's and raises. *)
+let refusal : Unix.error -> bool = function
+  | EIO | EFAULT | ENODEV | EPERM | ENOENT | ENOTTY | ENOSPC | ERANGE -> true
+  | _ -> false
+
+let config_read t off b n =
   let fd, at = t.config in
-  Lock.protect t.seek @@ fun () ->
-  match
-    ignore (Unix.lseek fd (at + off) SEEK_SET);
-    io fd b 0 n
-  with
-  | moved -> moved
-  | exception Unix.Unix_error _ -> 0
+  Fail.bug ("reading configuration space of " ^ t.bus) @@ fun () ->
+  try pread fd b n (at + off)
+  with Unix.Unix_error (e, _, _) when refusal e -> 0
+
+let config_write t off s n =
+  let fd, at = t.config in
+  Fail.bug ("writing configuration space of " ^ t.bus) @@ fun () ->
+  try pwrite fd s n (at + off)
+  with Unix.Unix_error (e, _, _) when refusal e -> 0
 
 (* Bytes the system does not give, as past the first 64 without CAP_SYS_ADMIN or
    of a function that left the bus, read as all ones, as the bus answers. *)
 let config t off n =
   let b = Bytes.make n '\xff' in
-  ignore (config_io t Unix.read off b n : int);
+  ignore (config_read t off b n : int);
   let v = ref 0 in
   for i = n - 1 downto 0 do
     v := (!v lsl 8) lor Bytes.get_uint8 b i
@@ -64,8 +82,8 @@ let config t off n =
 
 (* A write the system refuses is dropped, as the bus drops one. *)
 let set_config t off n x =
-  let b = Bytes.init n (fun i -> Char.chr ((x lsr (8 * i)) land 0xff)) in
-  ignore (config_io t Unix.single_write off b n : int);
+  let s = String.init n (fun i -> Char.chr ((x lsr (8 * i)) land 0xff)) in
+  ignore (config_write t off s n : int);
   ignore (config t off n : int)
 
 (* A function's command register, its bit that lets the function master the bus,
@@ -110,10 +128,13 @@ let give_back t s =
    files that list no function go. A child of fork inherits the list, and acts
    on none of it. The exit handler is registered when the library loads, before
    a driver above it registers its own, so it runs after theirs: a driver stops
-   its GPU while it still reaches memory. It is a list in an atomic, so that a
-   child of fork meets no held lock. An exit from a callback inside a lock may
-   hold a lock the handler takes: that take raises, the handler prints it, and
-   goes on with the other functions. *)
+   its GPU while it still reaches memory. It turns every function's bus
+   mastering off before it gives any back, since one function may write
+   memory another's take holds, such as a network adapter writing a GPU's
+   memory through its BAR (Memory.bus). It is a list in an atomic, so that
+   a child of fork meets no held lock. An exit from a callback inside a lock
+   may hold a lock the handler takes: that take raises, the handler prints it,
+   and goes on with the other functions. *)
 let physical = Atomic.make []
 let hold t = update physical (List.cons (Unix.getpid (), t))
 let unhold t = update physical (List.filter (fun (_, t') -> t' != t))
@@ -121,17 +142,19 @@ let unhold t = update physical (List.filter (fun (_, t') -> t' != t))
 let () =
   at_exit (fun () ->
       let pid = Unix.getpid () in
-      let release (owner, t) =
+      let each f (owner, t) =
         if owner = pid then
-          try
-            match t.way with
-            | Physical_take s -> give_back t s
-            | Iommu_take _ -> stop_dma t
+          try f t
           with e ->
             prerr_endline
               (strf "releasing %s at exit: %s" t.bus (Printexc.to_string e))
       in
-      List.iter release (Atomic.get physical);
+      let give_back t =
+        match t.way with Physical_take s -> give_back t s | Iommu_take _ -> ()
+      in
+      let held = Atomic.get physical in
+      List.iter (each stop_dma) held;
+      List.iter (each give_back) held;
       try Sysmem.exit ()
       with e ->
         prerr_endline
@@ -285,14 +308,23 @@ let fn t =
     release = (fun () -> release t);
   }
 
+(* A failure once the function is in its container gives the container its
+   user back, so that a container left with none closes. *)
 let take_iommu files fds bus bars =
   let c, efd = Vfio.open_ files fds bus in
+  let at =
+    match Vfio.config_offset bus (Vfio.device c) with
+    | at -> at
+    | exception e ->
+        let bt = Printexc.get_raw_backtrace () in
+        Vfio.close c;
+        Printexc.raise_with_backtrace e bt
+  in
   {
     files;
     bus;
-    config = (Vfio.device c, Vfio.config_offset bus (Vfio.device c));
+    config = (Vfio.device c, at);
     bars;
-    seek = Lock.create ();
     interrupts = Some efd;
     intx = None;
     way = Iommu_take c;
@@ -338,8 +370,7 @@ let take_physical l fds bars =
       bus;
       config = (config, 0);
       bars;
-      seek = Lock.create ();
-      interrupts;
+        interrupts;
       intx = None;
       way = Physical_take (Sysmem.store ~root ~bus);
       inherited;
@@ -352,9 +383,9 @@ let take_physical l fds bars =
   hold t;
   t
 
-(* A failure gives back every descriptor taken. Behind VFIO the group's file
-   admits one process at a time; taken physically, the function keeps its
-   lock until its release. *)
+(* A failure gives back every descriptor taken, as does a bug's [Failure].
+   Behind VFIO the group's file admits one process at a time; taken
+   physically, the function keeps its lock until its release. *)
 let take l =
   let fds = ref [] in
   let refused why =
@@ -372,6 +403,10 @@ let take l =
   | Ok _ as fn -> fn
   | Error why -> refused why
   | exception Fail.Failed why -> refused why
+  | exception e ->
+      let bt = Printexc.get_raw_backtrace () in
+      List.iter Unix.close !fds;
+      Printexc.raise_with_backtrace e bt
 
 let ops files =
   {

@@ -36,6 +36,108 @@ end
 
 let opened (o : _ Rig_edge.opener) = o.make ~word:(Host.word ())
 
+(* Dma-bufs *)
+
+module Dmabuf = struct
+  external read : int -> int -> int -> string option = "rig_gpu_dmabuf_read"
+  external cloexec : int -> bool = "rig_gpu_cloexec"
+  external close : int -> unit = "rig_gpu_close"
+
+  let read fd ~at n = read fd at n
+
+  (* fdinfo's lines are "key:\tvalue". *)
+  let size fd =
+    match
+      In_channel.with_open_text
+        (Printf.sprintf "/proc/self/fdinfo/%d" fd)
+        In_channel.input_all
+    with
+    | exception Sys_error _ -> None
+    | s ->
+        let field k =
+          String.split_on_char '\n' s
+          |> List.find_map (fun line ->
+              match String.index_opt line ':' with
+              | Some i when String.sub line 0 i = k ->
+                  Some
+                    (String.trim
+                       (String.sub line (i + 1) (String.length line - i - 1)))
+              | _ -> None)
+        in
+        if field "exp_name" = None then None
+        else Option.bind (field "size") int_of_string_opt
+end
+
+(* A BAR's bus address is the start of its line of the function's [resource]
+   file, "0xSTART 0xEND 0xFLAGS". *)
+let bar_base bus bar =
+  let lines =
+    In_channel.with_open_text
+      (Printf.sprintf "/sys/bus/pci/devices/%s/resource" bus)
+      In_channel.input_lines
+  in
+  Scanf.sscanf (List.nth lines bar) "%x" Fun.id
+
+let bar_bytes bus ~bar runs n =
+  let base = bar_base bus bar in
+  let fd =
+    Unix.openfile
+      (Printf.sprintf "/sys/bus/pci/devices/%s/resource%d" bus bar)
+      [ O_RDONLY ] 0
+  in
+  Fun.protect ~finally:(fun () -> Unix.close fd) @@ fun () ->
+  let out = Buffer.create n in
+  List.iter
+    (fun (a, k) ->
+      let k = Int.min k (n - Buffer.length out) in
+      if k > 0 then begin
+        let m =
+          Bigarray.array1_of_genarray
+            (Unix.map_file fd
+               ~pos:(Int64.of_int (a - base))
+               Bigarray.char Bigarray.c_layout false [| k |])
+        in
+        for i = 0 to k - 1 do
+          Buffer.add_char out m.{i}
+        done
+      end)
+    runs;
+  Buffer.contents out
+
+let has ~sub s =
+  let n = String.length sub in
+  let rec at i =
+    i + n <= String.length s && (String.sub s i n = sub || at (i + 1))
+  in
+  at 0
+
+(* A child skips with this exit code, automake's for a skipped test, its
+   reason on its standard output. *)
+let skip_exit = 77
+
+let child flag =
+  let exe = Sys.executable_name in
+  let from, into = Unix.pipe ~cloexec:true () in
+  let pid =
+    Unix.create_process exe [| exe; flag |] Unix.stdin into Unix.stderr
+  in
+  Unix.close into;
+  let said = In_channel.input_all (Unix.in_channel_of_descr from) in
+  Unix.close from;
+  match snd (Unix.waitpid [] pid) with
+  | WEXITED c when c = skip_exit -> skip ~reason:said ()
+  | WEXITED 0 -> print_string said
+  | WEXITED c ->
+      print_string said;
+      failf "the child exited with %d" c
+  | WSIGNALED _ | WSTOPPED _ ->
+      print_string said;
+      fail "a signal ended the child"
+
+let skipped why =
+  print_string why;
+  exit skip_exit
+
 let still ?msg w x f ~ms =
   let t0 = Rig.Profile.now () in
   while Rig.Profile.now () - t0 < ms * 1_000_000 do
@@ -322,6 +424,197 @@ module Watch (D : Rig_edge.Driver) = struct
 
   let word_frees h = (find h).frees
   let late_reads h = (find h).late_reads
+end
+
+(* A driver's copies *)
+
+external edge_copy : nativeint -> int -> int -> nativeint array -> int
+  = "rig_gpu_edge_copy"
+
+type raw = {
+  dst : nativeint;
+  dst_offset : int;
+  src : nativeint;
+  src_offset : int;
+  width : int;
+  rows : int;
+  src_pitch : int;
+  dst_pitch : int;
+  local : [ `None | `Src | `Dst ];
+  device_memory : bool;
+  fill : char option;
+}
+
+type answer = Handed | Room of int | Failed
+
+(* rig_edge.h's RIG_LOCAL_NONE, RIG_LOCAL_SRC and RIG_LOCAL_DST, and its room
+   answers. *)
+let hand edge ~v ~queue p =
+  let n = Nativeint.of_int in
+  let fields =
+    [|
+      p.dst;
+      n p.dst_offset;
+      p.src;
+      n p.src_offset;
+      n p.width;
+      n p.rows;
+      n p.src_pitch;
+      n p.dst_pitch;
+      (match p.local with `None -> 0n | `Src -> 1n | `Dst -> 2n);
+      (if p.device_memory then 1n else 0n);
+      (if p.fill = None then 0n else 1n);
+      n (match p.fill with Some c -> Char.code c | None -> 0);
+    |]
+  in
+  match edge_copy edge v queue fields with
+  | 0 -> Handed
+  | -1 -> Failed
+  | r -> Room r
+
+module Edge (D : Rig_edge.Driver) = struct
+  type t = { g : D.t; mutable last : int; mutable regions : D.region list }
+  type region = { r : D.region; memory : Rig_edge.memory; bytes : int }
+  type side = Region of region | Host of int
+
+  type part = {
+    dst : side;
+    dst_offset : int;
+    src : side option;
+    src_offset : int;
+    width : int;
+    rows : int;
+    src_pitch : int;
+    dst_pitch : int;
+    fill : char option;
+  }
+
+  let facts t = D.facts t.g
+
+  (* The value the device's word holds: the word's own bytes where the host
+     addresses them, and the driver's read otherwise. *)
+  let signaled t =
+    match (D.locate (facts t).word).host with
+    | Some at -> Host.get64 at
+    | None -> D.signaled t.g
+
+  let make g =
+    let t = { g; last = 0; regions = [] } in
+    t.last <- signaled t;
+    t
+
+  let alloc t memory bytes =
+    match D.alloc t.g memory bytes with
+    | Some r ->
+        t.regions <- r :: t.regions;
+        { r; memory; bytes }
+    | None -> failf "no %d bytes of memory to allocate" bytes
+
+  let release t =
+    List.iter (D.free t.g) t.regions;
+    t.regions <- []
+
+  let handle = function
+    | Region r -> (D.locate r.r).handle
+    | Host at -> Nativeint.of_int at
+
+  (* Waits for the word to reach [v], at most 10 s. *)
+  let wait t v =
+    let t0 = Rig.Profile.now () in
+    while signaled t < v do
+      if Rig.Profile.now () - t0 > 10_000_000_000 then
+        failf "value %d within 10 s" v;
+      D.sleep t.g ~seen:(signaled t) ~still_ms:100
+    done
+
+  let run t (p : part) =
+    let queue =
+      match (facts t).copy_engine with
+      | Some q -> q
+      | None -> invalid_arg "Edge.run: the device has no copy engine"
+    in
+    let device = function
+      | Region r -> r.memory = Device
+      | Host _ -> false
+    in
+    let local =
+      match (p.src, p.dst) with
+      | Some (Host _), _ -> `Src
+      | _, Host _ -> `Dst
+      | _ -> `None
+    in
+    let raw =
+      {
+        dst = handle p.dst;
+        dst_offset = p.dst_offset;
+        src = (match p.src with Some s -> handle s | None -> 0n);
+        src_offset = p.src_offset;
+        width = p.width;
+        rows = p.rows;
+        src_pitch = p.src_pitch;
+        dst_pitch = p.dst_pitch;
+        local;
+        device_memory =
+          device p.dst
+          && (match p.src with Some s -> device s | None -> true);
+        fill = p.fill;
+      }
+    in
+    let v = t.last + 1 in
+    let rec go () =
+      match hand (facts t).edge ~v ~queue raw with
+      | Handed -> ()
+      | Room 1 ->
+          D.sleep t.g ~seen:(signaled t) ~still_ms:10;
+          go ()
+      | Room 3 -> (
+          match D.grow t.g with
+          | Grown -> go ()
+          | Short n -> failf "no %d bytes for the queues to grow" n)
+      | Room _ -> failf "the device never runs the part"
+      | Failed -> failf "the device failed the part"
+    in
+    go ();
+    t.last <- v;
+    wait t v
+
+  let one_row ~dst ~dst_offset ~src ~src_offset n =
+    {
+      dst;
+      dst_offset;
+      src = Some src;
+      src_offset;
+      width = n;
+      rows = 1;
+      src_pitch = n;
+      dst_pitch = n;
+      fill = None;
+    }
+
+  (* [n] bytes of [r] from [at], through a copy into [Pinned] memory where
+     the host does not address [r]. *)
+  let rec read t r ~at n =
+    match (D.locate r.r).host with
+    | Some h -> Host.read (h + at) n
+    | None ->
+        let p = alloc t Pinned (Int.max n 1) in
+        if n > 0 then
+          run t
+            (one_row ~dst:(Region p) ~dst_offset:0 ~src:(Region r)
+               ~src_offset:at n);
+        read t p ~at:0 n
+
+  let rec write t r ~at s =
+    let n = String.length s in
+    match (D.locate r.r).host with
+    | Some h -> Host.write (h + at) s
+    | None ->
+        let p = alloc t Pinned (Int.max n 1) in
+        write t p ~at:0 s;
+        if n > 0 then
+          run t
+            (one_row ~dst:(Region r) ~dst_offset:at ~src:(Region p)
+               ~src_offset:0 n)
 end
 
 (* Conformance *)

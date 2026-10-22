@@ -31,10 +31,13 @@ external polled_last_times : polled -> int = "rig_test_polled_last_times"
 external polled_last_waits : polled -> int array
   = "rig_test_polled_last_waits"
 
+external polled_room_waits : polled -> int = "rig_test_polled_room_waits"
+
 external polled_layout : polled -> int array = "rig_test_polled_layout"
 
-external polled_copy_facts : polled -> (int * bool) array
-  = "rig_test_polled_copy_facts"
+external polled_copies :
+  polled -> (int * bool * int * int * int * int * bool * int) array
+  = "rig_test_polled_copies"
 
 external polled_kernel : string -> nativeint = "rig_test_polled_kernel"
 
@@ -185,10 +188,10 @@ module Driver = struct
     may_block : bool;
     stores : bool;
     waits : [ `Store | `Host ] list;
-    max_waits : int;
     hang_ms : int option;
     answer : [ `Stopped | `Unknown ];
     capability : Rig_edge.capability;
+    bus : string option;
     lock : Mutex.t;
     opened : Condition.t;
     mutable calls : string list;
@@ -271,7 +274,7 @@ module Driver = struct
          else [ compute ]);
       copy_engine = (if d.copies then Some 1 else None);
       completion = (if d.stores then Store else Host);
-      waits = { stores = has `Store; hosts = has `Host; most = d.max_waits };
+      waits = { stores = has `Store; hosts = has `Host };
       may_block = d.may_block;
       hang_ms = d.hang_ms;
       maps_host = d.maps_host;
@@ -287,6 +290,7 @@ module Driver = struct
           addressed = true;
           mapper = None;
         };
+      bus = d.bus;
       edge = polled_edge d.c;
     }
 
@@ -435,6 +439,11 @@ module Driver = struct
         }
     end
 
+  (* Its memory reaches a function at its own addresses. *)
+  let dma d r ~fn:_ =
+    if counted d "dma" then Error "Polled: dma refused"
+    else Ok (Rig_edge.Bus [ (r.at, r.bytes) ])
+
   let image d b =
     if counted d "image" then Error "refused"
     else
@@ -558,9 +567,8 @@ module Polled = struct
       ?(peers = true) ?(maps_host = true) ?(alignment = 4096)
       ?(budget = 1 lsl 30) ?(memory = max_int) ?(window = max_int)
       ?(may_block = false) ?(completion = `Host) ?(waits_on = [])
-      ?(max_waits = max_int) ?(answer = `Stopped) ?(runs = `When_slept)
-      ?(lag = 1) ?hang_ms
-      ?(capability = Rig_edge.Capability (capability_key, ())) () =
+      ?(answer = `Stopped) ?(runs = `When_slept) ?(lag = 1) ?hang_ms
+      ?(capability = Rig_edge.Capability (capability_key, ())) ?bus () =
     if lag < 1 then invalid_arg "Polled.make: lag is below 1";
     let limits = function
       | Rig_edge.Device -> memory
@@ -584,10 +592,10 @@ module Polled = struct
         may_block;
         stores = completion = `Store;
         waits = waits_on;
-        max_waits;
         hang_ms;
         answer;
         capability;
+        bus;
         lock = Mutex.create ();
         opened = Condition.create ();
         calls = [];
@@ -631,12 +639,11 @@ module Polled = struct
 
   let open_ ?capacity ?grows ?copies ?host_visible ?addresses
       ?transport ?peers ?maps_host ?alignment ?budget ?memory ?window ?may_block
-      ?completion ?waits_on ?max_waits ?answer ?runs ?lag ?hang_ms name =
+      ?completion ?waits_on ?answer ?runs ?lag ?hang_ms ?bus name =
     let p =
       make ?capacity ?grows ?copies ?host_visible ?addresses
         ?transport ?peers ?maps_host ?alignment ?budget ?memory ?window
-        ?may_block ?completion ?waits_on ?max_waits ?answer ?runs ?lag ?hang_ms
-        ()
+        ?may_block ?completion ?waits_on ?answer ?runs ?lag ?hang_ms ?bus ()
     in
     match Rig.open_ (opener name p) with
     | Ok d -> (d, p)
@@ -680,6 +687,8 @@ module Polled = struct
     let a = polled_last_waits d.c in
     List.init (Array.length a / 2) (fun i -> (a.(2 * i), a.((2 * i) + 1)))
 
+  let room_waits d = polled_room_waits d.c
+
 
   let layout d =
     let a = polled_layout d.c in
@@ -691,18 +700,37 @@ module Polled = struct
     in
     parts 0
 
-  let copy_sides d =
+  type copy = {
+    local : [ `None | `Src | `Dst ];
+    device_memory : bool;
+    width : int;
+    rows : int;
+    src_pitch : int;
+    dst_pitch : int;
+    fill : char option;
+  }
+
+  let copies d =
     let none, src, dst = rig_local () in
     let side k =
       if k = none then `None
       else if k = src then `Src
       else if k = dst then `Dst
-      else invalid_arg "Polled.copy_sides: an unknown copy_local"
+      else invalid_arg "Polled.copies: an unknown copy_local"
     in
-    List.map (fun (s, _) -> side s) (Array.to_list (polled_copy_facts d.c))
-
-  let copy_device_memory d =
-    List.map snd (Array.to_list (polled_copy_facts d.c))
+    let copy (local, device_memory, width, rows, src_pitch, dst_pitch, fill, c)
+        =
+      {
+        local = side local;
+        device_memory;
+        width;
+        rows;
+        src_pitch;
+        dst_pitch;
+        fill = (if fill then Some (Char.chr c) else None);
+      }
+    in
+    List.map copy (Array.to_list (polled_copies d.c))
 
   type launch = {
     groups : int * int * int;

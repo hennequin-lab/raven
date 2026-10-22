@@ -31,10 +31,14 @@
 
     {!detach} takes the GPU from its kernel driver, and {!attach} gives it
     back. An open holds the GPU until its device is stopped, and no other
-    open, in this process or another, can take it meanwhile. A GPU the
-    process held keeps its GSP running after that, and its next open or
-    {!attach} resets it first, as {!reset} does. A GPU whose reset has
-    failed is lost, and its next open resets it again.
+    open, in this process or another, can take it meanwhile. A stop
+    unloads the GSP's firmware and, on Ampere and Ada, takes down the
+    protected memory (WPR2) the boot set up, which NVIDIA's driver refuses
+    to boot a GPU with. {!attach} resets a GPU first, as {!reset} does. A
+    GPU whose stop could not unload its GSP's firmware or take its boot
+    down, or whose reset has failed, is lost, and its next open resets it
+    first. A reset that leaves WPR2 up fails, so neither an open nor
+    {!attach} hands such a GPU on.
 
     {!Rig_pci.section-needs} states what any open of a GPU with no kernel
     driver needs. *)
@@ -79,12 +83,12 @@
     and bootloader, and on Blackwell the FMC, each lie in one run of bus
     addresses.
 
-    The GSP's objects live as long as the GSP: its RM frees none
-    ([Rig_nv.rm]'s [free] is [None]), so a device of this path keeps the
-    channels a growth replaces as {!Rig_nv.section-submitting} states. Each
-    set it keeps holds, in the GPU's memory, the instance blocks and method
-    buffers of its two channels and the compute engine's context
-    buffers. *)
+    The GSP's RM frees an object and every object under it when a device
+    asks ([Rig_nv.rm]'s [free] is [Some]), so a device of this path gives
+    back the channels a growth replaces as {!Rig_nv.section-submitting}
+    states. With each set goes the GPU memory the path gave the GSP for it:
+    the instance blocks and method buffers of its two channels and the
+    compute engine's context buffers. *)
 
 (** {1:gpus GPUs}
 
@@ -107,13 +111,15 @@ val count : ?machine:Rig_pci.Machine.t -> unit -> (int, string) result
 
 (** {1:firmware Firmware}
 
-    A boot loads three files of linux-firmware's [nvidia/] directory at
-    commit [0a6871b1], each pinned by its BLAKE2b-256 digest: the GSP's
-    firmware [nvidia/ga102/gsp/gsp-570.144.bin], the same for every family,
-    then its bootloader and the image that starts it:
-    - Ampere: [ga102/gsp/bootloader-570.144.bin] and
-      [ga102/gsp/booter_load-570.144.bin];
-    - Ada: the same two under [ad102];
+    A boot loads files of linux-firmware's [nvidia/] directory at commit
+    [0a6871b1], each pinned by its BLAKE2b-256 digest: the GSP's firmware
+    [nvidia/ga102/gsp/gsp-570.144.bin], the same for every family, then its
+    bootloader, the image that starts it, and on Ampere and Ada the booter
+    that takes the boot down at its stop:
+    - Ampere: [ga102/gsp/bootloader-570.144.bin],
+      [ga102/gsp/booter_load-570.144.bin] and
+      [ga102/gsp/booter_unload-570.144.bin];
+    - Ada: the same three under [ad102];
     - Blackwell: [gb202/gsp/bootloader-570.144.bin] and
       [gb202/gsp/fmc-570.144.bin].
 
@@ -141,6 +147,14 @@ val count : ?machine:Rig_pci.Machine.t -> unit -> (int, string) result
     Two GPUs map each other's memory only if both are taken physically, on
     one machine, each BAR reaches all of its GPU's memory, and the bus carries
     requests between them ({!Rig_pci.Memory.reaches}).
+
+    {!Rig_nv.val-dma} gives another function, such as a NIC that a process
+    drives over PCI, a region's bus ranges ({!Rig_edge.Bus}), or the reason
+    it cannot reach them, as {!Rig_pci.Memory.bus} states: GPU memory
+    through BAR 1, the memory BAR. The region's memory and the GPU then stay
+    the process's until it exits, so no later open of the GPU, in this
+    process or another, succeeds meanwhile. The device's facts name the
+    GPU's function as [bus].
 
     A device reads the GPU's timer registers through BAR 0
     ({!Rig_nv.Registers}), so its profiles' times drift from the host's
@@ -179,7 +193,7 @@ val gpu :
       what it lacks;
     - an image is missing, naming the directories and the files found with
       another digest, or one found is not laid out as its format says;
-    - its GSP still runs after its reset;
+    - its protected memory (WPR2) is still up after its reset;
     - the machine refuses the addresses or the GSP's memory.
 
     A GPU reset first stays reset. Once the GSP's memory is taken, a
@@ -220,7 +234,8 @@ val attach : int -> (unit, string) result
     ({!Rig_pci.Driver.attach}).
 
     [Error why] if there is no GPU [i], if this process holds it, or as
-    {!Rig_pci.Driver.attach}.
+    {!Rig_pci.Driver.attach}, a reset that leaves the GPU's protected memory
+    (WPR2) up among its failed resets.
 
     Raises [Invalid_argument] if [i < 0]. *)
 
@@ -231,8 +246,9 @@ val reset : ?machine:Rig_pci.Machine.t -> int -> (unit, string) result
     function ({!Rig_pci.Function.reset}).
 
     [Error why] if there is no GPU [i], if this process holds it, if its
-    function cannot be taken, or if Linux has no reset for it or it does not
-    respond after one.
+    function cannot be taken, if Linux has no reset for it or it does not
+    respond after one, or if its protected memory (WPR2) is still up after
+    it.
 
     Raises [Invalid_argument] if [i < 0]. *)
 
@@ -259,7 +275,8 @@ type image = {
 type report = {
   chip : string;  (** The chip's name, such as ["AD102"]. *)
   images : image list;
-      (** The GSP's firmware, its bootloader, then the booter or the FMC. *)
+      (** The GSP's firmware, its bootloader, then the booter or the FMC,
+          then on Ampere and Ada the unloading booter. *)
 }
 (** The type for boot reports. *)
 

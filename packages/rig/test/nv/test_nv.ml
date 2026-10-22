@@ -226,7 +226,6 @@ let facts () =
   equal bool ~msg:"completion is the store" true (f.completion = Store);
   equal (list bool) ~msg:"waits on stores, hosts" [ true; true ]
     [ f.waits.stores; f.waits.hosts ];
-  equal int ~msg:"most waits" 256 f.waits.most;
   equal bool ~msg:"may block" false f.may_block;
   let w = N.locate f.word in
   equal nativeint ~msg:"the word's handle is its address"
@@ -450,6 +449,109 @@ let memory =
         shared_page;
     ]
 
+(* Another function's DMA
+
+   The GPU's own function stands for the other one, as every machine has it.
+   Through NVIDIA's kernel driver the device exports a dma-buf. Its bytes are
+   not checked here: the export leaves bAllowMmap off, so the host cannot map
+   the dma-buf (nv-dmabuf.c), and no other API of this process imports one.
+   Only a NIC that registers it can read them. Over PCI it
+   gives bus ranges and keeps the GPU taken until its process exits, so a
+   child of the suite makes that export, and the GPU opens again once the
+   child is gone. *)
+
+let dma_child = "--dma-over-pci"
+let dma_sizes = [ 1; 4095; 4096; 4097; 1 lsl 22 ]
+let small_bar = "memory BAR is smaller than its memory"
+
+(* An [fn] that is no bus address, or no function of the machine, is refused
+   naming it. *)
+let refuses_strangers d =
+  List.iter
+    (fun fn ->
+      match B.dma (B.create d 64) ~fn with
+      | Ok _ -> failf "%s reaches the memory" fn
+      | Error why -> contains ~msg:fn ~sub:fn why)
+    [ "41:00.0"; "ffff:ff:1f.7" ]
+
+let gpu_bus d =
+  let fn = require_some ~msg:"the device's bus" (Rig.bus d) in
+  equal ~msg:"GPU 0's function" (option string)
+    (List.nth_opt (require_ok (Rig_nv_pci.buses ())) 0)
+    (Some fn);
+  fn
+
+let exports_dmabuf () =
+  S.with_ @@ fun { d; _ } ->
+  let fn = gpu_bus d in
+  List.iter
+    (fun n ->
+      match B.dma (B.create d n) ~fn with
+      | Error why when Rig_gpu_support.has ~sub:"open kernel modules" why ->
+          skip ~reason:why ()
+      | Error why -> failf "%d bytes: %s" n why
+      | Ok (Bus _) -> fail "the kernel driver's path gives a dma-buf"
+      | Ok (Dmabuf { fd; offset }) -> (
+          Fun.protect ~finally:(fun () -> Rig_gpu_support.Dmabuf.close fd)
+          @@ fun () ->
+          equal ~msg:"close-on-exec" bool true
+            (Rig_gpu_support.Dmabuf.cloexec fd);
+          equal ~msg:"the region's offset" int 0 offset;
+          match Rig_gpu_support.Dmabuf.size fd with
+          | Some bytes -> at_least ~msg:"its bytes" int ~than:n bytes
+          | None -> fail "the descriptor is no dma-buf"))
+    dma_sizes;
+  refuses_strangers d
+
+(* In the child: the bytes at the ranges are the buffer's, through BAR 1, the
+   memory BAR, and a reopen of the GPU in the process is refused. The export is
+   refused, and the test skips, where the memory BAR is smaller than the GPU's
+   memory, as on a host that caps the BAR. *)
+let exports_bus () =
+  let t = S.open_ () in
+  let fn = gpu_bus t.d in
+  let n = 1 lsl 16 in
+  let b = B.create t.d n in
+  B.fill b 'x';
+  (match B.dma b ~fn with
+  | Error why when Rig_gpu_support.has ~sub:small_bar why ->
+      S.close t;
+      Rig_gpu_support.skipped why
+  | Error why -> failf "refused: %s" why
+  | Ok (Dmabuf _) -> fail "the path over PCI gives bus ranges"
+  | Ok (Bus runs) ->
+      satisfies ~msg:"the ranges" ~claim:"pages that hold the buffer"
+        (list (pair int int))
+        (fun runs ->
+          List.for_all (fun (a, k) -> a mod 4096 = 0 && k mod 4096 = 0) runs
+          && List.fold_left (fun s (_, k) -> s + k) 0 runs >= n)
+        runs;
+      equal ~msg:"the bytes through the BAR" string (String.make n 'x')
+        (Rig_gpu_support.bar_bytes fn ~bar:1 runs n));
+  refuses_strangers t.d;
+  S.close t;
+  match Rig.open_ (S.opener 0) with
+  | Ok d ->
+      Rig.close d;
+      fail "the GPU opened again in the process"
+  | Error why -> contains ~sub:"given to another PCI function" why
+
+let exports () =
+  match S.path () with
+  | Some Pci ->
+      Rig_gpu_support.child dma_child;
+      S.with_ ignore
+  | Some Kernel | None -> exports_dmabuf ()
+
+let dma =
+  group ~timeout:120. "another function's DMA"
+    [
+      test
+        "dma exports a dma-buf through the kernel driver, or bus ranges over \
+         PCI that keep the GPU until the process exits"
+        exports;
+    ]
+
 (* Work *)
 
 let launch () =
@@ -501,6 +603,30 @@ let high_word () =
   S.free_launches l;
   N.free t.g b
 
+(* A submission waits in its channels on every producer it follows, however
+   many: 300 Polled devices' values, more than a fixed reserve of waits held,
+   none of them reached when the submit returns. *)
+let many_waits () =
+  S.with_ @@ fun t ->
+  let module P = Rig_support.Polled in
+  let producers = List.init 300 (fun i -> P.open_ (strf "POLLED:wait-%d" i)) in
+  let close () = List.iter (fun (d, _) -> Rig.close d) producers in
+  Fun.protect ~finally:close @@ fun () ->
+  let point (d, _) =
+    let run = Rig.Submission.Run.make (Rig.Submission.make d [||]) in
+    Rig.submit run ~buffers:[||]
+  in
+  let points = Array.of_list (List.map point producers) in
+  let s = Rig.Submission.make t.d [||] in
+  S.watchdog "a submission of 300 waits" (fun () ->
+      let v =
+        Rig.submit (Rig.Submission.Run.make s) ~waits:points ~buffers:[||]
+      in
+      let reached = List.filter (fun (_, p) -> P.queued p = 0) producers in
+      equal int ~msg:"producers reached on the host" 0 (List.length reached);
+      List.iter (fun (_, p) -> ignore (P.run p)) producers;
+      Rig.Point.wait v)
+
 (* A ring entry cut in half is refused when submitted, and no value is
    assigned. *)
 let refused () =
@@ -518,6 +644,7 @@ let work =
       test "an allocation or mapping of no bytes raises" misuse;
       test "a wait holds work on another device's host word above 2^40"
         high_word;
+      test "a submission waits in its channels on 300 producers" many_waits;
       test "a submission of half a ring entry raises" refused;
     ]
 
@@ -782,12 +909,13 @@ let no_allocation () =
   Rig.Point.wait !last;
   equal int ~msg:"bytes of 99 launches" 0 bytes
 
-(* Public launches and a private copy kernel share the compute channel. The
-   edges their memory derives still put the copy between the launches. *)
+(* Public launches and a private copy kernel share the compute channel: a
+   copy of 256 KiB, from which the driver's kernel runs it. The edges their
+   memory derives still put the copy between the launches. *)
 let launch_copy_launch () =
   S.with_ @@ fun { d; _ } ->
   let image = launch_image d in
-  let n = 1024 in
+  let n = 64 * 1024 in
   let out = B.create d (4 * n) and mid = B.create d (4 * n) in
   let dst = B.create d (4 * n) in
   let s =
@@ -1004,9 +1132,52 @@ let grid_parameters (groups, threads) =
       buffers
   done
 
+(* The release of the last launch of a chain follows every launch of the
+   chain: the host sees it only once the earlier launches' writes are
+   visible, which copy 4 KiB each after 2 ms and 1 ms. *)
+let chain_delays = [ 2_000_000; 1_000_000 ]
+
+let chain_release () =
+  S.with_ @@ fun t ->
+  let k = S.kernels t in
+  let l = S.launches t.g in
+  let n = 4096 in
+  let src = alloc t.g Pinned n and word = alloc t.g Pinned 8 in
+  let dsts = List.map (fun _ -> alloc t.g Pinned n) chain_delays in
+  S.pattern (host src) n 11;
+  List.iter (fun d -> S.pattern (host d) n 12) dsts;
+  H.set64 (host word) 0;
+  let copies =
+    List.map2
+      (fun ns d -> ("copy_after", 1, [ ns; address d; address src; n ]))
+      chain_delays dsts
+  in
+  let e =
+    S.chained l k (copies @ [ ("empty", 1, []) ]) ~release:(address word, 7)
+  in
+  let t0 = Rig.Profile.now () in
+  let p = S.submit t [| S.words e |] in
+  S.watchdog "the chain's release" (fun () ->
+      while H.get64 (host word) <> 7 do
+        Domain.cpu_relax ()
+      done);
+  let waited = Rig.Profile.now () - t0 in
+  List.iteri
+    (fun i d ->
+      equal int ~msg:(strf "copy %d's first byte that differs" i) (-1)
+        (S.mismatch (host d) n 11))
+    dsts;
+  at_least int ~msg:"the ns until the release"
+    ~than:(List.fold_left ( + ) 0 chain_delays)
+    waited;
+  Rig.Point.wait p;
+  S.free_launches l;
+  List.iter (N.free t.g) (src :: word :: dsts)
+
 let launches =
   group ~timeout:120. "launches"
     [
+      test "a chain's last release follows the chain's launches" chain_release;
       test "launches past NV's limits are refused" refused_launches;
       test "a launch takes the most dynamic shared memory" most_shared_memory;
       test "functions with static shared memory run alone and chained"
@@ -1490,6 +1661,67 @@ let handover () =
   S.free_launches l;
   List.iter (N.free t.g) [ flags; out ]
 
+let deep_image = Rig_gpu_support.loader (fun () -> S.fixture "deep_sm89.cubin")
+
+(* The bytes of the local memory that serves [g]'s launches of deep
+   (fixtures/deep.cu). *)
+let deep_local g =
+  let pp = Format.pp_print_string in
+  let c = require_ok ~pp (A.Cubin.of_string (S.fixture "deep_sm89.cubin")) in
+  let k = require_some (A.Cubin.kernel c "deep") in
+  let l = require_ok ~pp (A.Launch.make (N.capability g) k) in
+  (A.Local_memory.make (N.capability g) (A.Launch.local_bytes l)).bytes
+
+(* A function the GPU has no local memory for: [deep] keeps 480 KiB a thread
+   (fixtures/deep.cu), and its local memory holds that for every thread the
+   GPU may run at once, past the GPU's memory. Its resolve runs the rounds of
+   reclamation, which give a dropped buffer back to the driver, then raises
+   Out_of_memory for the bytes of that local memory. It made nothing: the
+   device lives, and [shallow], of the same image, grows the local memory
+   and computes right. The driver refuses one allocation past the GPU's
+   memory, so no memory runs short; a GPU that holds it skips. *)
+let no_local_memory () =
+  S.with_ @@ fun { d; g } ->
+  let bytes = deep_local g in
+  if bytes <= Rig.budget d then
+    skip
+      ~reason:(strf "the GPU holds deep's %d bytes of local memory" bytes)
+      ();
+  let image = deep_image d in
+  let dropped = 64 * 1024 * 1024 in
+  let[@inline never] drop () =
+    ignore (Sys.opaque_identity (B.create d dropped))
+  in
+  drop ();
+  Gc.full_major ();
+  let before = Rig.allocated d in
+  let refused =
+    match Rig.Image.resolve image "deep" with
+    | _ -> fail "deep's local memory was made"
+    | exception Rig.Out_of_memory (d', n) -> (Rig.equal d d', n)
+  in
+  equal (pair bool int) ~msg:"Out_of_memory's device and bytes" (true, bytes)
+    refused;
+  at_most ~msg:"the device's bytes, the dropped buffer reclaimed" int
+    ~than:(before - dropped) (Rig.allocated d);
+  equal (option string) ~msg:"the device's loss" None (Rig.lost d);
+  (* shallow's threads keep [stack] words: thread i writes i + i mod stack. *)
+  let n = 2048 and stack = 1024 in
+  let s =
+    Sub.make d [| launch_part image "shallow" ~params:12 [| refer 0 0 |] |]
+  in
+  let run = Run.make s in
+  let b = Sub.block s 0 in
+  Run.groups run b (n / 256) 1 1;
+  Run.threads run b 256 1 1;
+  Run.shared run b 0;
+  Run.int32 run b 8 n;
+  let out = B.create d (4 * n) in
+  Rig.Point.wait (submitted run ~buffers:[| out |]);
+  equal (array int) ~msg:"shallow's words"
+    (Array.init n (fun i -> i + (i mod stack)))
+    (words out ~at:0 n)
+
 let local =
   group ~timeout:60. "local memory"
     [
@@ -1497,6 +1729,10 @@ let local =
       test "a growth leaves a running kernel's local memory intact" growth;
       test "a replaced local memory stays until the kernels on it ran"
         handover;
+      test
+        "a function the GPU has no local memory for raises Out_of_memory, \
+         having made nothing"
+        no_local_memory;
     ]
 
 let channels =
@@ -1656,11 +1892,46 @@ let stop_running () =
   S.free_launches l;
   List.iter (N.free t.g) [ flag; marked ]
 
+(* Opens and closes keep, of the C heap, each device's edge alone: 80 bytes,
+   which glibc's allocator holds in a chunk of 96. Warm opens first make the
+   process's client and the GPU's objects, which stay. The runtime's own
+   tables may grow by a few hundred bytes over the run. *)
+let edge_chunk = 96
+let runtime_slack = 1024
+
+let opens_keep_edges () =
+  let heap () =
+    match Rig_support.heap_bytes () with
+    | Some n -> n
+    | None -> skip ~reason:"the system counts no C heap" ()
+  in
+  let cycle () =
+    let t = S.open_ () in
+    ignore (B.create t.d 1 : B.t);
+    S.run t [||];
+    S.close t;
+    Gc.full_major ();
+    Rig.free_cache t.d
+  in
+  let opens = 32 in
+  for _ = 1 to 4 do
+    cycle ()
+  done;
+  let c = heap () in
+  for _ = 1 to opens do
+    cycle ()
+  done;
+  at_most int ~msg:"the C heap's growth over the opens"
+    ~than:((opens * edge_chunk) + runtime_slack)
+    (heap () - c)
+
 let timeline =
   group ~timeout:60. "timeline"
     [
       test "a close of an idle device leaves the word at the last value"
         stop_idle;
+      test "opens and closes keep each device's edge alone of the C heap"
+        opens_keep_edges;
       test
         "stop of a device waiting on a word that never moves leaves the word \
          at the last value (sampled)"
@@ -1820,6 +2091,13 @@ let stateful =
     ]
 
 let () =
+  if Array.length Sys.argv = 2 && Sys.argv.(1) = dma_child then
+    exit
+      (match exports_bus () with
+      | () -> 0
+      | exception e ->
+          prerr_endline (Printexc.to_string e);
+          1);
   exit
     (run "rig_nv"
        [
@@ -1828,6 +2106,7 @@ let () =
          parameters;
          facts;
          memory;
+         dma;
          work;
          launches;
          room;

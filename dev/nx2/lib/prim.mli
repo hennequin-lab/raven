@@ -6,11 +6,13 @@
 (** Operations as data, and values' facts: the functions over {!Value.prim} and
     {!Value.t} that the engine and [Nx.Prim] share.
 
-    Every function is total over the constructors. {!results} states each
-    operation's rule once: the shapes, dtypes, axes and attributes its operands
-    must have, and the form of each result, its placement from {!Route}. The
-    eager engine allocates destinations through it, and interpretations make
-    traced results through it, so the two agree in dtype, layout and placement.
+    Every function is total over the constructors. {!route} states each
+    operation's rule once: the shapes, dtypes, axes and attributes its
+    operands must have, where it reads them, and each result's layout and
+    placement, from {!Route}; {!results_at} makes the results' forms from what
+    it decided. The eager engine routes, places and allocates destinations
+    through them, and interpretations make traced results through {!results},
+    so the two agree in dtype, layout and placement.
     A sharded value's shape is the whole's, which it holds; each shard is its
     device's window of it. *)
 
@@ -145,7 +147,8 @@ val map : ('v 's 'd. ('v, 's, 'd) t -> ('v, 's, 'd) t) -> 'r prim -> 'r prim
 val mapi :
   ('v 's 'd. int -> ('v, 's, 'd) t -> ('v, 's, 'd) t) -> 'r prim -> 'r prim
 (** [mapi m op] is [op] with each operand [x] at position [i] in {!operands}
-    replaced by [m i x]. *)
+    replaced by [m i x]: [op] itself where [m] returns each operand
+    itself. *)
 
 val rule : 'r prim -> Route.rule
 (** [rule op] is how [op]'s results depend on its operands: its route and each
@@ -171,61 +174,55 @@ val within : 'r prim -> Nx_array.Move.range array -> 'r prim
 
     Raises [Invalid_argument] for an operation that is not a loop. *)
 
+val layouts : by:string -> 'r prim -> Nx_array.Layout.t array
+(** [layouts ~by op] is the layouts of [op]'s results that eager execution
+    gives them, after checking its operands against its rule: one per result
+    of a [Linalg], one that every result of any other operation shares, none
+    for a [Check]. A [Place]'s is its result's at its own placement.
+
+    Raises [Invalid_argument] naming [by] where [op]'s operands break its
+    rule. *)
+
+(** The type for what an operation's rule decides. *)
+type routed = {
+  route : unit Route.t option;
+      (** Where it reads each operand, in {!operands}' order, where its
+          results lie and how its devices compute them: [None] where every
+          operand is of every set, and for [Place] and [Check], which are not
+          routed. *)
+  layouts : Nx_array.Layout.t array;  (** Its results' ({!layouts}). *)
+}
+
+val route : by:string -> 'r prim -> routed
+(** [route ~by op] is what [op]'s rule decides, checked once. Operands that
+    lie at one placement that cuts no axis, the others of every set, are read
+    there and their results lie there; otherwise {!Route.route} of {!rule}
+    decides. A deferred value's placement and its eager twin's come from this
+    one route over the same operands.
+
+    Raises as {!layouts} does, then as {!Route.route} does. *)
+
+val results_at :
+  unit Devices.placement option ->
+  Nx_array.Layout.t array ->
+  ('v 's 'd. int -> ('v, 's, 'd) form -> ('v, 's, 'd) t) ->
+  'r prim ->
+  'r
+(** [results_at p layouts m op] is [op]'s result, its value at position [k]
+    made by [m k f], [f] the form eager execution gives it at [p], laid out as
+    [layouts], [op]'s {!layouts}; [()] for [Check]. A [Place]'s result lies
+    at its own placement. It checks nothing. *)
+
 val results :
   by:string ->
   ('v 's 'd. int -> ('v, 's, 'd) form -> ('v, 's, 'd) t) ->
   'r prim ->
   'r
-(** [results ~by m op] is [op]'s result, its value at position [k] made by
-    [m k f], [f] the form eager execution gives it; [()] for [Check].
+(** [results ~by m op] is {!results_at} of what {!route} decides for [op]:
+    its results' layouts, at the placement of its results.
 
     Raises [Invalid_argument] naming [by], before [m] is called, where [op]'s
     operands break its rule. *)
-
-(** The type for a reduction, a scan of no carry or a contraction whose route
-    computes by partials ({!Route.Partials}): its fields and that route. *)
-type 'r partial =
-  | Reduce_partial : {
-      route : 'd Route.t;
-      layout : Nx_array.Layout.t;
-      axes : int iarray;
-      prog : Nx_kernel.Prog.t;
-      reductions : ('d, 'r) reductions;
-      loads : 'd load iarray;
-    }
-      -> 'r partial
-  | Scan_partial : {
-      route : 'd Route.t;
-      layout : Nx_array.Layout.t;
-      axis : int;
-      prog : Nx_kernel.Prog.t;
-      reduction : ('d, 'r) reduction;
-      loads : 'd load iarray;
-    }
-      -> 'r partial
-  | Contract_partial : {
-      route : 'd Route.t;
-      order : Nx_kernel.order;
-      batch : (int * int) iarray;
-      contracting : (int * int) iarray;
-      acc : Nx_array.Dtype.any;
-      out : ('v, 's) dtype;
-      a : ('a, 'b, 'd) t;
-      b : ('c, 'e, 'd) t;
-      init : ('v, 's, 'd) t option;
-    }
-      -> ('v, 's, 'd) t partial
-
-val results_or_partial :
-  by:string ->
-  ('v 's 'd. int -> ('v, 's, 'd) form -> ('v, 's, 'd) t) ->
-  'r prim ->
-  ('r, 'r partial) Either.t
-(** [results_or_partial ~by m op] is [Right] [op] with its route where that
-    computes by partials, [m] never called, else [Left (results ~by m op)].
-    It routes [op] once.
-
-    Raises as {!results}. *)
 
 val reduction : ('d, 'a) reduction -> Nx_kernel.reduction * int
 (** [reduction r] is [r] as {!Nx_kernel.S.scan} takes it: what it computes and
@@ -265,19 +262,6 @@ val op3 :
     Raises [Invalid_argument] naming [by] where [k] does not take the operands'
     dtypes ({!Nx_kernel.Prog.accepts2} and its siblings). *)
 
-val prepare :
-  by:string ->
-  ('v 's 'd. 'd Devices.placement option -> ('v, 's, 'd) t -> ('v, 's, 'd) t) ->
-  'r prim ->
-  'r prim
-(** [prepare ~by place op] is [op] with each operand [x] replaced by
-    [place p x], [p] where [op]'s route reads [x] ([None] where every operand is
-    of every set); [op] itself where none changes. [Place] and [Check] are [op]
-    itself.
-
-    Raises [Invalid_argument] naming [by], before [place] is called, where
-    [op]'s operands break its rule. *)
-
 val contract_shape :
   by:string ->
   batch:(int * int) iarray ->
@@ -308,22 +292,6 @@ val contract_order :
     along the axes no pair names, and its columns, [b]'s likewise, each
     [max_int] past it. Where that set has no kernels, as one of devices of
     several kinds, or both are of every set, it is the one nx.cpu chooses. *)
-
-val free_extent :
-  batch:(int * int) iarray ->
-  contracting:(int * int) iarray ->
-  int array ->
-  (int * int -> int) ->
-  int
-(** [free_extent ~batch ~contracting s side] is the product of [s]'s extents
-    along the axes no pair names on [side] ([fst] for [a], [snd] for [b]),
-    [max_int] past it: a contraction's rows or columns as
-    {!contract_order} counts them. *)
-
-val contract_order_of :
-  rows:int -> columns:int -> ('a, 'b, 'd) t -> ('c, 'e, 'd) t -> Nx_kernel.order
-(** [contract_order_of ~rows ~columns a b] is {!contract_order} for [rows] and
-    [columns] its caller computed as it does. *)
 
 (** {1:loads Loads} *)
 

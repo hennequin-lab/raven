@@ -18,17 +18,22 @@
     {!Nx.place} of such a value onto a device that addresses host memory, such
     as Metal's, shares the pages, and onto any other device copies them
     ({!Rig.reaches}). Any other array (a compressed npz entry, a big-endian one,
-    one at a misaligned offset) is read at load into host memory of its own.
+    one at a misaligned offset) is read at load into host memory of its own,
+    where its donation may write its result ({!Nx.donate}). No donation of a
+    value over the file's pages writes them.
 
     A file stays open while a value over its pages is reachable, and its values
     see the file that was opened: a save to its path, which puts a new file
     there, leaves them their values.
     {b The file must not change in place while a value loaded from it is alive}:
-    rewriting it may change their values, and a value over its pages dies by
-    [SIGBUS], ending the process, when it reads a page that a truncation of the
-    file cut off. A value read into memory of its own is not affected. On
-    Windows a file whose pages are mapped can be neither deleted nor replaced
-    until its values are collected.
+    rewriting it may change their values, and what a value over its pages
+    reads from a page that a truncation of the file cut off is unspecified: on
+    Linux the read ends the process ([SIGBUS]), and on macOS it reads the
+    bytes the page held. A copy of such a value's bytes, as {!Nx.place} makes
+    onto a device whose memory the host does not address, raises [Sys_error]
+    naming the file. A value read into memory of its own is not affected.
+    On Windows a file whose pages are mapped can be neither deleted nor
+    replaced until its values are collected.
 
     {b Saving.} A save takes a value of any set and writes its elements in C
     order, little-endian. It reads the value on the host for the extent of the

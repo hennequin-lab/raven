@@ -7,10 +7,10 @@
    their ioctls, packed in the structures of kfd_ioctl.h and amdgpu_drm.h so
    that the compiler lays them out, and the process's mappings of their
    memory. The structures come from pinned excerpts of the headers
-   (gen/headers, made by gen/gen.py), so the build machine's headers, which
-   may predate them, play no part. A descriptor is an int. A stub raises
-   Unix.Unix_error for the kernel's refusal. A request may wait, so each
-   releases the runtime; the other stubs hold it.
+   (../gen/headers/kernel, made by ../gen/gen.py), so the build machine's
+   headers, which may predate them, play no part. A descriptor is an int. A
+   stub raises Unix.Unix_error for the kernel's refusal. A request may wait,
+   so each releases the runtime; the other stubs hold it.
 
    Off Linux every stub raises ENOSYS, so an open fails at its first
    file. */
@@ -42,9 +42,9 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "gen/headers/drm.h"
-#include "gen/headers/amdgpu_drm.h"
-#include "gen/headers/kfd_ioctl.h"
+#include "../gen/headers/kernel/drm.h"
+#include "../gen/headers/kernel/amdgpu_drm.h"
+#include "../gen/headers/kernel/kfd_ioctl.h"
 
 /* [(r, v)]: a result and a 64-bit value. */
 static value with64(long r, uint64_t v) {
@@ -157,6 +157,14 @@ value caml_rig_amd_amdgpu_free(value v_kfd, value v_handle) {
   struct kfd_ioctl_free_memory_of_gpu_args a = {.handle = Long_val(v_handle)};
   check(call(Int_val(v_kfd), AMDKFD_IOC_FREE_MEMORY_OF_GPU, &a));
   return Val_unit;
+}
+
+/* A new dma-buf descriptor, close-on-exec, over the memory [v_handle]. */
+value caml_rig_amd_amdgpu_export(value v_kfd, value v_handle) {
+  struct kfd_ioctl_export_dmabuf_args a = {.handle = Long_val(v_handle),
+                                           .flags = O_CLOEXEC};
+  check(call(Int_val(v_kfd), AMDKFD_IOC_EXPORT_DMABUF, &a));
+  return Val_int((int)a.dmabuf_fd);
 }
 
 /* Maps [v_handle] for GPU [v_gpu], or unmaps it if [v_map] is false: the
@@ -376,9 +384,12 @@ value caml_rig_amd_amdgpu_store64(value v_at, value v_v) {
 
 /* The GPU's clock
 
-   AMDKFD_IOC_GET_CLOCK_COUNTERS reads the GPU's clock counter, the counter
-   of the queues' timestamps, which ROCr converts its dispatches' times by
-   (amdgpu_amdkfd_get_gpu_clock_counter, GpuAgent::TranslateTime). KFD
+   AMDKFD_IOC_GET_CLOCK_COUNTERS reads the GPU's clock counter
+   (amdgpu_amdkfd_get_gpu_clock_counter), at the rate of the queues'
+   timestamps. Off SR-IOV on GFX 11 and 12 it is SMUIO's GOLDEN_TSC
+   (gfx_v11_0_get_gpu_clock_counter, smuio_v14_0_2_get_gpu_clock_counter),
+   which on an R9700 (GFX 12) runs 2.3 ms behind the queues' timestamps;
+   Rig_amd takes the constant between the two at open. KFD
    samples CLOCK_MONOTONIC_RAW after the counter read returns
    (kfd_ioctl_get_clock_counters, ktime_get_raw_ns). The gap between the
    two is one-sided, the host sample later, usually one register read, and
@@ -445,6 +456,7 @@ NONE(runtime_enable, value a UNUSED)
 NONE(alloc, value a UNUSED, value b UNUSED, value c UNUSED, value d UNUSED,
      value e UNUSED)
 NONE(free, value a UNUSED, value b UNUSED)
+NONE(export, value a UNUSED, value b UNUSED)
 NONE(map_gpu, value a UNUSED, value b UNUSED, value c UNUSED, value d UNUSED)
 NONE(event, value a UNUSED, value b UNUSED, value c UNUSED)
 NONE(destroy_event, value a UNUSED, value b UNUSED)

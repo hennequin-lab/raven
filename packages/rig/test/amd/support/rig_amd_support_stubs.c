@@ -79,7 +79,9 @@ static void *edge(value v_waits, value v_parts, struct rig_wait **wp,
     case RIG_COPY:
       p[i].copy.dst = (uint64_t)at(k, part_dst);
       p[i].copy.src = (uint64_t)at(k, part_src);
-      p[i].copy.bytes = (uint64_t)at(k, part_copy);
+      p[i].copy.width = (uint64_t)at(k, part_copy);
+      p[i].copy.rows = 1;
+      p[i].copy.src_pitch = p[i].copy.dst_pitch = p[i].copy.width;
       break;
     case RIG_LAUNCH:
       p[i].launch.code = (uint64_t)at(k, part_code);
@@ -111,7 +113,7 @@ value rig_amd_test_room(value v_self, value v_parts, value v_args) {
   struct rig_part *p;
   void *scratch;
   void *mem = edge(Atom(0), v_parts, &w, &p, &scratch);
-  int r = driver_of(v_self)->room((void *)Nativeint_val(v_self), p,
+  int r = driver_of(v_self)->room((void *)Nativeint_val(v_self), 0, p,
                                   (int)Wosize_val(v_parts), scratch,
                                   (const uint8_t *)String_val(v_args));
   free(mem);

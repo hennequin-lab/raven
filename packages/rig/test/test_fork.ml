@@ -391,6 +391,52 @@ let test_child_memory () =
   equal (list string) (List.init 6 (fun _ -> "forked")) lines;
   B.wait h Rig.Read_write
 
+(* A child of a process whose thread holds a half of the host's staging memory
+   at the fork, and whose queued copies no device ran, copies through staging
+   memory of its own: the held half stays held, and a half whose work names a
+   parent's device is replaced. Host memory a parent's device wrote through a
+   borrow, with the copy still queued, is lost in the child. *)
+let test_staging () =
+  if Sys.win32 then skip ~reason:"Windows has no fork" ();
+  Rig.free_cache Rig.host;
+  let d, p = P.open_ ~host_visible:false "fork:staging" in
+  let src = B.create d 64 in
+  B.fill src 's';
+  let filled c =
+    let b = B.create Rig.host 64 in
+    B.write b Bigarray.char (fun a -> Bigarray.Array1.fill a c);
+    b
+  in
+  ignore (B.submit_copy ~src:(filled 'q') ~dst:(B.create d 64) [| B.row 64 |]);
+  let paged = B.create Rig.host (1 lsl 16) in
+  ignore (B.submit_copy ~src ~dst:paged [| B.row 64 |]);
+  P.gate p;
+  let holder =
+    Thread.create (fun () -> B.copy ~src ~dst:(B.create Rig.host 64)) ()
+  in
+  Support.await "a copy holding a half" (fun () -> P.sleepers p = 1);
+  let lines, ended =
+    in_child (fun () ->
+        Sys.set_signal Sys.sigalrm Sys.Signal_default;
+        ignore (Unix.alarm 5);
+        let e, _ = P.open_ ~host_visible:false "fork:staging-child" in
+        let on_e = B.create e 64 and back = B.create Rig.host 64 in
+        B.copy ~src:(filled 'c') ~dst:on_e;
+        B.copy ~src:on_e ~dst:back;
+        [
+          B.read back Bigarray.char (fun a -> String.make 1 a.{0});
+          (match B.read paged Bigarray.char ignore with
+          | () -> "read"
+          | exception Rig.Lost (d', why) when Rig.equal d d' -> why);
+        ])
+  in
+  P.open_gate p;
+  Thread.join holder;
+  equal string "exited 0" (status ended);
+  equal (list string) [ "c"; "forked" ] lines;
+  equal ~msg:"the queued copy in the parent" string "s"
+    (B.read paged Bigarray.char (fun a -> String.make 1 a.{0}))
+
 (* A drain on [d], also on a lost [d], whose {!B.create} then raises. *)
 let drain d =
   match B.create d 8 with
@@ -403,17 +449,17 @@ let counted runs =
   Gc.finalise (fun _ -> Atomic.incr runs) v;
   v
 
-(* Drops the submission [h] holds in a forked child, drains its device and the
-   host there, and checks that its value is collected in the child, then in
-   the parent once its work is done. *)
-let collected_in_child d p runs h =
+(* Drops the submission [h] holds in a forked child, drains the devices [on]
+   there, its own and the host unless given, and checks that its value is
+   collected in the child, then in the parent once its work is done. *)
+let collected_in_child ?on d p runs h =
+  let on = Option.value on ~default:[ d; Rig.host ] in
   let lines, ended =
     in_child (fun () ->
         h := None;
         Gc.full_major ();
         Gc.full_major ();
-        drain d;
-        drain Rig.host;
+        List.iter drain on;
         Gc.full_major ();
         [ Printf.sprintf "collected: %d" (Atomic.get runs) ])
   in
@@ -437,6 +483,16 @@ let test_keep () =
   let h = ref (Some (Sub.make ~keep:(counted runs) d [||])) in
   ignore (submit (Option.get !h));
   collected_in_child d p runs h
+
+(* The child makes no call on an orphaned device, so a call on any device lets
+   go of the value a submission on it keeps, here one on the host. *)
+let test_keep_any_call () =
+  if Sys.win32 then skip ~reason:"Windows has no fork" ();
+  let runs = Atomic.make 0 in
+  let d, p = P.open_ "fork:keep-any-call" in
+  let h = ref (Some (Sub.make ~keep:(counted runs) d [||])) in
+  ignore (submit (Option.get !h));
+  collected_in_child ~on:[ Rig.host ] d p runs h
 
 (* A value whose submission the parent collected and drained before the fork,
    and whose work is not done, is kept in the child no longer. *)
@@ -514,8 +570,12 @@ let tests =
           test_locks;
         test "a forked child's host borrow of a lost device's memory is lost"
           test_child_memory;
+        test "a forked child stages through halves its parent did not hold"
+          test_staging;
         test "a submission made before a fork keeps nothing in the child"
           test_keep;
+        test "a forked child's call on the host lets go of an orphan's value"
+          test_keep_any_call;
         test "a kept value drained before a fork is let go in the child"
           test_keep_drained;
         test "a forked child gives back no word its parent's devices hold"

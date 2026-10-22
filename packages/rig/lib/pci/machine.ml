@@ -56,8 +56,8 @@ let address = Bus_address.v
 let compare_address = Bus_address.compare
 let machine name files ops = { name; ops; files; reserved = Atomic.make [] }
 
-let at root =
-  let files = Sysfs.v root in
+let at ?kernel root =
+  let files = Sysfs.v ?kernel root in
   machine None (Some files) (Local.ops files)
 
 let this = at "/"
@@ -76,6 +76,29 @@ let functions m =
   Result.map
     (List.sort (fun a b -> Bus_address.compare a.bus b.bus))
     (m.ops.functions ())
+
+(* Routes *)
+
+type distance = Sysfs.distance = Switch | Bridge | System
+
+let route m bus =
+  match m.files with
+  | Some files when Option.is_some (Bus_address.numbers bus) ->
+      Sysfs.route files bus
+  | Some _ | None -> None
+
+let routes m a b =
+  match (route m a, route m b) with
+  | Some ra, Some rb -> Some (ra, rb)
+  | _ -> None
+
+let forwards m ~provider ~client =
+  match routes m provider client with
+  | Some (provider, client) -> Sysfs.forwards ~provider ~client
+  | None -> false
+
+let distance m a b =
+  Option.map (fun (ra, rb) -> Sysfs.distance ra rb) (routes m a b)
 
 let rec record m range =
   let ranges = Atomic.get m.reserved in

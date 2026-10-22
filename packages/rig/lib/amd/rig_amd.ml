@@ -124,6 +124,8 @@ type 'm path = {
   reaches : int -> bool;
   map_peer : 'm memory -> 'm memory option;
   free : 'm memory -> unit;
+  bus : string option;
+  dma : 'm memory -> fn:string -> (Rig_edge.dma, string) result;
   queue :
     [ `Pm4 | `Aql | `Sdma ] ->
     ring:int ->
@@ -157,6 +159,7 @@ type ops = {
   alloc : Rig_edge.memory -> int -> mem option;
   map_host : (int -> int -> mem option) option;
   map_peer : mem -> mem option;
+  dma : mem -> fn:string -> (Rig_edge.dma, string) result;
   queue :
     [ `Pm4 | `Aql | `Sdma ] ->
     ring:int ->
@@ -184,6 +187,11 @@ let ops (type m) (p : m path) =
     map_host = Option.map (fun f a n -> Option.map pack (f a n)) p.map_host;
     map_peer =
       (fun m -> Option.bind (own m) (fun m -> Option.map pack (p.map_peer m)));
+    dma =
+      (fun m ~fn ->
+        match own m with
+        | Some m -> p.dma m ~fn
+        | None -> invalid_arg "Rig_amd.dma: another path's memory");
     queue = p.queue;
     retire = p.retire;
     most_ring = p.most_ring;
@@ -221,12 +229,19 @@ external set_ring :
 external set_descriptor : int -> int -> int -> unit = "caml_rig_amd_descriptor"
 
 (* The code of a ring's kind in rig_amd_stubs.h. *)
-let ring_kind = function `Pm4 -> 0 | `Aql -> 1 | `Sdma -> 2
+external ring_pm4 : unit -> int = "caml_rig_amd_ring_pm4" [@@noalloc]
+external ring_aql : unit -> int = "caml_rig_amd_ring_aql" [@@noalloc]
+external ring_sdma : unit -> int = "caml_rig_amd_ring_sdma" [@@noalloc]
+
+let ring_kind = function
+  | `Pm4 -> ring_pm4 ()
+  | `Aql -> ring_aql ()
+  | `Sdma -> ring_sdma ()
 
 external set_template : int -> int -> string -> string -> unit
   = "caml_rig_amd_template"
 
-external set_max_copy : int -> int -> unit = "caml_rig_amd_max_copy"
+external set_copies : int -> int -> int -> unit = "caml_rig_amd_copies"
 
 external set_stamps : int -> int -> int -> int -> int -> unit
   = "caml_rig_amd_stamps"
@@ -331,6 +346,7 @@ type t = {
   maps_host : bool;
   word : region; (* rig frees a word of the device's own after stop *)
   reaches : int -> bool; (* the path's *)
+  bus : string option; (* the path's *)
   capability : Abi.Capability.t;
   guard : Lock.t;
       (* held by [grow_scratch], [make_trace], and stop over [live] *)
@@ -343,22 +359,22 @@ type t = {
    comparing all 64 bits of a word the host moved across 2^32. GC 12.0.1: the
    R9700, MEC firmware 3010. *)
 let wait64_from = [ ((12, 0, 1), 3010) ]
-let ring_bytes = 16 lsl 20
+(* The bytes of the first compute ring, copy ring and argument segment of a
+   device made from now on ([set_first_sizes]). *)
+let first_sizes = Atomic.make (16 lsl 20, 16 lsl 20, 2 lsl 20)
 
-(* The bytes of [p]'s first ring of a queue of kind [k]. *)
-let first_ring (p : _ path) k = Int.min ring_bytes (p.most_ring k)
+(* The bytes of [p]'s first ring of a queue of kind [k], of [compute] or
+   [copy] bytes where [p] makes rings that large. *)
+let first_ring (p : _ path) ~compute ~copy k =
+  Int.min (if k = `Sdma then copy else compute) (p.most_ring k)
 
 (* A path's refusal, as an open's error. *)
 let why = function Lacking why | Full why | Refused why -> why
-let segment_bytes = 2 lsl 20
 let pointers_bytes = 4096
 
 (* The stamp ring: RIG_AMD_STAMPS slots of four 8-byte words, then the record
    of a stamp of the measure at open. *)
 let stamps_bytes = (4096 * 32) + 8
-
-(* RIG_AMD_WAITS, the waits a submission's reserved room holds *)
-external max_waits : unit -> int = "caml_rig_amd_max_waits" [@@noalloc]
 
 (* The queues, as rig_amd_ring.c's [runs] accepts their parts. *)
 let device_queues =
@@ -408,37 +424,84 @@ let init_pointers (gpu : Abi.Gpu.t) ~aql ~waves host =
 
 (* Templates *)
 
-(* Each packet the writer places, its values the arguments 0, 1 and 2 of a use,
-   in rig_amd_stubs.h's order. On an AQL queue, whose PM4 words every die runs,
-   a release writes once: on die 0, after the barrier of its packet, every die's
-   work is done. *)
-let templates (g : Abi.Gpu.t) ~interrupt ~waits64 ~aql =
-  let once p = if aql then Pm4.pred_exec ~xcc_mask:1 p else p in
+(* The index of each packet the writer places, rig_amd_stubs.h's T_WAIT to
+   S_FILL, and their count. *)
+external t_wait : unit -> int = "caml_rig_amd_t_wait" [@@noalloc]
+external t_flush : unit -> int = "caml_rig_amd_t_flush" [@@noalloc]
+external t_acquire : unit -> int = "caml_rig_amd_t_acquire" [@@noalloc]
+external t_wait64 : unit -> int = "caml_rig_amd_t_wait64" [@@noalloc]
+external t_signal : unit -> int = "caml_rig_amd_t_signal" [@@noalloc]
+external t_release : unit -> int = "caml_rig_amd_t_release" [@@noalloc]
+external t_write : unit -> int = "caml_rig_amd_t_write" [@@noalloc]
+external s_poll : unit -> int = "caml_rig_amd_s_poll" [@@noalloc]
+external s_fence : unit -> int = "caml_rig_amd_s_fence" [@@noalloc]
+external s_trap : unit -> int = "caml_rig_amd_s_trap" [@@noalloc]
+external s_copy : unit -> int = "caml_rig_amd_s_copy" [@@noalloc]
+external a_ib : unit -> int = "caml_rig_amd_a_ib" [@@noalloc]
+external t_invalidate : unit -> int = "caml_rig_amd_t_invalidate" [@@noalloc]
+external t_stamp : unit -> int = "caml_rig_amd_t_stamp" [@@noalloc]
+external s_stamp : unit -> int = "caml_rig_amd_s_stamp" [@@noalloc]
+external s_fill : unit -> int = "caml_rig_amd_s_fill" [@@noalloc]
+external template_count : unit -> int = "caml_rig_amd_templates" [@@noalloc]
+
+(* What a device's packets depend on: its GPU, its release's interrupt
+   context, whether its compute queue runs 64-bit waits and whether it reads
+   AQL packets. *)
+module Setting = struct
+  type t = { gpu : Abi.Gpu.t; interrupt : int; waits64 : bool; aql : bool }
+end
+
+(* Each packet the writer places, at its index, its values the arguments 0, 1
+   and 2 of a use. On an AQL queue, whose PM4 words every die runs, a release
+   writes once: on die 0, after the barrier of its packet, every die's work is
+   done. *)
+let templates =
+  let open Setting in
+  let once s p = if s.aql then Pm4.pred_exec ~xcc_mask:1 p else p in
   [
-    Pm4.wait g (Memory 0) Equal 1 ();
-    Pm4.event_write Cs_partial_flush;
-    Pm4.acquire_mem g System;
-    (if waits64 then Pm4.wait_64 g 0 Greater_equal 1 () else []);
-    once (Pm4.release_mem g System 0 (Low_32 1));
-    once (Pm4.release_mem g System ~interrupt 0 (Data_64 1));
-    Pm4.write_data (Memory 0) 1;
-    Sdma.poll 0 Equal 1 ();
-    Sdma.fence g 0 1;
-    Sdma.trap;
-    Sdma.copy_linear ~dst:0 ~src:1 ~bytes:2;
-    Abi.Aql.indirect_buffer 0 ~dwords:1;
-    Pm4.acquire_mem g Agent;
-    Pm4.event_write Cs_partial_flush @ once (Pm4.copy_data Confirmed Clock 0);
-    Sdma.timestamp 0;
+    (t_wait (), fun s -> Pm4.wait s.gpu (Memory 0) Equal 1 ());
+    (t_flush (), fun _ -> Pm4.event_write Cs_partial_flush);
+    (t_acquire (), fun s -> Pm4.acquire_mem s.gpu System);
+    ( t_wait64 (),
+      fun s ->
+        if s.waits64 then Pm4.wait_64 s.gpu 0 Greater_equal 1 () else [] );
+    (t_signal (), fun s -> once s (Pm4.release_mem s.gpu System 0 (Low_32 1)));
+    ( t_release (),
+      fun s ->
+        once s
+          (Pm4.release_mem s.gpu System ~interrupt:s.interrupt 0 (Data_64 1))
+    );
+    (t_write (), fun _ -> Pm4.write_data (Memory 0) 1);
+    (s_poll (), fun _ -> Sdma.poll 0 Equal 1 ());
+    (s_fence (), fun s -> Sdma.fence s.gpu 0 1);
+    (s_trap (), fun _ -> Sdma.trap);
+    (s_copy (), fun _ -> Sdma.copy_linear ~dst:0 ~src:1 ~bytes:2);
+    (a_ib (), fun _ -> Abi.Aql.indirect_buffer 0 ~dwords:1);
+    (t_invalidate (), fun s -> Pm4.acquire_mem s.gpu Agent);
+    ( t_stamp (),
+      fun s ->
+        Pm4.event_write Cs_partial_flush
+        @ once s (Pm4.copy_data Confirmed Clock 0) );
+    (s_stamp (), fun _ -> Sdma.timestamp 0);
+    (s_fill (), fun _ -> Sdma.const_fill ~dst:0 ~word:1 ~bytes:2);
   ]
 
-let set_templates self g ~interrupt ~waits64 ~aql =
-  let set i p =
-    let words, holes = Template.flatten Packet (fun _ -> None) Fun.id p in
+(* The writer reads a template at each index the header numbers. *)
+let () =
+  assert (
+    List.sort compare (List.map fst templates)
+    = List.init (template_count ()) Fun.id)
+
+let set_templates self gpu ~interrupt ~waits64 ~aql =
+  let s = { Setting.gpu; interrupt; waits64; aql } in
+  let set (i, packet) =
+    let words, holes =
+      Template.flatten Packet (fun _ -> None) Fun.id (packet s)
+    in
     set_template self i words holes
   in
-  List.iteri set (templates g ~interrupt ~waits64 ~aql);
-  set_max_copy self (Sdma.max_copy g)
+  List.iter set templates;
+  set_copies self (Sdma.max_copy gpu) (Sdma.max_fill gpu)
 
 let supported (g : Abi.Gpu.t) =
   let major, _, _ = g.target in
@@ -645,7 +708,7 @@ let facts g =
     queues = device_queues;
     copy_engine = Some 1;
     completion = Store;
-    waits = { stores = g.waits64; hosts = g.waits64; most = max_waits () };
+    waits = { stores = g.waits64; hosts = g.waits64 };
     may_block = false;
     hang_ms = g.hang_ms;
     maps_host = g.maps_host;
@@ -653,6 +716,7 @@ let facts g =
     alignment = region_alignment;
     capability = Abi.declare g.capability;
     word = g.word;
+    bus = g.bus;
     edge = Nativeint.of_int g.self;
   }
 
@@ -720,6 +784,33 @@ let map_peer g _ r =
           None
       | None -> view None)
 
+(* Another function's writes through the memory BAR pass the host data path
+   (HDP) as the host's do, so every hand-over flushes it once a region is
+   given: the region counts for the process's life, as the function may write
+   it until then. Its reads through the BAR may hit the HDP's read cache, which
+   the kernel invalidates before its own reads (amdgpu_device.c,
+   amdgpu_device_aper_access) on HDP 4.0 to 4.2, 5.0 and 5.2.0 alone:
+   hdp_v4_0.c's invalidate_hdp returns at once on 4.4.0, 4.4.2 and 4.4.5, and
+   hdp_v5_2.c, hdp_v6_0.c and hdp_v7_0.c have none (amdgpu_discovery.c pairs
+   each version with its file). The GPUs this driver drives report HDP 4.4.2
+   (gfx942), 4.4.5 (gfx950), 6 (GFX 11) and 7 (GFX 12) in their discovery
+   tables, so their releases need no invalidation: a value's release writes
+   the L2 back, and the function reads what the work wrote once the value is
+   reached. *)
+let dma g r ~fn =
+  match g.hdp with
+  | None ->
+      Error
+        "the host reaches no register that flushes the GPU's host data path, \
+         through which another function's writes reach the GPU's memory"
+  | Some _ ->
+      if not (count_hdp g g.self 1) then
+        Error "the device stopped, or flushes no more host data paths"
+      else
+        let answer = (live g).ops.dma r.mem ~fn in
+        if Result.is_error answer then ignore (count_hdp g g.self (-1));
+        answer
+
 let map_host g a n =
   if n < 1 then invalid_argf "Rig_amd.map_host: %d bytes, expected at least 1" n;
   match (live g).ops.map_host with
@@ -779,27 +870,46 @@ let image g bin =
         in
         Ok (Rig_edge.Place (Code_object.size co, lay))
 
-(* A dispatch's values: known to its launch, or the hand-over's argument [i], in
-   the order of rig_amd_stubs.h's L_ARGS, L_SCRATCH, L_THREADS, L_GROUPS and
-   L_GRID. *)
+(* A dispatch's values: known to its launch, or the hand-over's argument [i]. *)
 type value = Known of int | Arg of int
+
+(* The index of each of the hand-over's arguments, rig_amd_stubs.h's L_ARGS,
+   L_SCRATCH, and the first along x of L_THREADS, L_GROUPS and L_GRID. *)
+external l_args : unit -> int = "caml_rig_amd_l_args" [@@noalloc]
+external l_scratch : unit -> int = "caml_rig_amd_l_scratch" [@@noalloc]
+external l_threads : unit -> int = "caml_rig_amd_l_threads" [@@noalloc]
+external l_groups : unit -> int = "caml_rig_amd_l_groups" [@@noalloc]
+external l_grid : unit -> int = "caml_rig_amd_l_grid" [@@noalloc]
+
+(* The hand-over's arguments from [first] along x, y and z. *)
+let axes first = (Arg first, Arg (first + 1), Arg (first + 2))
 
 let word s i = Int32.to_int (String.get_int32_le s (4 * i)) land 0xffff_ffff
 
-(* The offsets of the implicit arguments [k] reads, in the order of
-   rig_amd_stubs.h's H_BLOCKS, H_GROUP, H_REMAINDER, H_OFFSET, H_DIMS and H_LDS,
-   or -1. *)
+(* The index among a launch's implicit argument offsets of the first of each
+   kind, rig_amd_stubs.h's H_BLOCKS, H_GROUP, H_REMAINDER, H_OFFSET, H_DIMS and
+   H_LDS, and their count, RIG_AMD_HIDDEN. *)
+external h_blocks : unit -> int = "caml_rig_amd_h_blocks" [@@noalloc]
+external h_group : unit -> int = "caml_rig_amd_h_group" [@@noalloc]
+external h_remainder : unit -> int = "caml_rig_amd_h_remainder" [@@noalloc]
+external h_offset : unit -> int = "caml_rig_amd_h_offset" [@@noalloc]
+external h_dims : unit -> int = "caml_rig_amd_h_dims" [@@noalloc]
+external h_lds : unit -> int = "caml_rig_amd_h_lds" [@@noalloc]
+external hidden_count : unit -> int = "caml_rig_amd_hidden" [@@noalloc]
+
+(* The offsets of the implicit arguments [k] reads, at their indices, or
+   -1. *)
 let hidden f (k : Code_object.kernel) =
-  let at = Array.make 14 (-1) in
+  let at = Array.make (hidden_count ()) (-1) in
   let axis : Code_object.axis -> int = function X -> 0 | Y -> 1 | Z -> 2 in
   let set (h : Code_object.hidden) off =
     match h with
-    | Block_count a -> at.(axis a) <- off
-    | Group_size a -> at.(3 + axis a) <- off
-    | Remainder a -> at.(6 + axis a) <- off
-    | Global_offset a -> at.(9 + axis a) <- off
-    | Grid_dims -> at.(12) <- off
-    | Dynamic_lds_size -> at.(13) <- off
+    | Block_count a -> at.(h_blocks () + axis a) <- off
+    | Group_size a -> at.(h_group () + axis a) <- off
+    | Remainder a -> at.(h_remainder () + axis a) <- off
+    | Global_offset a -> at.(h_offset () + axis a) <- off
+    | Grid_dims -> at.(h_dims ()) <- off
+    | Dynamic_lds_size -> at.(h_lds ()) <- off
     | Other kind ->
         invalid_argf
           "Rig_amd.entry: kernel %s reads the implicit argument %s, which a \
@@ -845,7 +955,7 @@ let c_launch_of g (k : Code_object.kernel) ~base ~lds f =
         (Aql.dispatch
            { k with group_segment = 0 }
            ~descriptor:(Known (base + k.descriptor))
-           ~args:(Arg 0) ~threads:(1, 1, 1) ~grid:(Arg 8, Arg 9, Arg 10))
+           ~args:(Arg (l_args ())) ~threads:(1, 1, 1) ~grid:(axes (l_grid ())))
     in
     c_launch_aql words holes
       Aql.
@@ -862,8 +972,9 @@ let c_launch_of g (k : Code_object.kernel) ~base ~lds f =
         (Pm4.dispatch g
            { k with group_segment = group }
            ~program:(Known (base + k.entry))
-           ~scratch:(Arg 1) ~args:(Arg 0) ~packet:(Known 0)
-           ~threads:(Arg 2, Arg 3, Arg 4) ~groups:(Arg 5, Arg 6, Arg 7) ())
+           ~scratch:(Arg (l_scratch ())) ~args:(Arg (l_args ()))
+           ~packet:(Known 0) ~threads:(axes (l_threads ()))
+           ~groups:(axes (l_groups ())) ())
     in
     let granule = Pm4.lds_granule g in
     let words, holes = dispatch 0 and more, _ = dispatch granule in
@@ -979,7 +1090,9 @@ let make (type m) ~word (p : m path) =
   let* () = supported p.gpu in
   let ops = ops p in
   let taken = ref [] and queues = ref false and copy_launch = ref 0 in
-  (* Memory a queue the path could not stop may still read stays. *)
+  let state = ref 0 in
+  (* Memory a queue the path could not stop may still read stays. The C
+     state, which no queue reads, goes either way. *)
   let undo () =
     let stopped =
       (not !queues)
@@ -989,6 +1102,7 @@ let make (type m) ~word (p : m path) =
       | `Unknown -> false
       | exception Fault _ -> false
     in
+    if !state <> 0 then destroy !state;
     if stopped then begin
       if !copy_launch <> 0 then free_launch !copy_launch;
       List.iter give_back !taken
@@ -1032,10 +1146,12 @@ let make (type m) ~word (p : m path) =
           copy_word host word;
           Ok own
     in
+    let compute, copy, segment_bytes = Atomic.get first_sizes in
+    let first_ring = first_ring p ~compute ~copy in
     let* segment = alloc "argument segment" segment_bytes in
     let compute_kind = if aql then `Aql else `Pm4 in
-    let* compute = alloc "compute ring" (first_ring p compute_kind) in
-    let* copy = alloc "copy ring" (first_ring p `Sdma) in
+    let* compute = alloc "compute ring" (first_ring compute_kind) in
+    let* copy = alloc "copy ring" (first_ring `Sdma) in
     let* pointers = alloc "queue positions" pointers_bytes in
     let* stamps = alloc "stamp ring" stamps_bytes in
     let* stamps_host = host_of "stamp ring" stamps in
@@ -1073,7 +1189,7 @@ let make (type m) ~word (p : m path) =
       let at = mem_address pointers in
       let* doorbell =
         Result.map_error why
-          (p.queue kind ~ring:(mem_address ring) ~bytes:(first_ring p kind)
+          (p.queue kind ~ring:(mem_address ring) ~bytes:(first_ring kind)
              ~read:(at + read_at ~aql q)
              ~write:(at + write_at ~aql q))
       in
@@ -1084,6 +1200,7 @@ let make (type m) ~word (p : m path) =
     let* copy_bell = queue 1 `Sdma copy in
     (* The queues read none of the C state before a doorbell. *)
     let self = create () in
+    state := self;
     set_memory self word_host (mem_address word);
     set_segment self segment_host (mem_address segment) segment_bytes;
     (* The GPU's own register takes the first of the empty table's slots, with
@@ -1093,7 +1210,7 @@ let make (type m) ~word (p : m path) =
     set_templates self p.gpu ~interrupt:p.interrupt ~waits64 ~aql;
     set_copy_launch self !copy_launch;
     let ring q kind host bell id =
-      set_ring self q host (first_ring p kind) (p.most_ring kind)
+      set_ring self q host (first_ring kind) (p.most_ring kind)
         (pointers_host + write_at ~aql q)
         bell (ring_kind kind) id
     in
@@ -1107,10 +1224,7 @@ let make (type m) ~word (p : m path) =
     let source = match p.clock with Source c -> c | Round_trip -> 0 in
     let* () =
       if set_clock self source then Ok ()
-      else begin
-        destroy self;
-        Error "the GPU's clock could not be read against the host's"
-      end
+      else Error "the GPU's clock could not be read against the host's"
     in
     let rec g =
       {
@@ -1128,6 +1242,7 @@ let make (type m) ~word (p : m path) =
         maps_host = Option.is_some ops.map_host;
         word = region 8 word;
         reaches = p.reaches;
+        bus = p.bus;
         capability =
           {
             gpu = p.gpu;
@@ -1466,3 +1581,20 @@ let ring g q =
       refuse_stopped g "ring";
       placed g.self i
   | None -> invalid_argf "Rig_amd.ring: no queue %S" q
+
+external segment_bytes : int -> int = "caml_rig_amd_segment_bytes"
+
+let segment g =
+  Lock.check "Rig_amd.segment";
+  Lock.protect g.guard @@ fun () ->
+  refuse_stopped g "segment";
+  segment_bytes g.self
+
+let set_first_sizes ~compute ~copy ~segment =
+  let sized n = n >= 4096 && n land (n - 1) = 0 in
+  if not (sized compute && sized copy && sized segment) then
+    invalid_argf
+      "Rig_amd.set_first_sizes: %d, %d and %d bytes, expected powers of two \
+       of at least 4096"
+      compute copy segment;
+  Atomic.exchange first_sizes (compute, copy, segment)

@@ -58,26 +58,22 @@ let alignment (type v s) (dt : (v, s) D.t) =
   | D.Complex -> D.bits dt / 16
   | D.Float | D.Signed | D.Unsigned | D.Boolean -> Int.max 1 (D.bits dt / 8)
 
-(* [value b dt layout] is the host value of [dt] elements laid out by [layout]
-   over the bytes [b], a range of a file or of host memory. It reads [b]'s own
-   memory, through the host's borrow of a file's pages, where [b] starts on a
-   multiple of [dt]'s alignment and the host maps it; it reads a copy of [b]'s
-   bytes otherwise. *)
+let copied b dt layout =
+  let c = B.create Rig.host (B.length b) in
+  B.copy ~src:b ~dst:c;
+  Nx.Repr.unsafe_of_array Nx.Host.v (A.v dt layout c)
+
+(* [value b dt layout] reads [b]'s own memory, through the host's borrow of a
+   file's pages, where [b] starts on a multiple of [dt]'s alignment and the
+   host maps it, and shares it; it reads a copy of [b]'s bytes otherwise,
+   which it owns. *)
 let value b dt layout =
-  let b =
-    if B.offset b mod alignment dt = 0 then b
-    else
-      let c = B.create Rig.host (B.length b) in
-      B.copy ~src:b ~dst:c;
-      c
-  in
-  let a = A.v dt layout b in
-  let a =
+  if B.offset b mod alignment dt = 0 then
+    let a = A.v dt layout b in
     match A.borrow Rig.host a with
-    | Some a -> a
-    | None -> A.to_device Rig.host a
-  in
-  Nx.Repr.of_array Nx.Host.v a
+    | Some a -> Nx.Repr.of_array Nx.Host.v a
+    | None -> Nx.Repr.unsafe_of_array Nx.Host.v (A.to_device Rig.host a)
+  else copied b dt layout
 
 (* Each element's bytes are a last axis of [w], split into components of [k]
    bytes, whose order is reversed: a complex number keeps its real part
@@ -117,7 +113,7 @@ let with_bytes ~by x f =
   Fail.reading ~by (Nx.Repr.read x) @@ fun a ->
   let a = if L.is_contiguous (A.layout a) then a else A.copy a in
   if Sys.big_endian && alignment (A.dtype a) > 1 then
-    let swapped = byteswap (Nx.Repr.of_array Nx.Host.v (A.copy a)) in
+    let swapped = byteswap (Nx.Repr.unsafe_of_array Nx.Host.v (A.copy a)) in
     Nx.Repr.read swapped (fun b ->
         bytes (if L.is_contiguous (A.layout b) then b else A.copy b))
   else bytes a
