@@ -44,15 +44,7 @@
 #include <sys/mount.h>
 #endif
 
-#if defined(__linux__) && defined(__has_include)
-#if __has_include(<linux/io_uring.h>)
-#include <linux/io_uring.h>
-#include <sys/syscall.h>
-#if defined(IO_URING_OP_SUPPORTED) && defined(__NR_io_uring_setup)
-#define RIG_DISK_IO_URING 1
-#endif
-#endif
-#endif
+#include "rig_pool.h"
 #endif
 
 /* A path that names no regular file. */
@@ -381,208 +373,83 @@ static intnat transfer_calls(int write, intnat h, int64_t pos, char *buf,
   return done;
 }
 
-#ifdef RIG_DISK_IO_URING
+/* Long reads
 
-/* Linux's io_uring, for long reads: a read is cut into requests of [SEGMENT]
-   bytes, [DEPTH] of them in flight. The ring is made by the first read that
-   takes it, if the kernel allows it and its probe reports the read
-   operation. One read at a time holds it; a read that finds it held moves its
-   bytes with system calls. */
+   A read of more than [SEGMENT] bytes is a blocking job of the host's pool
+   (rig_pool.h), one chunk a segment, on as many threads as the performance
+   cores the process may occupy; each segment is read by system calls. A
+   read copies the file's cached pages on the thread that makes it, so one
+   thread moves them at the speed of one core's copy, and storage serves
+   several reads at once. A 32 MiB piece of a file took, on fudge (Core
+   Ultra 5 235, Linux 6.12, ext4 on NVMe), 3.0 ms in one pread from the page
+   cache and 1.1 ms on six threads that claim its segments, and 10.2 and 6.1
+   ms from the disk. io_uring with 16 reads in flight took as long as one
+   pread, 3.0 and 10.5 ms: it copies cached pages on the submitting thread
+   too.
 
-#define DEPTH 16
+   A read that finds the end of the file reads up to it: the bytes read are
+   those before the first segment that came short. Segments past that end,
+   or after an error, are not read. */
+
 #define SEGMENT ((intnat)2 << 20)
 
-/* The operations the ring's probe asks about. */
-#define PROBE_OPS 256
-
-/* 0 before the first transfer that takes the ring, 1 ready, -1 unavailable.
-   Written only by the ring's holder. */
-static int ring_state;
-static int ring_held;
-
-static struct {
-  int fd;
-  unsigned *sq_head, *sq_tail, *sq_mask, *sq_array;
-  unsigned *cq_head, *cq_tail, *cq_mask;
-  struct io_uring_sqe *sqes;
-  struct io_uring_cqe *cqes;
-} ring;
-
-/* A forked child shares the ring's queues with its parent: their requests
-   would mix. The child closes its share and makes a ring of its own at its
-   first long read (Forks, below). */
-static void ring_forget(void) {
-  if (ring_state == 1) close(ring.fd);
-  ring_state = 0;
-  ring_held = 0;
-}
-
-static int supports(struct io_uring_probe *probe, int op) {
-  return op <= probe->last_op &&
-         (probe->ops[op].flags & IO_URING_OP_SUPPORTED) != 0;
-}
-
-static int ring_setup(void) {
-  struct io_uring_params p;
-  memset(&p, 0, sizeof p);
-  int fd = (int)syscall(__NR_io_uring_setup, DEPTH, &p);
-  if (fd < 0) return 0;
-  size_t probe_size =
-      sizeof(struct io_uring_probe) +
-      PROBE_OPS * sizeof(struct io_uring_probe_op);
-  struct io_uring_probe *probe = calloc(1, probe_size);
-  int ok = probe != NULL &&
-           syscall(__NR_io_uring_register, fd, IORING_REGISTER_PROBE, probe,
-                   PROBE_OPS) == 0 &&
-           supports(probe, IORING_OP_READ);
-  free(probe);
-  size_t sq_size = p.sq_off.array + p.sq_entries * sizeof(unsigned);
-  size_t cq_size = p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe);
-  int single = (p.features & IORING_FEAT_SINGLE_MMAP) != 0;
-  if (single && cq_size > sq_size) sq_size = cq_size;
-  void *sq = MAP_FAILED, *cq = MAP_FAILED, *sqes = MAP_FAILED;
-  if (ok) {
-    sq = mmap(NULL, sq_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE,
-              fd, IORING_OFF_SQ_RING);
-    cq = single ? sq
-                : mmap(NULL, cq_size, PROT_READ | PROT_WRITE,
-                       MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_CQ_RING);
-    sqes = mmap(NULL, p.sq_entries * sizeof(struct io_uring_sqe),
-                PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd,
-                IORING_OFF_SQES);
-  }
-  if (sq == MAP_FAILED || cq == MAP_FAILED || sqes == MAP_FAILED) {
-    if (sq != MAP_FAILED) munmap(sq, sq_size);
-    if (cq != MAP_FAILED && !single) munmap(cq, cq_size);
-    if (sqes != MAP_FAILED)
-      munmap(sqes, p.sq_entries * sizeof(struct io_uring_sqe));
-    close(fd);
-    return 0;
-  }
-  ring.fd = fd;
-  ring.sq_head = (unsigned *)((char *)sq + p.sq_off.head);
-  ring.sq_tail = (unsigned *)((char *)sq + p.sq_off.tail);
-  ring.sq_mask = (unsigned *)((char *)sq + p.sq_off.ring_mask);
-  ring.sq_array = (unsigned *)((char *)sq + p.sq_off.array);
-  ring.cq_head = (unsigned *)((char *)cq + p.cq_off.head);
-  ring.cq_tail = (unsigned *)((char *)cq + p.cq_off.tail);
-  ring.cq_mask = (unsigned *)((char *)cq + p.cq_off.ring_mask);
-  ring.cqes = (struct io_uring_cqe *)((char *)cq + p.cq_off.cqes);
-  ring.sqes = (struct io_uring_sqe *)sqes;
-  return 1;
-}
-
-/* A request's bytes: [len] from [off] of the transfer, [queued] once it is in
-   the submission queue or in flight. */
-struct request {
-  intnat off, len;
-  int queued;
+/* A read: [n] bytes of [h] from [pos] into [buf]. [end] is where a segment
+   found the end of the file, else [n], and [error] the first system error,
+   else 0. */
+struct reading {
+  intnat h;
+  int64_t pos;
+  char *buf;
+  intnat n;
+  _Atomic intnat end;
+  _Atomic int error;
 };
 
-static intnat read_ring(intnat h, int64_t pos, char *buf, intnat n) {
-  struct request req[DEPTH];
-  memset(req, 0, sizeof req);
-  intnat next = 0; /* the first byte no request covers */
-  intnat end = n;  /* where a read found the end of the file */
-  int error = 0, inflight = 0;
-  unsigned mask = *ring.sq_mask;
-  for (;;) {
-    unsigned tail = *ring.sq_tail;
-    for (int s = 0; s < DEPTH && error == 0; s++) {
-      if (req[s].queued) continue;
-      if (req[s].len == 0) {
-        if (next >= end) continue;
-        req[s].off = next;
-        req[s].len = end - next < SEGMENT ? end - next : SEGMENT;
-        next += req[s].len;
+/* Reads segments [lo, hi) of [ctx]'s read, until an error came or a
+   segment starts past the end of the file. */
+static void read_segments(int64_t lo, int64_t hi, int worker, void *ctx) {
+  (void)worker;
+  struct reading *r = ctx;
+  for (int64_t s = lo; s < hi; s++) {
+    intnat at = (intnat)s * SEGMENT;
+    if (atomic_load(&r->error) != 0 || at >= atomic_load(&r->end)) return;
+    intnat len = r->n - at < SEGMENT ? r->n - at : SEGMENT;
+    intnat got = transfer_calls(0, r->h, r->pos + at, r->buf + at, len);
+    if (got < 0) {
+      int none = 0;
+      atomic_compare_exchange_strong(&r->error, &none, (int)-got);
+    } else if (got < len) {
+      intnat end = atomic_load(&r->end);
+      while (at + got < end &&
+             !atomic_compare_exchange_weak(&r->end, &end, at + got)) {
       }
-      struct io_uring_sqe *sqe = &ring.sqes[tail & mask];
-      memset(sqe, 0, sizeof *sqe);
-      sqe->opcode = IORING_OP_READ;
-      sqe->fd = (int)h;
-      sqe->off = (uint64_t)(pos + req[s].off);
-      sqe->addr = (uint64_t)(uintptr_t)(buf + req[s].off);
-      sqe->len = (uint32_t)req[s].len;
-      sqe->user_data = (uint64_t)s;
-      ring.sq_array[tail & mask] = tail & mask;
-      tail++;
-      req[s].queued = 1;
-      inflight++;
     }
-    __atomic_store_n(ring.sq_tail, tail, __ATOMIC_RELEASE);
-    if (inflight == 0) break;
-    unsigned pending = tail - __atomic_load_n(ring.sq_head, __ATOMIC_ACQUIRE);
-    if (syscall(__NR_io_uring_enter, ring.fd, pending, 1,
-                IORING_ENTER_GETEVENTS, NULL, 0) < 0) {
-      if (errno == EINTR || errno == EAGAIN || errno == EBUSY) continue;
-      /* The ring is unusable: nothing it holds can be waited for. */
-      ring_state = -1;
-      return -(intnat)errno;
-    }
-    unsigned head = *ring.cq_head;
-    unsigned cq_tail = __atomic_load_n(ring.cq_tail, __ATOMIC_ACQUIRE);
-    for (; head != cq_tail; head++) {
-      struct io_uring_cqe *cqe = &ring.cqes[head & *ring.cq_mask];
-      struct request *r = &req[cqe->user_data];
-      int res = cqe->res;
-      r->queued = 0;
-      inflight--;
-      if (res == -EINTR || res == -EAGAIN) continue;
-      if (res < 0) {
-        if (error == 0) error = -res;
-        r->len = 0;
-      } else if (res == 0) {
-        if (r->off < end) end = r->off;
-        r->len = 0;
-      } else {
-        r->off += res;
-        r->len -= res;
-      }
-      if (error != 0 || r->off >= end) r->len = 0;
-    }
-    __atomic_store_n(ring.cq_head, head, __ATOMIC_RELEASE);
   }
-  return error != 0 ? -(intnat)error : end;
 }
 
-/* Only a read of more than one segment takes the ring: a shorter read, and
-   any write, is faster as system calls. */
-static intnat transfer(int write, intnat h, int64_t pos, char *buf,
-                       intnat n) {
-  if (!write && n > SEGMENT &&
-      __atomic_exchange_n(&ring_held, 1, __ATOMIC_ACQUIRE) == 0) {
-    if (ring_state == 0) ring_state = ring_setup() ? 1 : -1;
-    intnat r = ring_state == 1 ? read_ring(h, pos, buf, n)
-                               : transfer_calls(0, h, pos, buf, n);
-    __atomic_store_n(&ring_held, 0, __ATOMIC_RELEASE);
-    return r;
-  }
-  return transfer_calls(write, h, pos, buf, n);
+static intnat read_long(intnat h, int64_t pos, char *buf, intnat n) {
+  struct reading r = {h, pos, buf, n, n, 0};
+  int64_t segments = (n + SEGMENT - 1) / SEGMENT;
+  rig_pool_run_blocking(rig_pool_performance_cores(), segments, segments,
+                        read_segments, &r);
+  return r.error != 0 ? -(intnat)r.error : atomic_load(&r.end);
 }
-
-#else
 
 static intnat transfer(int write, intnat h, int64_t pos, char *buf,
                        intnat n) {
+  if (!write && n > SEGMENT) return read_long(h, pos, buf, n);
   return transfer_calls(write, h, pos, buf, n);
 }
-
-#endif
 
 /* Forks
 
    A forked child makes anew what a thread of its parent may have held at the
    fork: the descriptor table's lock and the files' sync locks, which the
-   OCaml side makes anew once [forks] has moved, and the io_uring ring. */
+   OCaml side makes anew once [forks] has moved. */
 
 static atomic_int forks;
 
-static void forked_child(void) {
-  atomic_fetch_add(&forks, 1);
-#ifdef RIG_DISK_IO_URING
-  ring_forget();
-#endif
-}
+static void forked_child(void) { atomic_fetch_add(&forks, 1); }
 
 static pthread_once_t watch_once = PTHREAD_ONCE_INIT;
 static void watch(void) { pthread_atfork(NULL, NULL, forked_child); }

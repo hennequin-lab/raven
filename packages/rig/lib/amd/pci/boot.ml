@@ -48,6 +48,9 @@ type t = {
   fault : string option ref;
       (* the first report, raised again by each sleep: a fault, a hang, or a
          flush the hubs did not confirm *)
+  reads : int Atomic.t;
+      (* moves each time a sleep consumes entries of the interrupt ring or
+         records a fault: [interrupts] *)
   mutable eops : (int * Memory.region) list;
       (* each compute queue's end-of-pipe buffer, by its doorbell index, kept
          from its first queue to the stop for every later one *)
@@ -148,17 +151,18 @@ let vf_request mmio f ?(ready = true) req =
   in
   Ok (req + 1)
 
-(* The discovery table, read through the memory BAR, or a word at a time through
-   the memory index window when the BAR is smaller than the GPU's memory: the
-   index's low 31 bits with bit 31 set, then its high bits, as the kernel's
-   amdgpu_device_mm_access writes them. *)
-let read_table ~vram ~mmio ~memory =
+(* The first [n] bytes of the discovery table, [n] a multiple of 4, read
+   through the memory BAR, or a word at a time through the memory index window
+   when the BAR is smaller than the GPU's memory: the index's low 31 bits with
+   bit 31 set, then its high bits, as the kernel's amdgpu_device_mm_access
+   writes them. The window takes three register accesses a word, 5 ms for the
+   whole table on an R9700. *)
+let read_table ~vram ~mmio ~memory n =
   let at = memory - Discovery.offset in
-  if Window.length vram >= memory then
-    Window.read vram at Discovery.bytes
+  if Window.length vram >= memory then Window.read vram at n
   else begin
-    let b = Bytes.create Discovery.bytes in
-    for i = 0 to (Discovery.bytes / 4) - 1 do
+    let b = Bytes.create n in
+    for i = 0 to (n / 4) - 1 do
       let w = at + (4 * i) in
       Window.set32 mmio (D.mmmm_index * 4) (w land 0x7fff_ffff lor 0x8000_0000);
       Window.set32 mmio (D.mmmm_index_hi * 4) (w lsr 31);
@@ -167,6 +171,39 @@ let read_table ~vram ~mmio ~memory =
     done;
     Bytes.to_string b
   end
+
+(* What a process keeps of a GPU across its boots: the discovery table a boot
+   last read whole, with its parse, and the frequencies of each clock the
+   power managers of its boots reported. A table's first 12 bytes hold its
+   signature, version, size and the checksum of the rest, so a later boot
+   reads them alone and keeps the table if they are its first bytes. The
+   frequencies are kept by the version of the firmware that reported them,
+   which a boot asks in one message, since a partial boot runs whatever
+   firmware the last session left; otherwise each boot would ask for them
+   again, 16 messages on an R9700, 1 ms. *)
+type kept = {
+  mutable table : (string * Discovery.t) option;
+  levels : Smu.levels;
+}
+
+let kept () = { table = None; levels = Smu.levels () }
+let header_bytes = 12
+
+let table ?kept ~vram ~mmio ~memory () =
+  let known =
+    match Option.bind kept (fun k -> k.table) with
+    | Some (s, d) ->
+        let head = read_table ~vram ~mmio ~memory header_bytes in
+        if String.starts_with ~prefix:head s then Some d else None
+    | None -> None
+  in
+  match known with
+  | Some d -> Ok d
+  | None ->
+      let s = read_table ~vram ~mmio ~memory Discovery.bytes in
+      let* d = Discovery.of_string s in
+      Option.iter (fun k -> k.table <- Some (s, d)) kept;
+      Ok d
 
 (* The windows on the GPU's BARs: its memory combined, its doorbells and
    registers uncached. *)
@@ -192,7 +229,7 @@ let unmap_bars f (vram, doorbells, mmio) =
 let give_back_lease mmio f lease =
   if lease <> 0 then ignore (vf_request mmio f ~ready:false lease)
 
-let surveyed f vram doorbells mmio =
+let surveyed ?kept f vram doorbells mmio =
   let vf = Window.get32 mmio (D.mmrcc_iov_func_identifier * 4) land 1 = 1 in
   let* lease =
     if vf then vf_request mmio f D.idh_req_gpu_init_access else Ok 0
@@ -216,7 +253,7 @@ let surveyed f vram doorbells mmio =
     if size = 0 || size = 0xffff_ffff then Error "the GPU reports no memory"
     else Ok (size lsl 20)
   in
-  let* d = Discovery.of_string (read_table ~vram ~mmio ~memory) in
+  let* d = table ?kept ~vram ~mmio ~memory () in
   Ok (vram, doorbells, mmio, vf, lease, memory, d)
 
 (* What the GPU says of itself before any block is touched, its BARs unmapped if
@@ -225,7 +262,7 @@ let surveyed f vram doorbells mmio =
    C: windows a transport reaches but the process does not map are refused
    before the first write, a VF's mailbox's included. A reset writes through
    the transport. *)
-let survey ~driven f =
+let survey ?kept ~driven f =
   with_bar f ~combine:true vram_bar @@ fun vram ->
   with_bar f ~combine:false doorbell_bar @@ fun doorbells ->
   with_bar f ~combine:false register_bar @@ fun mmio ->
@@ -238,7 +275,7 @@ let survey ~driven f =
           "the GPU's registers and doorbells are not mapped into the process, \
            as through a transport"
   in
-  surveyed f vram doorbells mmio
+  surveyed ?kept f vram doorbells mmio
 
 let stuck f =
   match f () with v -> Ok v | exception Regs.Stuck why -> Error why
@@ -327,7 +364,7 @@ let stop_locked g =
     if not g.vf then step (fun () -> Smu.clocks g.smu `Lowest);
     step (fun () ->
         ignore (Ih.read g.ih);
-        Ih.consume g.ih);
+        ignore (Ih.consume g.ih : bool));
     step (fun () -> List.iter (fun (_, m) -> Memory.free g.memory m) g.eops);
     g.eops <- [];
     step (fun () -> mark g ~dirty:(!(g.fault) <> None || (not left) || !failed));
@@ -454,9 +491,11 @@ let confirm f fault invalidate () =
       if !fault = None then fault := Some why;
       false
 
-let start ~gpus f first =
+let start ~gpus ~kept f first =
   let* vram, doorbells, mmio, vf, lease, memory, d =
-    Result.map_error (fun why -> `Refused why) (survey ~driven:`Driven f)
+    Result.map_error
+      (fun why -> `Refused why)
+      (survey ~kept ~driven:`Driven f)
   in
   let refused r =
     Result.map_error
@@ -511,7 +550,10 @@ let start ~gpus f first =
     refused
     @@ stuck (fun () ->
         let tables =
-          Page_table.create (Gmc.format gmc ~flush) space
+          (* The MMU translates from the start the GMC is given:
+             the space's. *)
+          Page_table.create ~base:(Rig_pci.Space.base space)
+            (Gmc.format gmc ~flush) space
             ~memory:(memory - reserved gc)
             ~boot:boot_pool
             ~tables:
@@ -536,7 +578,7 @@ let start ~gpus f first =
       memory = Memory.create ?link f tables ~bar:vram_bar;
       ih = Ih.make r gmc vram ~rings:pool.ih_rings ~wptr:pool.ih_wptr;
       psp = Psp.make r gmc vram tables pool.psp;
-      smu = Smu.make r gmc ~table:pool.smu_table;
+      smu = Smu.make r gmc ~table:pool.smu_table ~levels:kept.levels;
       gfx = Gfx.make r gmc vram doorbells ~mqds:pool.mqds;
       sdma = Sdma.make r;
       images;
@@ -545,6 +587,7 @@ let start ~gpus f first =
       vf;
       lease;
       fault;
+      reads = Atomic.make 0;
       eops = [];
       stopped = None;
       hw = Rig_amd.Lock.create ();
@@ -671,6 +714,7 @@ let most_ring g = function
 
 let fault g why =
   g.fault := Some why;
+  Atomic.incr g.reads;
   raise (Rig_amd.Fault why)
 
 let faulted g why =
@@ -725,17 +769,22 @@ let events g reports =
   if reports <> [] then g.fault := Some (String.concat "; " reports);
   if Option.is_some page then Gmc.clear_fault g.gmc;
   Option.iter (fun (_, flags) -> clear_fatal g flags) fatal;
-  Ih.consume g.ih;
+  if Ih.consume g.ih || reports <> [] then Atomic.incr g.reads;
   Option.iter (fun why -> raise (Rig_amd.Fault why)) !(g.fault)
+
+let interrupts g = Atomic.get g.reads
 
 (* A sleep that a stop overtakes reads nothing more: the stop's release unmaps
    the windows the interrupt ring lies in. Each look at the ring holds the lock
-   the stop takes. *)
-let sleep g ~ms =
+   the stop takes. A sleep consumes every entry it reads, those of releases
+   other domains sleep on included: the count moving past [after] wakes them,
+   as an eventcount does. *)
+let sleep g ~ms ~after =
   (match !(g.fault) with Some why -> raise (Rig_amd.Fault why) | None -> ());
   let stopped () = Option.is_some g.stopped in
   let moved () =
-    Rig_amd.Lock.protect g.hw (fun () -> stopped () || Ih.pending g.ih)
+    Atomic.get g.reads <> after
+    || Rig_amd.Lock.protect g.hw (fun () -> stopped () || Ih.pending g.ih)
   in
   (* A failed wait is read below, with the ring. *)
   ignore
@@ -833,7 +882,9 @@ let reset f =
         let r = Regs.make f mmio l ~vf in
         stuck (fun () ->
             let gmc = Gmc.make r vram in
-            let smu = Smu.make r gmc ~table:0 in
+            (* A reset runs with the function alone, before a boot, and keeps
+               no levels. *)
+            let smu = Smu.make r gmc ~table:0 ~levels:(Smu.levels ()) in
             (* A fabric's GPUs reset together, as their kernel driver does when
                it takes them back: a GPU of a fabric is only stopped. *)
             let hive = Gmc.hive gmc in

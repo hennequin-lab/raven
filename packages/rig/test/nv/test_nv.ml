@@ -392,8 +392,8 @@ let shared_page () =
   end
 
 (* Views a GPU's reopened device makes of memory the GPU already maps: each
-   region over it keeps it mapped until its own free, in whatever order they
-   go. *)
+   view keeps it mapped until its own free, whichever view goes first, and the
+   memory's own region goes after them, as rig frees them. *)
 let views_of_mapped () =
   let n = 4096 in
   let a = S.driver () in
@@ -406,7 +406,6 @@ let views_of_mapped () =
   in
   let v = view () in
   let v' = view () in
-  N.free a src;
   N.free t.g v;
   let k = S.kernels t in
   let l = S.launches t.g in
@@ -415,7 +414,8 @@ let views_of_mapped () =
   equal int ~msg:"the first byte that differs" (-1) (S.mismatch (host out) n 5);
   S.free_launches l;
   N.free t.g out;
-  N.free t.g v'
+  N.free t.g v';
+  N.free a src
 
 (* A stopped device's Mapped memory lies behind a BAR word that no viewer's
    submissions read any more, so nothing would order the host's writes
@@ -455,10 +455,13 @@ let memory =
    Through NVIDIA's kernel driver the device exports a dma-buf. Its bytes are
    not checked here: the export leaves bAllowMmap off, so the host cannot map
    the dma-buf (nv-dmabuf.c), and no other API of this process imports one.
-   Only a NIC that registers it can read them. Over PCI it
-   gives bus ranges and keeps the GPU taken until its process exits, so a
+   Only a NIC that registers it can read them. Over PCI, a GPU taken
+   physically gives bus ranges and stays taken until its process exits, so a
    child of the suite makes that export, and the GPU opens again once the
-   child is gone. *)
+   child is gone. Behind an IOMMU that translates, which a device that maps
+   host memory shows, no other function reaches the memory at a bus address:
+   the export is refused, naming the GPU, and keeps nothing, so the GPU opens
+   again in the process. *)
 
 let dma_child = "--dma-over-pci"
 let dma_sizes = [ 1; 4095; 4096; 4097; 1 lsl 22 ]
@@ -536,10 +539,24 @@ let exports_bus () =
       fail "the GPU opened again in the process"
   | Error why -> contains ~sub:"given to another PCI function" why
 
+(* Whether the GPU is behind an IOMMU that translates; if it is, [dma] refuses
+   and the export is checked here. *)
+let refused_behind_iommu () =
+  S.with_ @@ fun t ->
+  if not (N.facts t.g).maps_host then false
+  else begin
+    let fn = gpu_bus t.d in
+    let why = require_error (B.dma (B.create t.d (1 lsl 16)) ~fn) in
+    contains ~msg:"names the GPU" ~sub:fn why;
+    contains ~msg:"names the IOMMU" ~sub:"IOMMU" why;
+    refuses_strangers t.d;
+    true
+  end
+
 let exports () =
   match S.path () with
   | Some Pci ->
-      Rig_gpu_support.child dma_child;
+      if not (refused_behind_iommu ()) then Rig_gpu_support.child dma_child;
       S.with_ ignore
   | Some Kernel | None -> exports_dmabuf ()
 
@@ -547,8 +564,9 @@ let dma =
   group ~timeout:120. "another function's DMA"
     [
       test
-        "dma exports a dma-buf through the kernel driver, or bus ranges over \
-         PCI that keep the GPU until the process exits"
+        "dma exports a dma-buf through the kernel driver, or over PCI bus \
+         ranges that keep the GPU until the process exits, refused behind an \
+         IOMMU"
         exports;
     ]
 
@@ -1735,6 +1753,47 @@ let local =
         no_local_memory;
     ]
 
+(* An object the RM refuses keeps none of the memory the path gave for it.
+   Over PCI a channel's instance block lies at addresses the GPUs share,
+   which [Rig_nv_pci.taken] counts; its method buffer has none, and goes
+   uncounted. The path refuses a channel whose USERD
+   lies in memory of a handle it never gave; the GSP refuses one on the
+   second graphics engine, which no channel runs on without MIG. *)
+
+(* NV_CHANNEL_ALLOC_PARAMS of release 570 (nvos.h): its size and the fields
+   the cases set; NV2080_ENGINE_TYPE_GR1 (cl2080_notification.h). *)
+let channel_params = 368
+let h_object_error = (0, 4)
+let h_userd_memory = (0x20, 4)
+let engine_type = (0x80, 4)
+let gr1 = 2
+
+let channel_refusals =
+  [
+    ( "by the path, for a USERD in no memory it gave",
+      fun p ->
+        N.set p h_object_error 1;
+        N.set p h_userd_memory 0xbad );
+    ("by the GSP, for the second graphics engine", fun p -> N.set p engine_type gr1);
+  ]
+
+let refused_channel (_, fill) =
+  if S.path () <> Some S.Pci then
+    skip ~reason:"the addresses it counts are those of GPUs over PCI" ();
+  S.with_ @@ fun t ->
+  let rm, device, gpu = N.rm t.g in
+  equal ~msg:"the release whose layout the cases fill" int 570 rm.release;
+  let p = N.params channel_params in
+  fill p;
+  let before = Rig_nv_pci.taken () in
+  (match rm.alloc ~parent:device gpu.channel_class (Some p) with
+  | Error _ -> ()
+  | Ok h ->
+      Option.iter (fun free -> ignore (free ~parent:device h)) rm.free;
+      fail "the RM made the channel");
+  equal ~msg:"the ranges of the GPUs' addresses taken" int before
+    (Rig_nv_pci.taken ())
+
 let channels =
   group ~timeout:120. "channels"
     [
@@ -1743,6 +1802,8 @@ let channels =
       test "a growth of the channels waits for the work in flight"
         drained_growth;
       test "32,768 values stay in flight, and the next waits" in_flight;
+      cases "a channel the RM refuses gives back its instance block" ~name:fst
+        channel_refusals refused_channel;
     ]
 
 (* Images *)
@@ -1895,9 +1956,16 @@ let stop_running () =
 (* Opens and closes keep, of the C heap, each device's edge alone: 80 bytes,
    which glibc's allocator holds in a chunk of 96. Warm opens first make the
    process's client and the GPU's objects, which stay. The runtime's own
-   tables may grow by a few hundred bytes over the run. *)
+   tables may grow by a few hundred bytes over the run, so a leak of more
+   than 64 bytes an open fails it. Over PCI each open also gives back every
+   range of the GPUs' addresses it took, which a leak there shows at once
+   where the heap shows it only as its allocator's table doubles. Each open
+   boots the GPU's GSP over PCI, in about 3.6 s: the 20 opens take 75 s. *)
 let edge_chunk = 96
 let runtime_slack = 1024
+let warm_opens = 4
+let opens = 16
+let opens_timeout = 120.
 
 let opens_keep_edges () =
   let heap () =
@@ -1905,6 +1973,7 @@ let opens_keep_edges () =
     | Some n -> n
     | None -> skip ~reason:"the system counts no C heap" ()
   in
+  let ranges = Rig_nv_pci.taken in
   let cycle () =
     let t = S.open_ () in
     ignore (B.create t.d 1 : B.t);
@@ -1913,14 +1982,14 @@ let opens_keep_edges () =
     Gc.full_major ();
     Rig.free_cache t.d
   in
-  let opens = 32 in
-  for _ = 1 to 4 do
+  for _ = 1 to warm_opens do
     cycle ()
   done;
-  let c = heap () in
+  let taken = ranges () and c = heap () in
   for _ = 1 to opens do
     cycle ()
   done;
+  equal ~msg:"the ranges of the GPUs' addresses taken" int taken (ranges ());
   at_most int ~msg:"the C heap's growth over the opens"
     ~than:((opens * edge_chunk) + runtime_slack)
     (heap () - c)
@@ -1930,7 +1999,8 @@ let timeline =
     [
       test "a close of an idle device leaves the word at the last value"
         stop_idle;
-      test "opens and closes keep each device's edge alone of the C heap"
+      test ~timeout:opens_timeout
+        "opens and closes keep each device's edge alone of the C heap"
         opens_keep_edges;
       test
         "stop of a device waiting on a word that never moves leaves the word \

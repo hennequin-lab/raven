@@ -104,7 +104,15 @@ val release : t -> unit
     its DMA, and restores the legacy interrupts {!take} turned off. It unmaps
     [f]'s BAR windows, closes the process's files for [f] and unlocks it.
     Memory from {!alloc_dma} stays until {!free_dma}. Releasing again does
-    nothing.
+    nothing. An exception that ends a release part-way, such as an
+    asynchronous one ({!Sys.Break}), leaves what the release had not given back
+    to the process's exit, which leaves [f] at worst as a killed process leaves
+    a function it holds. Until a release returns, and after one that could not
+    turn [f]'s bus mastering off because the system refused the write, as a
+    kernel locked down meanwhile refuses every write to configuration space,
+    {!free_dma} and {!unpin} give no memory back: [f] may still reach it. The
+    memory stays the process's until the process exits, and taken physically,
+    past its exit ({{!dma}system memory}).
 
     Behind an IOMMU, Linux turns bus mastering off when the last descriptor of
     the function's files closes. A child of [fork] that has not run [exec]
@@ -121,7 +129,7 @@ val addressing : t -> Machine.addressing
 (** [addressing f] is how [f] reaches system memory. *)
 
 val released : t -> bool
-(** [released f] is [true] iff {!release} gave [f] back. *)
+(** [released f] is [true] iff {!release} began giving [f] back. *)
 
 val failed : t -> string option
 (** [failed f] is why [f] can no longer be reached, if it cannot: its machine
@@ -218,7 +226,10 @@ val map :
     physically. Elsewhere it is the window [~combine:false] makes. Map
     registers and doorbells with [~combine:false]. Without [combine], the
     window maps BAR [i] as its live windows do, or with [~combine:false] if it
-    has none.
+    has none. A window mapped into the process on a BAR whose register marks
+    it prefetchable, memory into which host bridges may merge the processor's
+    writes (PCI Local Bus Specification 2.2, 6.2.5.1), takes copies wider than
+    a word, whatever [combine] ({!Window.accesses}).
 
     [Error why] if VFIO or the kernel does not let the process map the BAR, or
     if [f] is taken physically and the file of its BAR [i] is shorter than the
@@ -352,7 +363,9 @@ val alloc_dma :
     than a page on a function taken physically. *)
 
 val free_dma : t -> Window.t -> unit
-(** [free_dma f w] frees [w], and [f] reaches it no more.
+(** [free_dma f w] frees [w], and [f] reaches it no more. Once a release of
+    [f] began and until it returned, or after a release that could not turn
+    [f]'s bus mastering off, [w] stays instead, as {!release} states.
 
     Raises [Invalid_argument] if [w] is not a live window {!alloc_dma} returned
     for [f]. *)
@@ -382,7 +395,10 @@ val pin : t -> int -> int -> ((int * int) list option, string) result
     Raises [Invalid_argument] if [a] is not on a page or [n <= 0]. *)
 
 val unpin : t -> int -> int -> unit
-(** [unpin f a n] releases one pin of the [n] bytes at [a].
+(** [unpin f a n] releases one pin of the [n] bytes at [a]. Once a release of
+    [f] began and until it returned, or after a release that could not turn
+    [f]'s bus mastering off, the memory stays locked instead, as {!release}
+    states.
 
     Raises [Invalid_argument] if [(a, n)] is not pinned for [f]. *)
 
@@ -399,6 +415,12 @@ val take_locked : Machine.t -> 's Sysfs.lock -> (t, string) result
    the length it replaces. A test shrinks it to pass a range with little
    memory. *)
 val set_own_length : int -> int
+
+(* [reaching f] is [true] iff [f] was released and may still reach the
+   memory it was given: its release has not returned, or it could not turn
+   [f]'s bus mastering off. {!free_dma} and {!unpin} give nothing back
+   then. *)
+val reaching : t -> bool
 
 (* [inherited f] is the [inherited] of [f]'s take ({!Machine.fn}) until
    {!forget} returns [Ok ()], and [false] after. *)

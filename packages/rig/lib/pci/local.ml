@@ -37,6 +37,7 @@ type taken = {
   bus : string;
   config : Unix.file_descr * int; (* where configuration space starts in it *)
   bars : (int * int) option array; (* read once: a held function keeps them *)
+  prefetchable : bool array; (* each BAR's, read with [bars] *)
   interrupts : Unix.file_descr option; (* the eventfd VFIO signals *)
   intx : int option; (* the INTx bit as found, if the take turned INTx off *)
   way : way;
@@ -95,14 +96,16 @@ let bus_master = 0x4
 let intx_disable = 0x400
 let stop_dma t = set_config t command 2 (config t command 2 land lnot bus_master)
 
-(* Whether the function masters the bus no more: its bit reads 0, or the
-   function left the bus and reads all ones. A write the system refused leaves
-   it on, and its memory then stays, which leaks safely. *)
-let stopped t =
-  let c = config t command 2 in
-  c land bus_master = 0 || c = 0xffff
+let masters c = c land bus_master <> 0 && c <> 0xffff
 
-let close_memory t s = if stopped t then Sysmem.close s
+(* Whether the function masters the bus no more. A write the system refused
+   leaves it on, and its memory then stays, which leaks safely. *)
+let stopped t = not (masters (config t command 2))
+
+let close_memory t s =
+  let stopped = stopped t in
+  if stopped then Sysmem.close s;
+  stopped
 
 (* Turns INTx off: the bit as it was. *)
 let intx_off t =
@@ -112,7 +115,7 @@ let intx_off t =
 
 (* Leaves a physical take's function as the take found it: its DMA stopped, its
    INTx as it was, and, once its bus mastering reads off, its memory files
-   gone. *)
+   gone. Is whether its bus mastering reads off. *)
 let give_back t s =
   stop_dma t;
   Option.iter
@@ -150,7 +153,9 @@ let () =
               (strf "releasing %s at exit: %s" t.bus (Printexc.to_string e))
       in
       let give_back t =
-        match t.way with Physical_take s -> give_back t s | Iommu_take _ -> ()
+        match t.way with
+        | Physical_take s -> ignore (give_back t s : bool)
+        | Iommu_take _ -> ()
       in
       let held = Atomic.get physical in
       List.iter (each stop_dma) held;
@@ -178,7 +183,7 @@ let map t ~combine i off n =
         Fail.step (strf "mapping BAR %d of %s" i t.bus) (fun () ->
             file_map fd (base + first) len)
       in
-      Window.v ?combines (a + off - first) n
+      Window.v ?combines ~prefetchable:t.prefetchable.(i) (a + off - first) n
     in
     match t.way with
     | Iommu_take c ->
@@ -276,14 +281,24 @@ let forget t =
   | Physical_take s -> Sysmem.forget ~root:(Sysmem.root s) ~bus:t.bus
   | Iommu_take _ -> ()
 
-(* A take's descriptors close whatever happens before. *)
+(* Behind an IOMMU a take's descriptors close whatever happens before: Linux
+   then stops the function's DMA, and the function reaches only what the
+   IOMMU maps for it, whose pages VFIO keeps until it unmaps them. A physical
+   take's close only once it is given back and has left the exit's list, so
+   that an exception before leaves the take, files open and the function
+   locked, for the exit to give back, and the exit gives back no take through
+   descriptors closed, whose numbers files opened since may hold. *)
 let release t =
-  Fun.protect ~finally:(fun () -> List.iter Unix.close t.fds) @@ fun () ->
   match t.way with
-  | Iommu_take c -> Vfio.close c
+  | Iommu_take c ->
+      Fun.protect ~finally:(fun () -> List.iter Unix.close t.fds) @@ fun () ->
+      Vfio.close c;
+      true
   | Physical_take s ->
+      let stopped = give_back t s in
       unhold t;
-      give_back t s
+      List.iter Unix.close t.fds;
+      stopped
 
 let fn t =
   {
@@ -310,7 +325,7 @@ let fn t =
 
 (* A failure once the function is in its container gives the container its
    user back, so that a container left with none closes. *)
-let take_iommu files fds bus bars =
+let take_iommu files fds bus bars prefetchable =
   let c, efd = Vfio.open_ files fds bus in
   let at =
     match Vfio.config_offset bus (Vfio.device c) with
@@ -325,6 +340,7 @@ let take_iommu files fds bus bars =
     bus;
     config = (Vfio.device c, at);
     bars;
+    prefetchable;
     interrupts = Some efd;
     intx = None;
     way = Iommu_take c;
@@ -336,7 +352,7 @@ let take_iommu files fds bus bars =
    VFIO's no-IOMMU mode. Otherwise nothing handles them: the take turns its INTx
    off, which bus mastering does not gate, so that a GPU left running signals no
    line another device's handler shares. *)
-let take_physical l fds bars =
+let take_physical l fds bars prefetchable =
   let files = Sysfs.files l and bus = Sysfs.bus l in
   let file = Sysfs.path files bus "config" in
   let config =
@@ -370,6 +386,7 @@ let take_physical l fds bars =
       bus;
       config = (config, 0);
       bars;
+      prefetchable;
         interrupts;
       intx = None;
       way = Physical_take (Sysmem.store ~root ~bus);
@@ -394,11 +411,13 @@ let take l =
   in
   match
     let* addressing = Sysfs.access l in
-    let bars = Sysfs.bars l in
+    let bars = Sysfs.bars l and prefetchable = Sysfs.prefetchable l in
     match addressing with
     | Ops.Iommu ->
-        Ok (fn (take_iommu (Sysfs.files l) fds (Sysfs.bus l) bars))
-    | Physical -> Ok (fn (take_physical l fds bars))
+        Ok
+          (fn
+             (take_iommu (Sysfs.files l) fds (Sysfs.bus l) bars prefetchable))
+    | Physical -> Ok (fn (take_physical l fds bars prefetchable))
   with
   | Ok _ as fn -> fn
   | Error why -> refused why

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2015-2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2005-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: MIT
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -21,10 +21,18 @@
  * DEALINGS IN THE SOFTWARE.
  */
 
-/* Excerpt of https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/570.144/src/common/sdk/nvidia/inc/ctrl/ctrlc36f.h. */
+/* Excerpt of https://raw.githubusercontent.com/NVIDIA/open-gpu-kernel-modules/570.144/src/common/sdk/nvidia/inc/ctrl/ctrl2080/ctrl2080perf.h. */
 
-#define NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN (0xc36f0108) /* finn: Evaluated from "(FINN_VOLTA_CHANNEL_GPFIFO_A_GPFIFO_INTERFACE_ID << 8) | NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS_MESSAGE_ID" */
+#define NV2080_CTRL_PERF_BOOST_FLAGS_CMD                1:0
 
-typedef struct NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS {
-    NvU32 workSubmitToken;
-} NVC36F_CTRL_CMD_GPFIFO_GET_WORK_SUBMIT_TOKEN_PARAMS;
+#define NV2080_CTRL_PERF_BOOST_FLAGS_CMD_BOOST_TO_MAX (0x00000002)
+
+#define NV2080_CTRL_PERF_BOOST_FLAGS_CUDA               4:4
+
+#define NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_YES         (0x00000001)
+
+#define NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_PRIORITY          6:6
+
+#define NV2080_CTRL_PERF_BOOST_FLAGS_CUDA_PRIORITY_HIGH     (0x00000001)
+
+#define NV2080_CTRL_PERF_BOOST_DURATION_INFINITE      0xffffffff // If set this way, the boost will last until cleared.

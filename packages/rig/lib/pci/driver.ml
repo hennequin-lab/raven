@@ -16,6 +16,17 @@ let ( let* ) = Result.bind
    A function is named by its machine and bus address. *)
 type siblings = Remove | Keep
 
+(* The buses lost on each machine, by an ephemeron on the machine, so that a
+   driver keeps no machine the process dropped: the GC frees an entry once
+   its machine goes, and the table drops the entry's cell as it grows.
+   Machines that no transport names hash alike. *)
+module Spent = Ephemeron.K1.Make (struct
+  type t = Machine.t
+
+  let equal = ( == )
+  let hash m = Hashtbl.hash (Machine.name m)
+end)
+
 type t = {
   name : string;
   memory_bar : int option;
@@ -30,15 +41,15 @@ type t = {
   mutable exits : bool;
   holds : Lock.t;
   mutable held : hold list;
-  mutable spent : (Machine.t * string) list;
+  spent : string list Spent.t;
 }
 
 (* [pid] is the process that opened it: a child of fork inherits the hold, and
    it stays the parent's. [lock] makes the first [stop] the only one to call
    the driver's: [stopped] is its answer, and [lost] whether it loses the
-   function. [returned] is whether a stop released the function, which the
-   next stop does if the first's release raised. A renewal that failed leaves
-   the function lost whatever stops it. *)
+   function. [returned] is whether a stop began releasing the function, which
+   the next stop does if the first's give-back raised before. A renewal that
+   failed leaves the function lost whatever stops it. *)
 and hold = {
   driver : t;
   machine : Machine.t;
@@ -69,7 +80,7 @@ let make ~name ~memory_bar ~siblings ~nodes ~unreleased ~teardown_ms ~reset
     exits = false;
     holds = Lock.create ();
     held = [];
-    spent = [];
+    spent = Spent.create 1;
   }
 
 (* Work no kernel driver bounds is hung once it has not advanced for 30 s. *)
@@ -91,31 +102,42 @@ let buses g m =
 
 (* Checks *)
 
-(* The bus of function [i] of [m], which the process does not hold. *)
+(* The bus of function [i] of [m], which the process does not hold. A hold
+   found under [holds] whose release began has a release an exception ended,
+   since a give-back holds [holds] through the release. *)
 let nth g m i =
   let* all = buses g m in
+  let held bus =
+    Lock.protect g.holds (fun () ->
+        Option.map
+          (fun h -> h.returned)
+          (List.find_opt (fun h -> h.machine == m && h.bus = bus) g.held))
+  in
   match List.nth_opt all i with
   | None when all = [] ->
       Error (strf "no such function; %s drives none here" g.name)
   | None ->
       Error
         (strf "no such function; %s drives %d here" g.name (List.length all))
-  | Some bus
-    when Lock.protect g.holds (fun () ->
-             List.exists (fun h -> h.machine == m && h.bus = bus) g.held) ->
-      Error (bus ^ " is open in this process")
-  | Some bus -> Ok bus
+  | Some bus -> (
+      match held bus with
+      | None -> Ok bus
+      | Some false -> Error (bus ^ " is open in this process")
+      | Some true ->
+          Error
+            (bus
+           ^ " is held by this process until it exits: an exception ended its \
+              stop as it gave the function back"))
 
 (* Renewals *)
 
-let lost g m bus =
-  Lock.protect g.holds (fun () ->
-      List.exists (fun (m', b) -> m' == m && b = bus) g.spent)
+let spent g m = Option.value (Spent.find_opt g.spent m) ~default:[]
+let lost g m bus = Lock.protect g.holds (fun () -> List.mem bus (spent g m))
 
 (* Records whether the function at [bus] of [m] is lost, under [holds]. *)
 let mark g m bus ~lost =
-  let others = List.filter (fun (m', b) -> not (m' == m && b = bus)) g.spent in
-  g.spent <- (if lost then (m, bus) :: others else others)
+  let others = List.filter (( <> ) bus) (spent g m) in
+  Spent.replace g.spent m (if lost then bus :: others else others)
 
 (* Resets the taken function [fn] as its vendor does: it reaches none of the
    memory processes that died left then, which goes before the driver asks
@@ -150,22 +172,20 @@ let renew h =
 
 (* Stopping *)
 
-(* Gives [h]'s function back, under [holds]: no open or reset sees the function
-   free while still taken, or lost before it is marked. *)
-let give_back h ~lost =
-  let g = h.driver in
-  Lock.protect g.holds @@ fun () ->
-  g.held <- List.filter (fun h' -> h' != h) g.held;
-  if lost then mark g h.machine h.bus ~lost:true;
-  Function.release h.fn
-
-(* Releases [h]'s function once its stop recorded its answer. A release that
-   raised, as one from a callback inside [holds] on the same thread does, is
-   made by the next stop. *)
+(* Releases [h]'s function once its stop recorded its answer, under [holds]:
+   no open or reset sees the function free while still taken, or lost before
+   it is marked. A give-back that raised before the release, as one from a
+   callback inside [holds] on the same thread does, is made by the next stop.
+   [h] stays held until the release returns, so that one an exception ended
+   leaves the function held until the process exits (Function.release). *)
 let give_once h =
+  let g = h.driver in
   if not h.returned then begin
-    give_back h ~lost:h.lost;
-    h.returned <- true
+    Lock.protect g.holds @@ fun () ->
+    if h.lost then mark g h.machine h.bus ~lost:true;
+    h.returned <- true;
+    Function.release h.fn;
+    g.held <- List.filter (fun h' -> h' != h) g.held
   end
 
 (* The first call stops the function. A failed open's bracket releases a

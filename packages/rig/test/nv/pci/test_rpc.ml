@@ -7,8 +7,9 @@
    570.144: message_queue_cpu.c and the RPC headers, g_rpc-structures.h
    (rpc_gsp_rm_alloc_v03_00, rpc_gsp_rm_control_v03_00, rpc_free_v03_00,
    rpc_set_page_directory_v1E_05, rpc_unloading_guest_driver_v1F_07,
-   rpc_run_cpu_sequencer_v17_00, rpc_rc_triggered_v17_02), g_os_nvoc.h
-   (PACKED_REGISTRY_TABLE) and rmgspseq.h (the opcodes). *)
+   rpc_run_cpu_sequencer_v17_00, rpc_rc_triggered_v17_02,
+   rpc_os_error_log_v17_00), ctrl2080nvd.h (NV2080CtrlNocatJournalInsertRecord),
+   g_os_nvoc.h (PACKED_REGISTRY_TABLE) and rmgspseq.h (the opcodes). *)
 
 open Windtrap
 open Rig_nv_pci
@@ -25,6 +26,7 @@ let rc_triggered = 0x1004
 let mmu_fault_queued = 0x1005
 let os_error_log = 0x1006
 let libos_print = 0x100c
+let nocat_record = 0x1020
 
 (* Records *)
 
@@ -143,6 +145,83 @@ let test_no_fault =
 
 let test_mmu () = is_some (Rpc.fault (event mmu_fault_queued ""))
 
+(* Reports *)
+
+(* rpc_os_error_log_v17_00: the exception type at 0, the text at 0xc, 256
+   bytes. *)
+let error_log ~xid text =
+  let b = Bytes.make 0x110 '\000' in
+  Bytes.set_int32_le b 0 (Int32.of_int xid);
+  Bytes.blit_string text 0 b 0xc (Int.min 0x104 (String.length text));
+  Bytes.to_string b
+
+(* NV2080CtrlNocatJournalInsertRecord, of 1208 bytes, as GSP_POST_NOCAT_RECORD
+   carries it: the source at 0x18, 65 bytes, then padding and subsystem to the
+   error code at 0x60, 8 bytes. Those between are not zero here, so a source
+   read past its field shows. *)
+let journal ~source ~code =
+  let b = Bytes.make 1208 '\000' in
+  Bytes.fill b 0x59 7 'z';
+  Bytes.blit_string source 0 b 0x18 (Int.min 65 (String.length source));
+  Bytes.set_int64_le b 0x60 code;
+  Bytes.to_string b
+
+let report = option (pair string string)
+
+let test_reports =
+  cases "an error log and a journal record are reports of their subject"
+    ~name:(fun (n, _, _) -> n)
+    [
+      ( "an error log's text, to its first zero byte",
+        event os_error_log (error_log ~xid:13 "Graphics Exception\000junk"),
+        Some ("Xid 13", "Xid 13: Graphics Exception") );
+      ( "an error log's text, at most its 256 bytes",
+        event os_error_log (error_log ~xid:31 (String.make 0x104 'a')),
+        Some ("Xid 31", "Xid 31: " ^ String.make 0x100 'a') );
+      ( "a journal record's source, to its first zero byte",
+        event nocat_record
+          (journal ~source:"FECS_A\000FECS_B\000FECS_C" ~code:3L),
+        Some ("FECS_A", "FECS_A, error 0x3") );
+      ( "a journal record's source, at most its 65 bytes",
+        event nocat_record
+          (journal ~source:(String.make 70 'b') ~code:0x41b_0143_05ccL),
+        Some (String.make 65 'b', String.make 65 'b' ^ ", error 0x41b014305cc")
+      );
+      ( "a journal record's error code, all 64 bits",
+        event nocat_record
+          (journal ~source:"ASSERT" ~code:0x8000_0000_0000_0001L),
+        Some ("ASSERT", "ASSERT, error 0x8000000000000001") );
+    ]
+    (fun (_, m, expected) -> equal report expected (Rpc.report m))
+
+let test_short_reports =
+  cases "a report shorter than its structure says so"
+    ~name:(fun (n, _, _) -> n)
+    [
+      ("an error log", os_error_log, "abc");
+      ( "an error log cut in its text",
+        os_error_log,
+        String.sub (error_log ~xid:13 "Graphics Exception") 0 0x20 );
+      ("a journal record", nocat_record, "abc");
+      ( "a journal record cut after its error code",
+        nocat_record,
+        String.sub (journal ~source:"FECS_A" ~code:3L) 0 0x68 );
+    ]
+    (fun (_, fn, body) ->
+      let _, why = require_some (Rpc.report (event fn body)) in
+      contains ~sub:"cut short" why)
+
+let test_no_report =
+  cases "other messages report nothing"
+    ~name:(fun (n, _) -> n)
+    [
+      ("a stopped channel", rc_triggered);
+      ("a queued MMU fault", mmu_fault_queued);
+      ("a log print", libos_print);
+      ("an answer", gsp_rm_control);
+    ]
+    (fun (_, fn) -> is_none (Rpc.report (event fn (String.make 1300 'x'))))
+
 (* Calls *)
 
 (* rpc_gsp_rm_alloc_v03_00: hClient, hParent, hObject, hClass, status,
@@ -213,6 +292,175 @@ let test_page_directory () =
     [ 4; 8; 3; 0; 1; 0xffffffff ]
     (List.map (fun o -> u32 b (0x10 + o)) [ 8; 12; 16; 20; 24; 28 ])
 
+(* NV90F1_CTRL_VASPACE_COPY_SERVER_RESERVED_PDES_PARAMS (ctrl90f1.h): pageSize
+   at 8, virtAddrLo at 0x10, virtAddrHi at 0x18, numLevelsToCopy at 0x20, then
+   from 0x28 levels of 24 bytes: physAddress, size at 8, aperture at 16,
+   pageShift at 20. CPU-RM hands over the tables of the 512 MiB from 4 GiB
+   (SPLIT_VAS_SERVER_RM_MANAGED_VA_START and _SIZE), from the root down to the
+   level whose entries map 2 MiB, each in the GPU's memory (GMMU_APERTURE_VIDEO,
+   1) and of its size: 8 bytes an entry, 16 on that level
+   (_gvaspacePopulatePDEentries). Version 2's root has 4 entries, version 3's
+   2. *)
+let test_reserved_pdes =
+  cases "the GSP's range hands over its tables down to 2 MiB"
+    ~name:(fun (n, _, _) -> n)
+    [
+      ( "version 2",
+        Page_entry.V2,
+        [ (47, 32); (38, 4096); (29, 4096); (21, 4096) ] );
+      ( "version 3",
+        Page_entry.V3,
+        [ (56, 16); (47, 4096); (38, 4096); (29, 4096); (21, 4096) ] );
+    ]
+    (fun (_, v, levels) ->
+      let tables = List.mapi (fun i _ -> 0x40_0000 + (i * 0x1000)) levels in
+      let b = Rpc.reserved_pdes v tables in
+      equal int 184 (String.length b);
+      equal ~msg:"the range" (pair int int)
+        (0x1_0000_0000, 0x2000_0000)
+        Rpc.reserved;
+      equal ~msg:"page size, range, levels" (list int)
+        [ 0x20_0000; 0x1_0000_0000; 0x1_1fff_ffff; List.length levels ]
+        [ u64 b 8; u64 b 0x10; u64 b 0x18; u32 b 0x20 ];
+      List.iteri
+        (fun i (shift, size) ->
+          let l = 0x28 + (24 * i) in
+          equal
+            ~msg:(Printf.sprintf "level %d" i)
+            (list int)
+            [ List.nth tables i; size; 1; shift ]
+            [ u64 b l; u64 b (l + 8); u32 b (l + 16); u8 b (l + 20) ])
+        levels)
+
+let test_reserved_depth () =
+  raises_match Exn.invalid_arg (fun () ->
+      ignore (Rpc.reserved_pdes V2 [ 0; 0x1000; 0x2000 ]))
+
+(* NV2080_CTRL_GPU_PROMOTE_CTX_PARAMS (ctrl2080gpu.h): engineType, hClient,
+   ChID, hChanClient at 0xc, hObject at 0x10, entryCount at 0x28, then from
+   0x30 16 entries of 32 bytes: gpuPhysAddr, gpuVirtAddr at 8, size at 0x10,
+   physAttr at 0x18, bufferId at 0x1c (16 bits), bInitialize at 0x1e,
+   bNonmapped at 0x1f. Each entry decodes to [buffer; initialize; unmapped;
+   physical address; size; attributes; virtual address]. *)
+let promoted b =
+  let entry i =
+    let e = 0x30 + (0x20 * i) in
+    [
+      u32 b (e + 0x1c) land 0xffff;
+      u8 b (e + 0x1e);
+      u8 b (e + 0x1f);
+      u64 b e;
+      u64 b (e + 0x10);
+      u32 b (e + 0x18);
+      u64 b (e + 8);
+    ]
+  in
+  List.init (u32 b 0x28) entry
+
+(* What CPU-RM sends for a buffer (kgrctxPrepareInitializeCtxBuffer,
+   kgrctxPreparePromoteCtxBuffer): one it initializes carries its physical
+   address and size, in the GPU's memory and not cached by the GPU
+   (NV2080_CTRL_GPU_INITIALIZE_CTX_APERTURE_VIDMEM and _GPU_CACHEABLE_NO,
+   0x4), and is unmapped unless it also carries a virtual address. *)
+let expected (p : Rpc.promotion) =
+  let init, pa, size, attr =
+    match p.phys with
+    | Some (pa, size) -> (1, pa, size, 0x4)
+    | None -> (0, 0, 0, 0)
+  in
+  let unmapped = if init = 1 && p.virt = None then 1 else 0 in
+  [ p.buffer; init; unmapped; pa; size; attr; Option.value p.virt ~default:0 ]
+
+let promotions =
+  (* Pages up to the top of the GPU's 49-bit addresses, the last among them. *)
+  let page = Gen.int_range 1 ((1 lsl 37) - 1) in
+  let addr =
+    Gen.map
+      (fun p -> p * 0x1000)
+      (Gen.one_of [ page; Gen.constant ((1 lsl 37) - 1) ])
+  in
+  let at =
+    Gen.one_of
+      [
+        Gen.map (fun pa -> (Some pa, None)) (Gen.pair addr addr);
+        Gen.map (fun va -> (None, Some va)) addr;
+        Gen.map
+          (fun (pa, va) -> (Some pa, Some va))
+          (Gen.pair (Gen.pair addr addr) addr);
+      ]
+  in
+  let promotion =
+    Gen.map
+      (fun (buffer, (phys, virt)) -> { Rpc.buffer; phys; virt })
+      (Gen.pair (Gen.one_of [ Gen.int_range 0 12; Gen.constant 0xffff ]) at)
+  in
+  let size =
+    Gen.one_of [ Gen.int_range 0 16; Gen.constant 0; Gen.constant 16 ]
+  in
+  Gen.list ~size promotion
+
+let test_promote_ctx =
+  prop "a promotion carries each buffer's addresses" promotions (fun l ->
+      let has f = List.exists f l in
+      cover "initialized and mapped"
+        (has (fun (p : Rpc.promotion) -> p.phys <> None && p.virt <> None));
+      cover "initialized, unmapped"
+        (has (fun (p : Rpc.promotion) -> p.virt = None));
+      cover "mapped only" (has (fun (p : Rpc.promotion) -> p.phys = None));
+      cover "no buffer" (l = []);
+      cover "16 buffers" (List.length l = 16);
+      cover "the last id" (has (fun (p : Rpc.promotion) -> p.buffer = 0xffff));
+      let b = Rpc.promote_ctx ~client:0xc100_0000 ~channel:0xcf00_0007 l in
+      equal ~msg:"size" int 560 (String.length b);
+      equal ~msg:"graphics engine, client, channel" (list int)
+        [ 1; 0xc100_0000; 0xcf00_0007 ]
+        [ u32 b 0; u32 b 0xc; u32 b 0x10 ];
+      equal (list (list int)) (List.map expected l) (promoted b))
+
+let test_promote_refused () =
+  let p = { Rpc.buffer = 0; phys = None; virt = Some 0x1000 } in
+  raises_match Exn.invalid_arg (fun () ->
+      ignore
+        (Rpc.promote_ctx ~client:1 ~channel:2 (List.init 17 (fun _ -> p))));
+  raises_match Exn.invalid_arg (fun () ->
+      ignore (Rpc.promote_ctx ~client:1 ~channel:2 [ { p with virt = None } ]))
+
+(* A compute object in an address space another owner keeps (UVM's, rig's), as
+   NVIDIA's RM promotes its context: the object's constructor initializes the
+   main context (0), PM (1) and patch (2) buffers before the object's RPC
+   (kgrobjPromoteContext, kgrobjGetPromoteIds_FWCLIENT; alloc_free.c:869), the
+   PM buffer allocated from the start in such a space
+   (kgrctxShouldPreAllocPmBuffer_PF), and promotes no virtual address there
+   (kgrctxPreparePromoteCtxBuffer). The space's owner then binds the address
+   of each of the context's buffers, the main, the patch, the PM and every
+   global buffer, in one call (nvGpuOpsBindChannelResources,
+   kgrctxGetCtxBuffers). *)
+let test_compute_context () =
+  let main = { Rpc.pa = 0x10_0000; size = 0x6_0000; va = 0x10_0000_0000 }
+  and pm = { Rpc.pa = 0x30_0000; size = 0x2_0000; va = 0x10_0050_0000 }
+  and patch = { Rpc.pa = 0x20_0000; size = 0x1_0000; va = 0x10_0010_0000 } in
+  let globals =
+    [ (3, 0x10_0020_0000); (9, 0x10_0030_0000); (11, 0x10_0040_0000) ]
+  in
+  let first, second = Rpc.compute_context ~main ~pm ~patch ~globals in
+  equal ~msg:"initialized before the object" (list (list int))
+    [
+      [ 0; 1; 1; 0x10_0000; 0x6_0000; 4; 0 ];
+      [ 1; 1; 1; 0x30_0000; 0x2_0000; 4; 0 ];
+      [ 2; 1; 1; 0x20_0000; 0x1_0000; 4; 0 ];
+    ]
+    (List.map expected first);
+  equal ~msg:"bound after it" (list (list int))
+    [
+      [ 0; 0; 0; 0; 0; 0; 0x10_0000_0000 ];
+      [ 2; 0; 0; 0; 0; 0; 0x10_0010_0000 ];
+      [ 1; 0; 0; 0; 0; 0; 0x10_0050_0000 ];
+      [ 3; 0; 0; 0; 0; 0; 0x10_0020_0000 ];
+      [ 9; 0; 0; 0; 0; 0; 0x10_0030_0000 ];
+      [ 11; 0; 0; 0; 0; 0; 0x10_0040_0000 ];
+    ]
+    (List.map expected second)
+
 (* rpc_unloading_guest_driver_v1F_07: bInPMTransition, bGc6Entering, then
    newLevel at 4. *)
 let test_unloading () =
@@ -239,6 +487,115 @@ let test_registry =
           equal (list int) [ 1; v; 4 ]
             [ u8 t (e + 4); u32 t (e + 8); u32 t (e + 12) ])
         keys)
+
+(* Channels *)
+
+(* NVOS04_FLAGS (alloc_channel.h): the index of a channel's USERD within its
+   page of 8 in bits 10:8, the index fixed in bit 11, the page in bits 20:12,
+   the page fixed in bit 21. NVIDIA's RM gives the GSP the hardware id it chose
+   with the page fixed and the index not, id / 8 and id mod 8
+   (_kchannelSendChannelAllocRpc, kernel_channel.c). *)
+let userd_bits = 0x3f_ff00
+let ids = Gen.one_of [ Gen.int_range 0 4095; Gen.of_list [ 0; 7; 8; 4095 ] ]
+let flag_words = Gen.int_range 0 0xffff_ffff
+
+let test_channel_flags =
+  prop "a channel's flags fix its id, the other flags kept"
+    (Gen.pair flag_words ids) (fun (flags, id) ->
+      cover "the first id" (id = 0);
+      cover "the last of a page" (id = 7);
+      cover "a second page" (id = 8);
+      cover "the last id" (id = 4095);
+      let f = Rpc.channel_flags flags id in
+      equal ~msg:"the other flags" int
+        (flags land lnot userd_bits)
+        (f land lnot userd_bits);
+      equal ~msg:"index, its page, the page fixed and the index not" (list int)
+        [ id mod 8; id / 8; 1; 0 ]
+        [ (f lsr 8) land 7; (f lsr 12) land 0x1ff; (f lsr 21) land 1;
+          (f lsr 11) land 1 ];
+      equal (option int) (Some id) (Rpc.channel_id f))
+
+let test_channel_id =
+  cases "flags that fix no page name no id"
+    ~name:(fun (n, _, _) -> n)
+    [
+      ("no flags", 0, None);
+      ("an index without its page", 0x0b00, None);
+      ("the golden channel's", 0x20_0320, Some 3);
+      ("a later page's", 0x20_1520, Some 13);
+    ]
+    (fun (_, flags, id) -> equal (option int) id (Rpc.channel_id flags))
+
+let test_channel_range () =
+  equal ~msg:"512 pages of 8" int 4096 Rpc.channel_ids;
+  raises_match Exn.invalid_arg (fun () -> ignore (Rpc.channel_flags 0 (-1)));
+  raises_match Exn.invalid_arg (fun () -> ignore (Rpc.channel_flags 0 4096))
+
+(* Beside a GSP, NVIDIA's RM allocates a channel that is not the GSP's own from
+   id 1 up, the lowest free: id 0 is kept for the GSP's
+   (KFIFO_NUM_GSP_RESERVED_CHANNELS and kfifoChidMgrAllocChid, kernel_fifo.c,
+   with eheap's growing-up allocation). *)
+let test_free_channel_id =
+  let ids = Gen.list ~size:(Gen.int_range 0 12) (Gen.int_range 0 10) in
+  let zeros = Gen.list ~size:(Gen.int_range 1 3) (Gen.constant 0) in
+  let held = Gen.one_of [ Gen.constant []; zeros; ids ] in
+  prop "a channel takes the lowest free id from 1" held (fun held ->
+      cover "none held" (held = []);
+      cover "id 1 held" (List.mem 1 held);
+      cover "only id 0 held" (held <> [] && List.for_all (( = ) 0) held);
+      let rec lowest id = if List.mem id held then lowest (id + 1) else id in
+      equal (option int) (Some (lowest 1))
+        (Rpc.free_channel_id (fun id -> List.mem id held)))
+
+let test_no_channel_id () =
+  equal (option int) None (Rpc.free_channel_id (fun id -> id < 4096));
+  equal (option int) (Some 4095) (Rpc.free_channel_id (fun id -> id < 4095))
+
+(* NV_CTRL_VF_DOORBELL (ga100 dev_ctrl.h), which NVIDIA's RM builds the token
+   in on Ampere and Ada: the id in bits 11:0, the runlist in bits 22:16;
+   NV_VIRTUAL_FUNCTION_DOORBELL (gb202 dev_vm.h) on Blackwell adds
+   RUNLIST_DOORBELL, bit 30, enabled (kfifoGenerateWorkSubmitTokenHal_GA100,
+   _GB202). *)
+let test_token =
+  cases "a work submit token is its channel's runlist and id"
+    ~name:(fun (n, _, _, _, _) -> n)
+    [
+      ("Ada's", false, 2, 5, 0x2_0005);
+      ("the last runlist and id", false, 127, 4095, 0x7f_0fff);
+      ("the first", false, 0, 0, 0);
+      ("Blackwell's", true, 2, 5, 0x4002_0005);
+    ]
+    (fun (_, runlist_doorbell, runlist, id, token) ->
+      equal int token (Rpc.work_submit_token ~runlist_doorbell ~runlist id))
+
+let test_token_range () =
+  let token runlist id =
+    ignore (Rpc.work_submit_token ~runlist_doorbell:false ~runlist id)
+  in
+  raises_match Exn.invalid_arg (fun () -> token 128 0);
+  raises_match Exn.invalid_arg (fun () -> token 0 4096);
+  raises_match Exn.invalid_arg (fun () -> token (-1) 0)
+
+(* NVIDIA's RM sends the GSP INTERNAL_PERF_BOOST_SET_2X for a PERF_BOOST
+   (kperfBoostSet, kern_perf_boost.c), whose NvBool flags (ctrl2080internal.h)
+   take the boost's flags' low byte, the duration at 4. *)
+let test_perf_boost =
+  prop "a boost is sent with its duration and its flags' low byte"
+    (Gen.pair flag_words flag_words) (fun (flags, duration) ->
+      cover "flags past the low byte" (flags > 0xff);
+      let p = Rpc.perf_boost ~flags ~duration in
+      equal ~msg:"size" int 8 (String.length p);
+      equal (list int)
+        [ flags land 0xff; 0; 0; 0; duration ]
+        [ u8 p 0; u8 p 1; u8 p 2; u8 p 3; u32 p 4 ])
+
+(* CUDA's boost to the maximum, of high priority (bits 1:0 = 2, bit 4, bit 6),
+   for ever (0xffffffff). *)
+let test_cuda_boost () =
+  equal string
+    "\x52\x00\x00\x00\xff\xff\xff\xff"
+    (Rpc.perf_boost ~flags:0x52 ~duration:0xffff_ffff)
 
 (* CPU sequences *)
 
@@ -271,6 +628,7 @@ let rec pp_op ppf (o : Falcon.op) =
   | Poll (what, r, m, c) ->
       Format.fprintf ppf "poll %S 0x%x 0x%x %a" what r m cond c
   | Delay n -> Format.fprintf ppf "delay %d" n
+  | Read r -> Format.fprintf ppf "read 0x%x" r
   | When (r, m, c, ops) ->
       Format.fprintf ppf "when 0x%x 0x%x %a [%a]" r m cond c
         (Format.pp_print_list pp_op)
@@ -362,6 +720,8 @@ let () =
              test "a queued MMU fault is a fault" test_mmu;
              test_no_fault;
            ];
+         group ~timeout:10. "reports"
+           [ test_reports; test_short_reports; test_no_report ];
          group ~timeout:10. "calls"
            [
              test "an allocation" test_alloc;
@@ -370,8 +730,28 @@ let () =
              test_answer;
              test "a short answer is refused" test_short_answer;
              test "a page directory" test_page_directory;
+             test_reserved_pdes;
+             test "tables of another depth raise" test_reserved_depth;
+             test_promote_ctx;
+             test "a promotion of 17 buffers or of an addressless one raises"
+               test_promote_refused;
+             test "a compute context is initialized, then bound"
+               test_compute_context;
              test "unloading" test_unloading;
              test_registry;
+           ];
+         group ~timeout:10. "channels"
+           [
+             test_channel_flags;
+             test_channel_id;
+             test "an id the flags cannot hold raises" test_channel_range;
+             test_free_channel_id;
+             test "every id held leaves none" test_no_channel_id;
+             test_token;
+             test "a runlist or id the token cannot hold raises"
+               test_token_range;
+             test_perf_boost;
+             test "CUDA's boost" test_cuda_boost;
            ];
          group ~timeout:10. "sequences"
            [

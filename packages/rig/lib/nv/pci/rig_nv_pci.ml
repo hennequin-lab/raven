@@ -119,7 +119,7 @@ let survey ~firmware boot42 rom =
 
 let report ~firmware ~chip ~vbios =
   Rig_nv.Lock.check "Rig_nv_pci.report";
-  Result.map fst (survey ~firmware chip (fun () -> vbios))
+  Result.map fst (survey ~firmware chip (fun () -> Vbios.of_string vbios))
 
 (* Memory *)
 
@@ -128,8 +128,10 @@ let report ~firmware ~chip ~vbios =
    of memory the host addresses, and where an IOMMU maps device addresses.
    System memory lies at the same address for the process and the GPU, so the
    range is reserved on the GPU's machine. One range serves every GPU: a peer's
-   memory maps at its owner's address. *)
+   memory maps at its owner's address. It lies above the GSP's addresses
+   ({!Rpc.reserved}), which the GPU's tables must leave unmapped. *)
 let space = Space.create ~base:(64 * gib) (Rig_nv.windows - (64 * gib))
+let taken () = Space.taken space
 
 module Handles = Map.Make (Int)
 
@@ -162,16 +164,27 @@ type known = {
   reached : (int * Memory.reach) list Atomic.t;
 }
 
-let machines : (Machine.t * known) list ref = ref []
+(* By machine, through ephemerons, so that the table keeps no machine the
+   process dropped: the GC frees an entry once its machine goes, and the table
+   drops the entry's cell as it grows. Machines that no transport names hash
+   alike. *)
+module Machines = Ephemeron.K1.Make (struct
+  type t = Machine.t
+
+  let equal = ( == )
+  let hash m = Hashtbl.hash (Machine.name m)
+end)
+
+let machines = Machines.create 1
 let machines_lock = Rig_nv.Lock.create ()
 
 let known m =
   Rig_nv.Lock.protect machines_lock @@ fun () ->
-  match List.assq_opt m !machines with
+  match Machines.find_opt machines m with
   | Some on -> on
   | None ->
       let on = { key = Type.Id.make (); reached = Atomic.make [] } in
-      machines := (m, on) :: !machines;
+      Machines.add machines m on;
       on
 
 let rec learn on index reach =
@@ -312,52 +325,63 @@ let device ~word ~on g ~gsp ~hold ~tables (c : Chip.t) =
   let* rm = Gsp.rm gsp ~locate:(locate g) in
   let* device, subdevice, vaspace = Gsp.objects rm in
   let* gpu = Gsp.gpu gsp rm ~subdevice in
-  (* The flush word's page lives with the GPU's memory until the stop. A GPU
-     whose BAR has no room for it opens without Mapped memory. *)
-  let* flush =
-    match protect g (fun () -> Memory.alloc g.memory Memory.Bar 0x1000) with
-    | Ok (Some r) -> Ok (host r)
-    | Ok None -> Ok None
-    | Error _ as e -> e
+  (* The flush word's page lives with the GPU's memory until the stop, which
+     gives back its addresses, as a device that fails to make does at once. A
+     GPU whose BAR has no room for it opens without Mapped memory. *)
+  let* page = protect g (fun () -> Memory.alloc g.memory Memory.Bar 0x1000) in
+  let free_page () =
+    Option.iter (fun r -> protect g (fun () -> Memory.free g.memory r)) page
   in
-  Rig_nv.make ~word
-    {
-      key = on.key;
-      index = g.index;
-      rm;
-      device;
-      subdevice;
-      vaspace;
-      gpu;
-      budget = Page_table.main_pool tables;
-      doorbell = Window.address c.regs + doorbell_at;
-      clock = Registers (Window.address c.regs);
-      flush;
-      alloc = alloc g;
-      (* A GPU taken physically would keep writing the process's pages after its
-         death: it maps no host memory. *)
-      map_host =
-        (match Function.addressing g.fn with
-        | Machine.Physical -> None
-        | Iommu -> Some (map_host g));
-      reaches = reaches on ~index:g.index;
-      map_peer = map_peer g;
-      free = free g;
-      bus = Some (Function.bus g.fn);
-      dma = dma g;
-      register = (fun _ -> Ok ());
-      unregister = (fun _ -> Ok ());
-      check = check g gsp;
-      hang_ms = Some Driver.hang_ms;
-      stop =
-        (fun () ->
-          Fun.protect
-            (fun () -> Driver.stop hold)
-            ~finally:(fun () ->
-              protect g (fun () ->
-                  g.names <- None;
-                  Memory.release g.memory)));
-    }
+  let flush = Option.bind page host in
+  match
+    Rig_nv.make ~word
+      {
+        key = on.key;
+        index = g.index;
+        rm;
+        device;
+        subdevice;
+        vaspace;
+        gpu;
+        budget = Page_table.main_pool tables;
+        doorbell = Window.address c.regs + doorbell_at;
+        clock = Registers (Window.address c.regs);
+        flush;
+        alloc = alloc g;
+        (* A GPU taken physically would keep writing the process's pages after
+           its death: it maps no host memory. *)
+        map_host =
+          (match Function.addressing g.fn with
+          | Machine.Physical -> None
+          | Iommu -> Some (map_host g));
+        reaches = reaches on ~index:g.index;
+        map_peer = map_peer g;
+        free = free g;
+        bus = Some (Function.bus g.fn);
+        dma = dma g;
+        register = (fun _ -> Ok ());
+        unregister = (fun _ -> Ok ());
+        check = check g gsp;
+        hang_ms = Some Driver.hang_ms;
+        stop =
+          (fun () ->
+            Fun.protect
+              (fun () -> Driver.stop hold)
+              ~finally:(fun () ->
+                protect g (fun () ->
+                    g.names <- None;
+                    Memory.release g.memory);
+                free_page ()));
+      }
+  with
+  | Ok _ as d -> d
+  | Error _ as e ->
+      free_page ();
+      e
+  | exception e ->
+      let bt = Printexc.get_raw_backtrace () in
+      free_page ();
+      Printexc.raise_with_backtrace e bt
 
 (* [start] places the GSP's memory and boots it. Before the GSP's memory is
    taken, the start only reads the GPU's registers and writes its page tables in
@@ -372,8 +396,11 @@ let start h (c : Chip.t) (fw : Images.t) fwsec ~failed ~lock =
     Fb_layout.top (Chip.layout c.family) ~memory
       ~boot:fw.bootloader.image.length ~image:fw.gsp.length
   in
+  (* The GPU's MMU indexes each level with the address's own bits, from
+     address 0 (mmuFmtVirtAddrToEntryIndex), whatever part of the addresses
+     the space hands out. *)
   let tables =
-    Page_table.create (Mmu.format c bar ~failed) space ~memory:top
+    Page_table.create ~base:0 (Mmu.format c bar ~failed) space ~memory:top
       ~boot:(Gsp.boot_pool fw.start)
       ~tables:(if Window.length bar >= memory then Main else Pool)
       ~pages:(Page_entry.pages (Mmu.version c.family))

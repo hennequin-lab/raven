@@ -133,6 +133,36 @@ let fault m =
     Some "the GPU's MMU queued a fault"
   else None
 
+(* The text of the character array [(off, 1, n)] of [s], which holds it, to
+   its first zero byte. *)
+let text s (off, _, n) =
+  let t = String.sub s off n in
+  match String.index_opt t '\000' with Some i -> String.sub t 0 i | None -> t
+
+(* CPU-RM files the GSP's journal (NOCAT) records into its own
+   (_kgspRpcGspPostNocatRecord): of a record, the source and the error code
+   say what failed. *)
+let report m =
+  if m.fn = Gsp_defs.nv_vgpu_msg_event_os_error_log then
+    let module L = Gsp_defs.Rpc_os_error_log in
+    let b = m.body in
+    if String.length b < L.sizeof then
+      Some ("an error log", "an error log the GSP cut short")
+    else
+      let xid = strf "Xid %d" (get b L.except_type) in
+      Some (xid, strf "%s: %s" xid (text b L.err_string))
+  else if m.fn = Gsp_defs.nv_vgpu_msg_event_gsp_post_nocat_record then
+    let module N = Gsp_defs.Nocat_record in
+    let b = m.body in
+    if String.length b < N.sizeof then
+      Some ("a journal record", "a journal record the GSP cut short")
+    else
+      (* The error code takes 64 bits, which [get] would cut to 63. *)
+      let code = String.get_int64_le b (fst N.error_code) in
+      let source = text b N.source in
+      Some (source, strf "%s, error 0x%Lx" source code)
+  else None
+
 (* Calls *)
 
 let rm_alloc ~client ~parent ~obj ~cls params =
@@ -194,6 +224,185 @@ let page_directory ~client ~device ~vaspace ~root ~entries =
       set b (p P.h_va_space) vaspace;
       set b (p P.pasid) 0xffff_ffff;
       set b (p P.sub_device_id) 1)
+
+(* The GSP's range of an address space whose tables the process keeps: 512 MiB
+   from 4 GiB (g_gpu_vaspace_nvoc.h's SPLIT_VAS_SERVER_RM_MANAGED_VA_START and
+   _SIZE). The GSP computes the same range itself (gvaspaceReserveSplitVaSpace)
+   and takes the tables over at its start (gvaspaceCopyServerReservedPdes). *)
+let reserved = (1 lsl 32, 512 lsl 20)
+
+(* GMMU_APERTURE_VIDEO: the tables are in the GPU's memory. *)
+let aperture_video = 1
+
+(* The bytes of an entry, dev_mmu.h's NV_MMU_VER2_PDE__SIZE and
+   NV_MMU_VER2_DUAL_PDE__SIZE, the same on version 3. *)
+let pde_size = 8
+let dual_pde_size = 16
+
+(* Each table, root first, as _gvaspacePopulatePDEentries describes it: its
+   address, its bytes and the bit its level indexes. *)
+let reserved_pdes v tables =
+  let module R = Defs.Reserved_pdes in
+  let shifts = Array.of_list (List.rev (Page_entry.levels v)) in
+  let n = Array.length shifts - 1 in
+  if List.length tables <> n then
+    invalid_arg
+      (strf "Rpc.reserved_pdes: %d tables, expected %d" (List.length tables) n);
+  let first, size = reserved in
+  let level (off, bytes, _) i (f, w) = (off + (i * bytes) + f, w) in
+  record R.sizeof (fun b ->
+      (* The lowest table is the dual level's, whose 16-byte entries map
+         2 MiB each. *)
+      set b R.page_size (1 lsl shifts.(n - 1));
+      set b R.virt_addr_lo first;
+      set b R.virt_addr_hi (first + size - 1);
+      set b R.num_levels_to_copy n;
+      List.iteri
+        (fun i pa ->
+          let f = level R.levels i in
+          let above = if i = 0 then Page_entry.bits v else shifts.(i - 1) in
+          let entry = if i = n - 1 then dual_pde_size else pde_size in
+          set b (f R.levels_phys_address) pa;
+          set b (f R.levels_size) ((1 lsl (above - shifts.(i))) * entry);
+          set b (f R.levels_page_shift) shifts.(i);
+          set b (f R.levels_aperture) aperture_video)
+        tables)
+
+(* Graphics contexts *)
+
+type promotion = { buffer : int; phys : (int * int) option; virt : int option }
+
+(* NV2080_CTRL_GPU_PROMOTE_CONTEXT_MAX_ENTRIES. *)
+let promote_max = 16
+
+(* NV2080_CTRL_GPU_INITIALIZE_CTX_APERTURE_VIDMEM (0) with _GPU_CACHEABLE_NO
+   (bit 2): a buffer CPU-RM initializes in the GPU's memory
+   (kgrctxPrepareInitializeCtxBuffer). *)
+let video_uncached = 0x4
+
+let promote_ctx ~client ~channel l =
+  let module P = Defs.Promote_ctx in
+  let module E = Defs.Promote_entry in
+  let n = List.length l in
+  if n > promote_max then
+    invalid_arg (strf "Rpc.promote_ctx: %d buffers, at most %d" n promote_max);
+  if List.exists (fun p -> p.phys = None && p.virt = None) l then
+    invalid_arg "Rpc.promote_ctx: a buffer with no address";
+  let off, size, _ = P.promote_entry in
+  let entry i (f, w) = (off + (i * size) + f, w) in
+  record P.sizeof (fun b ->
+      set b P.engine_type Defs.nv2080_engine_type_graphics;
+      set b P.h_chan_client client;
+      set b P.h_object channel;
+      set b P.entry_count n;
+      List.iteri
+        (fun i p ->
+          let f = entry i in
+          set b (f E.buffer_id) p.buffer;
+          Option.iter (fun va -> set b (f E.gpu_virt_addr) va) p.virt;
+          match p.phys with
+          | None -> ()
+          | Some (pa, size) ->
+              set b (f E.gpu_phys_addr) pa;
+              set b (f E.size) size;
+              set b (f E.phys_attr) video_uncached;
+              set b (f E.b_initialize) 1;
+              set b (f E.b_nonmapped) (Bool.to_int (p.virt = None)))
+        l)
+
+type context_buffer = { pa : int; size : int; va : int }
+
+(* NV2080_CTRL_GPU_PROMOTE_CTX_BUFFER_ID_MAIN, _PM and _PATCH. *)
+let main_id = 0
+let pm_id = 1
+let patch_id = 2
+
+(* The initialization follows kgrobjGetPromoteIds_FWCLIENT's order, the binding
+   kgrctxGetCtxBuffers'. *)
+let compute_context ~main ~pm ~patch ~globals =
+  let init (buffer, b) = { buffer; phys = Some (b.pa, b.size); virt = None } in
+  let bind (buffer, va) = { buffer; phys = None; virt = Some va } in
+  let own = [ (main_id, main); (pm_id, pm); (patch_id, patch) ] in
+  let at id = (id, (List.assoc id own).va) in
+  ( List.map init own,
+    List.map bind (at main_id :: at patch_id :: at pm_id :: globals) )
+
+(* Channels *)
+
+(* A channel's flags name its USERD's page and its index in the page, of 8
+   (NVOS04_FLAGS_CHANNEL_USERD_INDEX_VALUE's bits): together its hardware id,
+   page * 8 + index (kfifoChidMgrAllocChid). *)
+let index_value = Defs.nvos04_flags_channel_userd_index_value
+let page_value = Defs.nvos04_flags_channel_userd_index_page_value
+let page_fixed = Defs.nvos04_flags_channel_userd_index_page_fixed
+let per_page = 1 lsl snd index_value
+let channel_ids = per_page lsl snd page_value
+let field (lo, n) x = (x lsr lo) land ((1 lsl n) - 1)
+
+(* The ids kept for the GSP's own channels, from 0: CPU-RM allocates every
+   other channel above them (KFIFO_NUM_GSP_RESERVED_CHANNELS, a define of
+   kernel_fifo.c, which no header carries; kfifoChidMgrAllocChid). *)
+let gsp_channels = 1
+
+let free_channel_id held =
+  let rec lowest id =
+    if id >= channel_ids then None
+    else if held id then lowest (id + 1)
+    else Some id
+  in
+  lowest gsp_channels
+
+let userd_fields =
+  [
+    index_value;
+    Defs.nvos04_flags_channel_userd_index_fixed;
+    page_value;
+    page_fixed;
+  ]
+
+let channel_flags flags id =
+  if id < 0 || id >= channel_ids then
+    invalid_arg
+      (strf "Rpc.channel_flags: id %d, expected 0 to %d" id (channel_ids - 1));
+  let others =
+    List.fold_left (fun f x -> f land lnot (mask x)) flags userd_fields
+  in
+  others
+  lor put page_fixed Defs.nvos04_flags_channel_userd_index_page_fixed_true
+  lor put page_value (id / per_page)
+  lor put index_value (id mod per_page)
+
+let channel_id flags =
+  if
+    field page_fixed flags
+    <> Defs.nvos04_flags_channel_userd_index_page_fixed_true
+  then None
+  else Some ((field page_value flags * per_page) + field index_value flags)
+
+let work_submit_token ~runlist_doorbell ~runlist id =
+  let fits (_, n) x = x >= 0 && x < 1 lsl n in
+  let token ~runlist_id ~vector =
+    if not (fits runlist_id runlist && fits vector id) then
+      invalid_arg (strf "Rpc.work_submit_token: runlist %d, id %d" runlist id);
+    put runlist_id runlist lor put vector id
+  in
+  if runlist_doorbell then
+    token ~runlist_id:Defs.nv_virtual_function_doorbell_runlist_id
+      ~vector:Defs.nv_virtual_function_doorbell_vector
+    lor put Defs.nv_virtual_function_doorbell_runlist_doorbell
+          Defs.nv_virtual_function_doorbell_runlist_doorbell_enable
+  else
+    token ~runlist_id:Defs.nv_ctrl_vf_doorbell_runlist_id
+      ~vector:Defs.nv_ctrl_vf_doorbell_vector
+
+(* The command's NvBool field takes the low byte of the flags, as C's
+   conversion of kperfBoostSet_IMPL's assignment does; [set] writes the low
+   bytes of a value. *)
+let perf_boost ~flags ~duration =
+  let module X = Defs.Perf_boost_2x in
+  record X.sizeof (fun b ->
+      set b X.flags flags;
+      set b X.duration duration)
 
 (* Unloading to level 6, NV2080_CTRL_GPU_SET_POWER_STATE_GPU_LEVEL_3's bit (RM's
    unload to the deepest state the GSP keeps). *)

@@ -173,30 +173,54 @@ let protect g f = Amd.Lock.protect g.lock f
 
 (* What the path keeps of each machine, from its first open there: the key
    its devices share, so that a GPU's number names the same GPU for each of
-   them, and each GPU's reach as its last open found it, by number. A GPU's
-   reach is the same at every open ([Memory.reach]), so a device's [reaches]
-   answers from its GPU's number alone, also once it is lost, and keeps nothing
-   of the device. *)
+   them, each GPU's reach as its last open found it, by number, and what its
+   boots keep, by bus. A GPU's reach is the same at every open
+   ([Memory.reach]), so a device's [reaches] answers from its GPU's number
+   alone, also once it is lost, and keeps nothing of the device. Each list
+   holds at most the machine's AMD GPUs. *)
 type known = {
   key : Memory.region Type.Id.t;
   mutable reached : (int * Memory.reach) list;
+  mutable kept : (string * Boot.kept) list;
 }
 
-let machines : (Machine.t * known) list ref = ref []
+(* By machine, through ephemerons, so that the table keeps no machine the
+   process dropped: the GC frees an entry once its machine goes, and the table
+   drops the entry's cell as it grows. Machines that no transport names hash
+   alike. *)
+module Machines = Ephemeron.K1.Make (struct
+  type t = Machine.t
+
+  let equal = ( == )
+  let hash m = Hashtbl.hash (Machine.name m)
+end)
+
+let machines = Machines.create 1
 let machines_lock = Amd.Lock.create ()
 
 let known m =
   Amd.Lock.protect machines_lock @@ fun () ->
-  match List.assq_opt m !machines with
+  match Machines.find_opt machines m with
   | Some on -> on
   | None ->
-      let on = { key = Type.Id.make (); reached = [] } in
-      machines := (m, on) :: !machines;
+      let on = { key = Type.Id.make (); reached = []; kept = [] } in
+      Machines.add machines m on;
       on
 
 let learn on index reach =
   Amd.Lock.protect machines_lock @@ fun () ->
   on.reached <- (index, reach) :: List.remove_assoc index on.reached
+
+(* What the boots of the GPU at [bus] keep. Its opens run one at a time, under
+   the driver's lock. *)
+let kept on bus =
+  Amd.Lock.protect machines_lock @@ fun () ->
+  match List.assoc_opt bus on.kept with
+  | Some k -> k
+  | None ->
+      let k = Boot.kept () in
+      on.kept <- (bus, k) :: on.kept;
+      k
 
 let reaches on ~index j =
   let reach () =
@@ -309,7 +333,8 @@ let path g h fn ~index : Memory.region Amd.path =
     hdp = Boot.hdp g;
     interrupt;
     hang_ms = Some Driver.hang_ms;
-    sleep = (fun ~ms -> guard (fun () -> Boot.sleep g ~ms));
+    interrupts = (fun () -> Boot.interrupts g);
+    sleep = (fun ~ms ~after -> guard (fun () -> Boot.sleep g ~ms ~after));
     stable_power = (fun () -> guard (fun () -> Boot.stable_power g));
     stop;
   }
@@ -326,7 +351,9 @@ let boot h fn ~firmware =
     let* _, loads = survey ~firmware d in
     loads
   in
-  match Boot.start ~gpus fn first with
+  let on = known (Rig_pci.Function.machine fn) in
+  let kept = kept on (Rig_pci.Function.bus fn) in
+  match Boot.start ~gpus ~kept fn first with
   | Ok g -> Ok g
   | Error (`Refused why) -> Error (`Refused why)
   | Error `Running -> Error `Running

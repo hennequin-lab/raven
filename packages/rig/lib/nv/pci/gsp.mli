@@ -17,7 +17,9 @@ type placement = {
   chip : Chip.t;
   memory : int;  (** The size of the GPU's memory ({!Chip.memory}). *)
   tables : Rig_pci.Page_table.t;
-      (** The GPU's page tables: the GSP's objects' memory comes from them. *)
+      (** The GPU's page tables, which must translate from address 0, as the
+          GPU's MMU does, and leave the GSP's addresses ({!Rpc.reserved})
+          unmapped: the GSP's objects' memory comes from them. *)
   tables_lock : Rig_nv.Lock.t;
       (** The lock under which every call of [tables] runs, which the GSP
           takes too after its boot. *)
@@ -75,10 +77,11 @@ val stop : t -> [> `Clean | `Lost | `Unknown ]
       needs it to boot the GPU again.
 
     It then turns the GPU's bus mastering off and gives back the memory
-    {!create} took. It is [`Unknown], the memory kept, if the GPU stops
-    responding once its bus mastering is off: it may still read that memory.
-    It is [`Lost] if the boot raised WPR2 and the unload did not stop its
-    channels, if the unloading booter failed or left WPR2 up, or, on
+    {!create} took, and the addresses of the GPU memory the GSP still holds
+    to the space every GPU shares. It is [`Unknown], both kept, if the GPU
+    stops responding once its bus mastering is off: it may still read that
+    memory. It is [`Lost] if the boot raised WPR2 and the unload did not stop
+    its channels, if the unloading booter failed or left WPR2 up, or, on
     Blackwell, if the GSP's core did not halt; and [`Clean] otherwise. *)
 
 (** {1:rm The resource manager} *)
@@ -92,11 +95,14 @@ val rm :
     in the memory and at the address [locate h off] gives for the memory of
     handle [h] at offset [off] (a physical address in the GPU's memory, a bus
     address in system memory); a virtual address space gets the GPU's page
-    directory; a compute engine's context buffers are promoted; a channel's work
-    submit token carries its runlist. Its [free] frees an object and every
-    object under it, then gives back the GPU memory the client gave the GSP
-    for them; once the GPU has left the bus or faulted ({!check}) it is a
-    refusal, and calls nothing. *)
+    directory; a compute object's context is handed over as NVIDIA's RM and
+    its UVM do ({!Rpc.compute_context}). Its commands go to the GSP as NVIDIA's
+    RM sends them, but for a channel's work submit token, which it makes
+    without the GSP and which carries the channel's runlist, and a boost,
+    which goes as the GSP's own command ({!Rpc.perf_boost}). Its [free] frees
+    an object and every object under it, then gives back the GPU memory the
+    client gave the GSP for them; once the GPU has left the bus or faulted
+    ({!check}) it is a refusal, and calls nothing. *)
 
 val objects : Rig_nv.rm -> (int * int * int, string) result
 (** [objects rm] is the GPU's device, subdevice and virtual address space, new
@@ -114,7 +120,9 @@ val check : t -> string option
 (** [check g] handles the events the GSP sent since the last call, and is the
     first fault one reported ({!Rpc.fault}). A message that cannot be read
     is a fault too, and so is a call the GSP leaves unanswered past its
-    bound. Once it is [Some], it stays. An event stays in the GSP's queue until it is handled, so an
+    bound, whose error names the first fault and the last report of each
+    error the GSP logged since the call began ({!Rpc.report}). Once it is
+    [Some], it stays. An event stays in the GSP's queue until it is handled, so an
     exception that interrupts [check] or a call leaves it for the next one;
     one that interrupts a CPU sequence the GSP asked for counts as a fault,
     since a sequence runs once, front to back. It never waits for the GSP's

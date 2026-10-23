@@ -68,10 +68,14 @@
     ({!Rig_pci.Function.alloc_dma}). The GPUs' addresses and the process's
     addresses of system memory coincide, from 64 GiB to {!Rig_nv.windows},
     which the process reserves at its first open; every GPU it opens takes
-    its addresses from that range.
+    its addresses from that range. A device's stop gives back every address
+    its open took, once the GPU's memory regions are freed, unless the GPU
+    stopped answering ({!Rig_nv.val-stop}), which keeps the addresses the
+    GPU may still reach.
     - Behind an IOMMU, system memory counts against the process's limit on
       locked memory ([RLIMIT_MEMLOCK]), and {!Rig_nv.val-alloc} returns
-      [None] once it is reached. Raise the limit to allocate more.
+      [None] once it is reached. Raise the limit to allocate more. Such a
+      GPU's device has [maps_host] [true].
     - Taken physically, system memory lies in huge pages of 2 MiB, and
       {!Rig_nv.val-alloc} returns [None] once none is free. Reserve more
       huge pages ([vm.nr_hugepages]) or free memory. Such a GPU's device has
@@ -87,8 +91,10 @@
     asks ([Rig_nv.rm]'s [free] is [Some]), so a device of this path gives
     back the channels a growth replaces as {!Rig_nv.section-submitting}
     states. With each set goes the GPU memory the path gave the GSP for it:
-    the instance blocks and method buffers of its two channels and the
-    compute engine's context buffers. *)
+    the instance blocks of its two channels, the method buffer of their
+    group and the compute engine's context buffers. An allocation the path or
+    the GSP refuses gives back at once the memory the path gave for it,
+    unless the GPU faulted meanwhile. *)
 
 (** {1:gpus GPUs}
 
@@ -254,6 +260,11 @@ val reset : ?machine:Rig_pci.Machine.t -> int -> (unit, string) result
 
 (**/**)
 
+val taken : unit -> int
+(* [taken ()] is the number of ranges of the GPUs' addresses that this
+   library's opens hold, for the suites that check that a stop gives back
+   every range its open took. *)
+
 (* Boot reports, for the suites that check, without a GPU, what an open
    loads to boot a GPU and whether it refuses the GPU for its chip, its VBIOS
    or its firmware, from what the open reads before the boot writes. Making
@@ -316,6 +327,7 @@ module Falcon : sig
     | Copy of int * int
     | Poll of string * int * int * cond
     | Delay of int
+    | Read of int
     | When of int * int * cond * op list
     | Expect of string * int * int * cond
 

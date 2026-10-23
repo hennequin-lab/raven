@@ -17,7 +17,8 @@ type reach = {
   addressing : Machine.addressing;
   small_bar : bool;
   link : link option;
-  route : Sysfs.route option; (* its way up the bus, without a transport *)
+  route : Sysfs.route option Lazy.t;
+      (* its way up the bus, without a transport, read at its first use *)
 }
 
 (* The memory a GPU addresses: the facts [reaches] and errors read, and [held],
@@ -96,9 +97,10 @@ let create ?link fn tables ~bar =
         small_bar = bar_size < Page_table.memory tables;
         link;
         route =
-          Option.bind
-            (Machine.files (Function.machine fn))
-            (fun files -> Sysfs.route files (Function.bus fn));
+          lazy
+            (Option.bind
+               (Machine.files (Function.machine fn))
+               (fun files -> Sysfs.route files (Function.bus fn)));
       };
     bar;
     bar_base;
@@ -149,6 +151,12 @@ let rec host r =
 
 let reach m = m.reach
 
+(* A route is read from the machine's files when a peer or another function
+   first needs it, which a session that reaches neither never does: 4 ms of an
+   open on an R9700. Its lock lets two domains ask at once. *)
+let routes = Lock.create ()
+let route (r : reach) = Lock.protect routes (fun () -> Lazy.force r.route)
+
 let linked (r : reach) (o : reach) =
   match (r.link, o.link) with
   | Some l, Some l' -> Int64.equal l.fabric l'.fabric
@@ -157,7 +165,7 @@ let linked (r : reach) (o : reach) =
 (* Whether the bus carries [r]'s requests to [o]'s BAR, which only a machine
    reached without a transport tells. *)
 let carried (r : reach) (o : reach) =
-  match (r.route, o.route) with
+  match (route r, route o) with
   | Some client, Some provider -> Sysfs.forwards ~provider ~client
   | _ -> false
 
@@ -413,16 +421,28 @@ let map_new m h tables r =
                         }))))
 
 (* Misuse is refused before anything is pinned or written: a region freed, or
-   its origin freed. Memory the GPU maps already, its own or a peer's it
-   mapped, lies at its owner's address, so a new region there shares that
-   mapping. *)
+   its origin freed. A released GPU's own memory is refused: another open may
+   have reset that GPU and given the memory out. Its system memory stays until
+   its region's free, and maps as a live GPU's does. Memory the GPU maps
+   already, its own or a peer's it mapped, lies at its owner's address, so a
+   new region there shares that mapping. *)
 let map_peer m r =
   let h, tables = live "map_peer" m in
   ignore (mine "map_peer" r.owner r : held);
   let r = origin r in
-  ignore (live "map_peer" r.owner : held * Page_table.t);
-  ignore (mine "map_peer" r.owner r : held);
+  let owner = mine "map_peer" r.owner r in
+  let gone =
+    m.reach.machine == r.owner.reach.machine
+    && r.mapping.target <> System
+    && Function.released owner.fn
+  in
   match Tables.Address.find_opt h.regions r.mapping.va with
+  | _ when gone ->
+      Error
+        (strf
+           "%s was released, and another open may have reset it and given its \
+            memory out"
+           r.owner.reach.bus)
   | None -> map_new m h tables r
   | Some e when origin e.holder != r ->
       invalid_argf "Memory.map_peer: %s maps other memory at 0x%x" m.reach.bus
@@ -472,7 +492,7 @@ let bar_check m files ~client =
        firmware settings makes it as large"
       gpu
   else
-    match (m.reach.route, Sysfs.route files client) with
+    match (route m.reach, Sysfs.route files client) with
     | Some provider, Some client when Sysfs.forwards ~provider ~client -> Ok ()
     | _ ->
         refuse
@@ -528,7 +548,9 @@ let bus m r ~client =
    is live: once the function is released the GPU may be another instance's, so
    a free gives back system memory, pins and addresses only. The addresses go
    back last: the vendor's GPUs share the space, and another GPU's system memory
-   there would be mapped over this one's. *)
+   there would be mapped over this one's. A released function that may still
+   reach its memory ([Function.reaching]) keeps the memory, and so its
+   addresses. *)
 let give_back m h tables r =
   let map = r.mapping in
   (match (r.source, map.target, r.host, tables) with
@@ -541,8 +563,9 @@ let give_back m h tables r =
       List.iter (fun (pa, _) -> Page_table.pfree tables pa) map.pages
   | _ -> ());
   match r.source with
-  | Allocated | Borrowed _ -> Space.free m.reach.space map.va
-  | Peer _ -> ()
+  | (Allocated | Borrowed _) when not (Function.reaching h.fn) ->
+      Space.free m.reach.space map.va
+  | Allocated | Borrowed _ | Peer _ -> ()
 
 (* The last region out over a mapping unmaps it and gives back its holder's. *)
 let free m r =

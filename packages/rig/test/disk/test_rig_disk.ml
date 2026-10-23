@@ -21,7 +21,7 @@ let host = Rig.host
 (* The disk keeps at most this many descriptors open while no copy uses them. *)
 let max_descriptors = 64
 
-(* The bytes of one of the disk's io_uring requests on Linux, whose edges large
+(* The bytes of one of the segments a long read is cut into, whose edges large
    copies cross. *)
 let segment = 2 lsl 20
 
@@ -1014,7 +1014,8 @@ let test_inherited () =
   ignore (Sys.opaque_identity file)
 
 (* A forked child reads and writes files with the disk, its parent's opens and
-   its own, with a read long enough to take the io_uring ring on Linux. OCaml
+   its own, with a read long enough to run on the host pool's blocking
+   workers, which the parent's read made before the fork. OCaml
    forks only a process that started no domain: a child process of the suite's
    own forks. *)
 let test_forked () =
@@ -1073,6 +1074,27 @@ let test_truncated kind =
   let other = make_file "other" in
   removing [ other ] @@ fun () ->
   equal octets ~msg:"another file" "other" (read (of_file other))
+
+(* A long read past the end of a file truncated since raises Sys_error naming
+   it, wherever the cut falls among the segments that threads read at once:
+   in a late one, or in the first. *)
+let test_truncated_long () =
+  let s = pattern 3 (16 * segment) in
+  let path = make_file s in
+  removing [ path ] @@ fun () ->
+  let file = of_file path in
+  List.iter
+    (fun cut ->
+      let fd = Unix.openfile path [ Unix.O_WRONLY ] 0 in
+      Fun.protect
+        ~finally:(fun () -> Unix.close fd)
+        (fun () -> Unix.ftruncate fd cut);
+      raises_match
+        ~msg:(Printf.sprintf "cut at %d" cut)
+        (Exn.sys_error ~substring:path)
+        (fun () -> read file))
+    [ (12 * segment) + 7; segment + 3 ];
+  equal (option string) ~msg:"the disk lost" None (Rig.lost disk)
 
 let kind_arg = function Opened -> "opened" | Created -> "created"
 
@@ -1144,6 +1166,10 @@ let descriptors =
         "a copy past the end of a file truncated since raises Sys_error naming \
          it, and the disk goes on"
         [ Opened; Created ] test_truncated;
+      test
+        "a long copy past the end of a file truncated since raises Sys_error \
+         naming it, the cut in any segment of the read"
+        test_truncated_long;
       cases
         ~name:(fun k -> Format.asprintf "%a" pp_kind k)
         "a copy from a host borrow of a file truncated since raises \
@@ -1630,9 +1656,48 @@ let domain_commands =
       (fun () -> use_others others_count);
   ]
 
+(* A long read neither waits for the host pool's compute jobs nor needs their
+   workers: it ends while another domain's compute job holds them until
+   released. If it waited, it would end only at the release. *)
+let test_beside_compute () =
+  if Sys.win32 then skip ~reason:"long reads run on the calling thread" ();
+  let s = pattern 5 (8 * segment) in
+  let path = make_file s in
+  removing [ path ] @@ fun () ->
+  let file = of_file path in
+  let job = Domain.spawn Support.hold_pool in
+  let read_ended, got =
+    Fun.protect
+      ~finally:(fun () ->
+        Support.release_pool ();
+        Domain.join job)
+      (fun () ->
+        let until = Unix.gettimeofday () +. 10. in
+        while (not (Support.pool_held ())) && Unix.gettimeofday () < until do
+          Unix.sleepf 0.001
+        done;
+        if not (Support.pool_held ()) then failf "the compute job did not begin";
+        let got = Atomic.make None in
+        let reader = Domain.spawn (fun () -> Atomic.set got (Some (read file))) in
+        let until = Unix.gettimeofday () +. 10. in
+        while Option.is_none (Atomic.get got) && Unix.gettimeofday () < until do
+          Unix.sleepf 0.001
+        done;
+        let ended = Option.is_some (Atomic.get got) in
+        Support.release_pool ();
+        Domain.join reader;
+        (ended, Atomic.get got))
+  in
+  equal bool ~msg:"the read ended while the compute job ran" true read_ended;
+  same ~msg:"the bytes read" s (Option.get got)
+
 let domains =
   group ~timeout "domains"
     [
+      test
+        "a long copy ends while another domain's compute job holds the host \
+         pool's workers"
+        test_beside_compute;
       stateful ~domains:2 ~count:10 ~steps:4
         "copies from two domains at once read and write each file's own bytes, \
          through closed and reopened descriptors"
